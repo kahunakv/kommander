@@ -103,7 +103,8 @@ public class TestSnapshotReceiverInstallEdges
         {
             if (Directory.Exists(directory))
             {
-                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
                 Directory.Delete(directory, recursive: true);
             }
         }
@@ -222,7 +223,8 @@ public class TestSnapshotReceiverInstallEdges
             Directory.CreateDirectory(directory);
             string leftover = Path.Combine(directory, "snapshot-p1-dead" + SnapshotReceiver.StagingFileExtension);
             File.WriteAllBytes(leftover, [1, 2, 3]);
-            File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserExecute);
 
             SnapshotReceiver r = NewReceiver(new GatedInstaller().Install, () => 1000,
                 stagingDirectory: directory, stagingMemoryBytes: 1_000_000);

@@ -50,9 +50,9 @@ public sealed class WorkloadRunner
     public sealed class WorkerResult
     {
         public List<long> LatencyTicks { get; } = new(1 << 14);
-        public long Calls;
-        public long Entries;
-        public long Failed;
+        internal long Calls;
+        internal long Entries;
+        internal long Failed;
         public Dictionary<RaftOperationStatus, long> FailedByStatus { get; } = [];
     }
 

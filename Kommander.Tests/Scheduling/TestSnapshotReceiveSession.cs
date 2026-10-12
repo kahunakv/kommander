@@ -786,7 +786,8 @@ public class TestSnapshotReceiveSession
         {
             if (Directory.Exists(directory))
             {
-                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
                 Directory.Delete(directory, recursive: true);
             }
         }
@@ -946,7 +947,8 @@ public class TestSnapshotReceiveSession
         {
             CapturingInstaller installer = new();
             SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 4);
-            File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserExecute);
 
             Assert.True((await r.ReceiveInstallSnapshot(Chunk("big", 0, false, [1, 2, 3]), ct)).Success);
             Assert.False((await r.ReceiveInstallSnapshot(Chunk("big", 1, false, [4, 5, 6]), ct)).Success);

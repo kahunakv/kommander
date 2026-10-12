@@ -32,13 +32,13 @@ public sealed class TestPartitionLifecyclePreconditions
     {
         PartitionLifecycleService lifecycle = Create(initialized: false);
 
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(DataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SetReplicationFactorAsync(DataPartition, 3));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SetReplicationFactorAsync(DataPartition, 3, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.ChangeReplicaAsync(RaftSystemRequestType.AddReplica, DataPartition, "10.0.0.1:7000", 11));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(DataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(DataPartition));
+            () => lifecycle.ChangeReplicaAsync(RaftSystemRequestType.AddReplica, DataPartition, "10.0.0.1:7000", 11, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
     }
 
     // ── system partition is not a lifecycle target ─────────────────────────────
@@ -48,18 +48,18 @@ public sealed class TestPartitionLifecyclePreconditions
     {
         PartitionLifecycleService lifecycle = Create(leaderOf: _ => true);
 
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(RaftSystemConfig.SystemPartition));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(RaftSystemConfig.SystemPartition, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.MergePartitionsAsync(DataPartition, RaftSystemConfig.SystemPartition));
+            () => lifecycle.MergePartitionsAsync(DataPartition, RaftSystemConfig.SystemPartition, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.MergePartitionsAsync(RaftSystemConfig.SystemPartition, DataPartition));
+            () => lifecycle.MergePartitionsAsync(RaftSystemConfig.SystemPartition, DataPartition, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.SetReplicationFactorAsync(RaftSystemConfig.SystemPartition, 3));
+            () => lifecycle.SetReplicationFactorAsync(RaftSystemConfig.SystemPartition, 3, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
             () => lifecycle.ChangeReplicaAsync(
-                RaftSystemRequestType.RemoveReplica, RaftSystemConfig.SystemPartition, "10.0.0.1:7000", 11));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(RaftSystemConfig.SystemPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(RaftSystemConfig.SystemPartition));
+                RaftSystemRequestType.RemoveReplica, RaftSystemConfig.SystemPartition, "10.0.0.1:7000", 11, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(RaftSystemConfig.SystemPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(RaftSystemConfig.SystemPartition, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -67,7 +67,7 @@ public sealed class TestPartitionLifecyclePreconditions
     {
         PartitionLifecycleService lifecycle = Create(leaderOf: _ => true);
 
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, DataPartition));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, DataPartition, ct: TestContext.Current.CancellationToken));
     }
 
     // ── leadership gate ────────────────────────────────────────────────────────
@@ -77,13 +77,13 @@ public sealed class TestPartitionLifecyclePreconditions
     {
         PartitionLifecycleService lifecycle = Create(leaderOf: _ => false);
 
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(DataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SetReplicationFactorAsync(DataPartition, 3));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SplitPartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.SetReplicationFactorAsync(DataPartition, 3, ct: TestContext.Current.CancellationToken));
         await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.ChangeReplicaAsync(RaftSystemRequestType.PromoteReplica, DataPartition, "10.0.0.1:7000", 11));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(DataPartition));
-        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(DataPartition));
+            () => lifecycle.ChangeReplicaAsync(RaftSystemRequestType.PromoteReplica, DataPartition, "10.0.0.1:7000", 11, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.CreatePartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
+        await Assert.ThrowsAsync<RaftException>(() => lifecycle.RemovePartitionAsync(DataPartition, ct: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -95,14 +95,14 @@ public sealed class TestPartitionLifecyclePreconditions
         PartitionLifecycleService leadsNeither = Create(leaderOf: partitionId => partitionId == RaftSystemConfig.SystemPartition);
 
         RaftException survivorRejection = await Assert.ThrowsAsync<RaftException>(
-            () => leadsNeither.MergePartitionsAsync(DataPartition, OtherDataPartition));
+            () => leadsNeither.MergePartitionsAsync(DataPartition, OtherDataPartition, ct: TestContext.Current.CancellationToken));
         Assert.Contains("survivor", survivorRejection.Message);
 
         PartitionLifecycleService leadsSurvivorOnly = Create(
             leaderOf: partitionId => partitionId == DataPartition);
 
         RaftException sourceRejection = await Assert.ThrowsAsync<RaftException>(
-            () => leadsSurvivorOnly.MergePartitionsAsync(DataPartition, OtherDataPartition));
+            () => leadsSurvivorOnly.MergePartitionsAsync(DataPartition, OtherDataPartition, ct: TestContext.Current.CancellationToken));
         Assert.Contains("source", sourceRejection.Message);
     }
 
@@ -114,7 +114,7 @@ public sealed class TestPartitionLifecyclePreconditions
         PartitionLifecycleService lifecycle = Create(leaderOf: _ => false);
 
         RaftException rejection = await Assert.ThrowsAsync<RaftException>(
-            () => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition));
+            () => lifecycle.MergePartitionsAsync(DataPartition, OtherDataPartition, ct: TestContext.Current.CancellationToken));
 
         Assert.Contains("survivor", rejection.Message);
     }

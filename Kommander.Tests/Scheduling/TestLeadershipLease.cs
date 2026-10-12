@@ -415,16 +415,16 @@ public class TestLeadershipLease
         Assert.Equal(5, readIndex);
 
         Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
-        await Task.Delay(50);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         Assert.False(wait.IsCompleted);
 
         // Applying up to (but not through) the frontier wakes the reader and parks it again.
         sm.SetLastAppliedIndexForTesting(3);
-        await Task.Delay(50);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         Assert.False(wait.IsCompleted);
 
         sm.SetLastAppliedIndexForTesting(5);
-        Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -444,7 +444,7 @@ public class TestLeadershipLease
         host.AdvanceMonotonic(host.Configuration.HeartbeatInterval);
         sm.SetLastAppliedIndexForTesting(2);
 
-        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -464,7 +464,7 @@ public class TestLeadershipLease
         await sm.StepDownAsync(replyCorrelationId: null);
         sm.SetLastAppliedIndexForTesting(5);
 
-        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -480,6 +480,6 @@ public class TestLeadershipLease
 
         // Nothing ever applies: the wait is bounded by the confirmation timeout and answers a miss,
         // so a wedged consumer cannot park lease readers forever.
-        Assert.False(await sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(await sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
     }
 }

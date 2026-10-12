@@ -35,10 +35,10 @@ public sealed class CountingCommunication : ICommunication
     public sealed class TrafficCounter
     {
         /// <summary>Entry-carrying frames. Heartbeats (no entries) are counted apart.</summary>
-        public long Frames;
-        public long Heartbeats;
-        public long Entries;
-        public long LogBytes;
+        internal long Frames;
+        internal long Heartbeats;
+        internal long Entries;
+        internal long LogBytes;
     }
 
     /// <summary>Snapshot of the counters: per target endpoint, and the ack total.</summary>

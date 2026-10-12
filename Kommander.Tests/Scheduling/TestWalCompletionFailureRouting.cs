@@ -218,7 +218,7 @@ public class TestWalCompletionFailureRouting
     [Fact]
     public async Task FollowerAppend_ErroredCompletion_DeliversNothing_AcksError_ThenHealsOnRedelivery()
     {
-        (RaftPartitionStateMachine sm, FollowerHost host, RoutingWal wal) = BuildFollower();
+        (RaftPartitionStateMachine sm, FollowerHost host, RoutingWal wal) = await BuildFollowerAsync();
 
         List<RaftLog> batch =
         [
@@ -306,7 +306,7 @@ public class TestWalCompletionFailureRouting
         return (sm, host, wal, sink);
     }
 
-    private static (RaftPartitionStateMachine, FollowerHost, RoutingWal) BuildFollower()
+    private static async Task<(RaftPartitionStateMachine, FollowerHost, RoutingWal)> BuildFollowerAsync()
     {
         FollowerHost host = new();
         RoutingWal wal = new();
@@ -314,7 +314,7 @@ public class TestWalCompletionFailureRouting
 
         // Restore completion is what releases the consumer-apply hold: without it the
         // follower acks but never delivers, which is not the behavior under test.
-        sm.CompleteRestoreAsync([]).GetAwaiter().GetResult();
+        await sm.CompleteRestoreAsync([]);
         sm.MarkRestoredForTesting();
         sm.SetPostToExecutor(_ => { });
 

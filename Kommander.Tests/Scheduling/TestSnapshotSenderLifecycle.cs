@@ -243,7 +243,7 @@ public class TestSnapshotSenderLifecycle
             SnapshotTransferTrigger.NonContiguousBackfill, "attempt");
         await h.WaitUntilAsync(() => Statuses(h, s => s.FailedAttempts == 1 && !s.InFlight), "the failure surfaced");
         Assert.Contains("unhandled snapshot transfer error", Assert.Single(h.Sender.GetStatuses()).LastError);
-        Assert.Equal(0, h.Installs.Count);
+        Assert.Empty(h.Installs);
 
         // Nothing was cached from the failed attempt: the retry re-exports…
         await h.WaitUntilAsync(() => h.Sender.CanAttempt(Follower), "the backoff window passes");
@@ -281,7 +281,7 @@ public class TestSnapshotSenderLifecycle
             SnapshotTransferTrigger.NonContiguousBackfill, "attempt");
         await h.WaitUntilAsync(() => Statuses(h, s => s.FailedAttempts == 1), "the step timeout is recorded");
         Assert.Contains("snapshot stream read", Assert.Single(h.Sender.GetStatuses()).LastError);
-        Assert.Equal(0, h.Installs.Count);
+        Assert.Empty(h.Installs);
 
         await h.WaitUntilAsync(() => stuck.CancelObserved, "the watchdog cancelled the abandoned read");
 
@@ -354,7 +354,7 @@ public class TestSnapshotSenderLifecycle
         await h.WaitUntilAsync(() => Statuses(h, s => s.FailedAttempts == 2 && !s.InFlight), "the refused mid-stream chunk");
 
         string firstSession = h.Host.Chunks()[0].SessionId;
-        SnapshotRequest refusedReplayOnly = Assert.Single(h.Host.Chunks().Where(c => c.SessionId != firstSession));
+        SnapshotRequest refusedReplayOnly = Assert.Single(h.Host.Chunks(), c => c.SessionId != firstSession);
         Assert.Equal(0, refusedReplayOnly.ChunkIndex);
         Assert.False(refusedReplayOnly.IsLast);
         Assert.Equal(1, transfer.ExportCalls);
@@ -605,7 +605,7 @@ public class TestSnapshotSenderLifecycle
         await h.WaitUntilAsync(() => h.Sender.GetStatuses().Count == 0, "the wait ends with the leadership");
         await h.WaitUntilAsync(() => h.Sender.CanAttempt(Follower), "the follower is eligible again");
 
-        Assert.Equal(0, h.Installs.Count);
+        Assert.Empty(h.Installs);
         Assert.Equal(0, transfer.ExportCalls);
 
         h.NodeState = RaftNodeState.Leader;

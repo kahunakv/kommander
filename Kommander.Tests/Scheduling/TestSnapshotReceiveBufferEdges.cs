@@ -318,7 +318,7 @@ public sealed class TestSnapshotReceiveBufferEdges
     /// are in memory — the importer's <c>ReadExactly</c> loops terminate on exactly this shape.
     /// </summary>
     [Fact]
-    public void ReadAsync_InMemory_AtTheExactEnd_CompletesSynchronouslyWithZero()
+    public async Task ReadAsync_InMemory_AtTheExactEnd_CompletesSynchronouslyWithZero()
     {
         using SnapshotReceiveBuffer buffer = new();
         buffer.Write(Pattern(32, seed: 15));
@@ -327,7 +327,7 @@ public sealed class TestSnapshotReceiveBufferEdges
         ValueTask<int> read = buffer.ReadAsync(new byte[8], TestContext.Current.CancellationToken);
 
         Assert.True(read.IsCompletedSuccessfully, "an in-memory read at the end must not schedule anything");
-        Assert.Equal(0, read.Result);
+        Assert.Equal(0, await read);
     }
 
     [Fact]

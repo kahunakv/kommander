@@ -19,7 +19,7 @@ namespace Kommander.MicroBenchmarks;
 /// honest, and both numbers are noise next to a RocksDB put.</para>
 /// </summary>
 [Config(typeof(InProcessConfig))]
-public class WalEngineFenceBenchmarks
+public class WalEngineFenceBenchmarks : IDisposable
 {
     private ReaderWriterLockSlim recursive = null!;
     private ReaderWriterLockSlim nonRecursive = null!;
@@ -37,6 +37,9 @@ public class WalEngineFenceBenchmarks
         recursive.Dispose();
         nonRecursive.Dispose();
     }
+
+    /// <summary>Satisfies CA1001: the class owns two locks. BenchmarkDotNet calls <see cref="Cleanup"/>; this covers direct use.</summary>
+    public void Dispose() => Cleanup();
 
     /// <summary>Old fence: read enter/exit under the recursion-tracking policy.</summary>
     [Benchmark(Baseline = true, Description = "old: SupportsRecursion enter/exit read")]

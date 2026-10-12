@@ -23,7 +23,7 @@ public sealed class StageCollector : IDisposable
 
     private readonly Dictionary<string, Accumulator> stages = [];
 
-    public volatile bool Measuring;
+    internal volatile bool Measuring;
 
     public StageCollector()
     {

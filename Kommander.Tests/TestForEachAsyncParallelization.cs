@@ -10,6 +10,8 @@ namespace Kommander.Tests;
 /// </summary>
 public sealed class TestForEachAsyncParallelization
 {
+    private static readonly string[] FirstAndSecond = ["first", "second"];
+
     [Fact]
     public async Task ForEachAsync_EnumerableOverload_ProcessesEveryItem()
     {
@@ -81,7 +83,7 @@ public sealed class TestForEachAsyncParallelization
         TaskCompletionSource firstStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         TaskCompletionSource releaseFirst = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        Task loop = new[] { "first", "second" }.ForEachAsync(2, async item =>
+        Task loop = FirstAndSecond.ForEachAsync(2, async item =>
         {
             if (item == "first")
             {

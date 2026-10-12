@@ -391,7 +391,7 @@ public sealed class TestSystemCoordinatorFailures
             // The step-down of a self-removed node runs fire-and-forget; it must
             // never wedge the loop that every later system message flows through.
             await WaitForIdleAsync(manager);
-            await Task.Delay(100);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
             Assert.False(manager.SystemCoordinator.LoopTask.IsFaulted);
         }
     }
