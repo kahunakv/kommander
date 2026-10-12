@@ -21,10 +21,13 @@ namespace Kommander.Consensus;
 /// lines.</para>
 ///
 /// <para><b>Concurrency.</b> Mutated only from the partition executor's single-writer thread and
-/// holds no locks by design. The one exception is <see cref="NodeState"/>, which is published
-/// through a volatile backing field because it is read off-thread (see below). Do not add
-/// synchronization here: the single-owner guarantee is what makes the whole consensus path
-/// lock-free, and a lock in this object would sit on every hot path in the partition.</para>
+/// holds no locks on any consensus path by design. <see cref="NodeState"/> is published through a
+/// volatile backing field because it is read off-thread (see below). The one lock in this object
+/// guards the applied-frontier waiter registry (<see cref="RegisterAppliedFrontierWaiter"/>): it is
+/// taken by off-thread lease readers that park on the frontier, and by the executor only while such
+/// a reader is parked — never when nothing waits, which is the steady state. Do not add
+/// synchronization anywhere else here: the single-owner guarantee is what makes the whole consensus
+/// path lock-free, and a lock on a consensus field would sit on every hot path in the partition.</para>
 /// </summary>
 internal sealed class RaftPartitionCoreState
 {
@@ -73,7 +76,7 @@ internal sealed class RaftPartitionCoreState
             RaftNodeState previous = (RaftNodeState)nodeStateValue;
 
             if (value != RaftNodeState.Leader)
-                leadershipLease = null;
+                KillLeadershipLease();
 
             // Leadership-loss bookkeeping (see PendingLeadershipLossTerm). Recorded here, in the
             // one place every demotion path goes through, so no call site can forget it.
@@ -150,7 +153,7 @@ internal sealed class RaftPartitionCoreState
             RaftInvariants.RequireNoRegression(
                 RaftInvariants.TermMonotonic, currentTermValue, value, partitionId, localEndpoint);
 
-            leadershipLease = null;
+            KillLeadershipLease();
             Volatile.Write(ref currentTermValue, value);
         }
     }
@@ -175,7 +178,23 @@ internal sealed class RaftPartitionCoreState
         leadershipLease = new(term, confirmedTicks);
 
     /// <summary>Kills the published lease. Idempotent; safe to call from any demotion/reset path.</summary>
-    public void InvalidateLeadershipLease() => leadershipLease = null;
+    public void InvalidateLeadershipLease() => KillLeadershipLease();
+
+    /// <summary>
+    /// The single lease-death path behind the <see cref="NodeState"/> and <see cref="CurrentTerm"/>
+    /// setters and <see cref="InvalidateLeadershipLease"/>. Nulls the lease and then releases every
+    /// off-thread reader parked on the applied frontier: each of them re-validates the lease on wake,
+    /// finds it gone, and hands its decision to the executor path at once instead of sitting until
+    /// its frontier index applies (which a demoted node may never do locally) or its deadline passes.
+    /// <para>The lease is nulled BEFORE the readers are released, and the release path carries a full
+    /// fence, so a reader that registers concurrently either sees the dead lease on its post-register
+    /// re-validation or is found in the registry by the release — never neither.</para>
+    /// </summary>
+    private void KillLeadershipLease()
+    {
+        leadershipLease = null;
+        ReleaseAppliedFrontierWaiters();
+    }
 
     /// <summary>
     /// Set once the WAL restore has completed. Guards <c>CompleteRestoreAsync</c> against a second
@@ -380,38 +399,211 @@ internal sealed class RaftPartitionCoreState
 
             Volatile.Write(ref lastAppliedIndexValue, value);
 
-            // Wake any off-thread reader parked on the frontier. One volatile read when nobody waits,
-            // which is the steady state; the exchange runs only while a lease reader is parked.
-            if (Volatile.Read(ref appliedFrontierPulse) is not null)
-                Interlocked.Exchange(ref appliedFrontierPulse, null)?.TrySetResult();
+            // Wake the off-thread readers whose target this advance covers, and only those. The
+            // registry is keyed by required index, so a reader parked on the end of an 84-entry
+            // batch is not touched by the 83 advances below it (the per-entry cost under a parked
+            // reader used to be one continuation per parked reader per applied entry).
+            //
+            // The full fence is load-bearing. This is the store-buffering shape: the store above
+            // versus the registry's "something is parked" count that a reader publishes with a
+            // full fence before it re-reads the frontier. Without a fence on THIS side the count
+            // load could be satisfied before the store above is visible, both sides would read the
+            // stale value, and a reader would be parked on an index already applied — a lost wake
+            // that only its deadline would end. One fence per applied entry is the price, and it
+            // is far below the consumer delivery that precedes every call here.
+            Interlocked.MemoryBarrier();
+            if (Volatile.Read(ref parkedAppliedFrontierWaiters) != 0)
+                WakeCoveredAppliedFrontierWaiters(value);
         }
     }
 
     private long lastAppliedIndexValue = -1;
 
-    /// <summary>
-    /// Completion that the next advance of <see cref="LastAppliedIndex"/> fires, for readers that hold a
-    /// fresh leadership lease but found the applied frontier behind the commit frontier. Created lazily by
-    /// the first waiter and consumed by the advance that follows, so an idle partition holds nothing here.
-    /// Continuations run asynchronously: the apply loop must never execute a reader's continuation inline.
-    /// </summary>
-    private TaskCompletionSource? appliedFrontierPulse;
+    // ── applied-frontier waiter registry ─────────────────────────────────────────────────────
 
     /// <summary>
-    /// A task that completes on the next advance of <see cref="LastAppliedIndex"/>. The caller must re-read
-    /// the frontier after installing the wait and before awaiting it: an advance that landed between its
-    /// first read and this call is not signalled by the task.
+    /// Off-thread lease readers parked until <see cref="LastAppliedIndex"/> covers their required
+    /// index, one entry per DISTINCT required index (readers that need the same index share one
+    /// entry and one completion), kept sorted ascending by index so an advance pops covered heads
+    /// from the front and never scans the rest. Guarded by <see cref="appliedFrontierWaitersLock"/>.
+    /// The expected population is a handful of entries (readers that landed inside one batch's
+    /// commit-to-apply window), so a sorted list beats a tree here.
     /// </summary>
-    public Task WaitForAppliedFrontierAdvanceAsync()
+    private readonly List<AppliedFrontierWaiter> appliedFrontierWaiters = [];
+
+    private readonly object appliedFrontierWaitersLock = new();
+
+    /// <summary>
+    /// Mirror of <c>appliedFrontierWaiters.Count</c> published for the lock-free check in the
+    /// <see cref="LastAppliedIndex"/> setter: the apply loop takes the registry lock only while
+    /// this is non-zero. Written under the lock with a full fence (see
+    /// <see cref="RegisterAppliedFrontierWaiter"/> for why the fence matters).
+    /// </summary>
+    private long parkedAppliedFrontierWaiters;
+
+    /// <summary>
+    /// Diagnostic: readers signalled by an applied-frontier advance that covered their index
+    /// (release wakes from a lease death are not counted). A reader parked on index N must add
+    /// exactly one here, on the advance that reaches N, whatever advances land below N meanwhile.
+    /// </summary>
+    private long appliedFrontierWakeups;
+
+    /// <summary>Readers woken by a covering advance so far; see <see cref="appliedFrontierWakeups"/>.</summary>
+    public long AppliedFrontierWakeups => Volatile.Read(ref appliedFrontierWakeups);
+
+    /// <summary>Distinct required indexes currently parked on; test and diagnostic use.</summary>
+    public int ParkedAppliedFrontierWaiterCount => (int)Volatile.Read(ref parkedAppliedFrontierWaiters);
+
+    /// <summary>
+    /// Parks an off-thread reader until <see cref="LastAppliedIndex"/> covers
+    /// <paramref name="requiredIndex"/>. Returns <see langword="null"/> when the frontier already
+    /// covers it (nothing to wait for); otherwise a waiter whose <see cref="AppliedFrontierWaiter.Covered"/>
+    /// completes on the first advance that reaches the index. Readers that need the same index share
+    /// the waiter. A reader that gives up before completion (deadline, cancellation, lease lapse) must
+    /// call <see cref="AbandonAppliedFrontierWaiter"/> so the registry only ever holds live readers.
+    /// <para><b>No lost wake.</b> The count is published with a full fence and the frontier is re-read
+    /// after it, under the lock; the setter stores the frontier, fences, then reads the count. Of the
+    /// two orders a concurrent advance can take, either the setter sees the count and pops this
+    /// waiter, or the re-read here sees the new frontier and this method returns null. The fence on
+    /// both sides is what rules out the third outcome (both read stale), which is the store-buffering
+    /// reordering every mainstream CPU performs.</para>
+    /// <para><b>Wake granularity.</b> The waiter completes only when its own index is covered, or on a
+    /// lease death (<see cref="KillLeadershipLease"/>), so the reader must re-check the frontier after
+    /// a wake rather than assume coverage.</para>
+    /// </summary>
+    public AppliedFrontierWaiter? RegisterAppliedFrontierWaiter(long requiredIndex)
     {
-        TaskCompletionSource? pulse = Volatile.Read(ref appliedFrontierPulse);
-        if (pulse is null)
+        if (Volatile.Read(ref lastAppliedIndexValue) >= requiredIndex)
+            return null;
+
+        lock (appliedFrontierWaitersLock)
         {
-            TaskCompletionSource fresh = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            pulse = Interlocked.CompareExchange(ref appliedFrontierPulse, fresh, null) ?? fresh;
+            int slot = FindAppliedFrontierSlot(requiredIndex, out bool found);
+
+            AppliedFrontierWaiter waiter;
+            if (found)
+            {
+                waiter = appliedFrontierWaiters[slot];
+                waiter.Readers++;
+            }
+            else
+            {
+                waiter = new AppliedFrontierWaiter(requiredIndex);
+                appliedFrontierWaiters.Insert(slot, waiter);
+            }
+
+            // Full fence: the count must be visible before the frontier is re-read below.
+            Interlocked.Exchange(ref parkedAppliedFrontierWaiters, appliedFrontierWaiters.Count);
+
+            if (Volatile.Read(ref lastAppliedIndexValue) < requiredIndex)
+                return waiter;
+
+            // Covered between the first check and the publish of the count: the setter may have
+            // seen a zero count and skipped the registry, so pop the covered heads here.
+            PopCoveredAppliedFrontierWaitersLocked(Volatile.Read(ref lastAppliedIndexValue));
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Drops one reader from <paramref name="waiter"/>; removes the entry once no reader is left on
+    /// it. No-op when the waiter already completed (it is no longer in the registry).
+    /// </summary>
+    public void AbandonAppliedFrontierWaiter(AppliedFrontierWaiter waiter)
+    {
+        lock (appliedFrontierWaitersLock)
+        {
+            if (waiter.Covered.IsCompleted)
+                return;
+
+            if (--waiter.Readers > 0)
+                return;
+
+            int slot = FindAppliedFrontierSlot(waiter.RequiredIndex, out bool found);
+            if (found && ReferenceEquals(appliedFrontierWaiters[slot], waiter))
+            {
+                appliedFrontierWaiters.RemoveAt(slot);
+                Interlocked.Exchange(ref parkedAppliedFrontierWaiters, appliedFrontierWaiters.Count);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Setter-side wake: pops and completes every head whose required index
+    /// <paramref name="applied"/> covers. Entries above it stay parked untouched. Completions are
+    /// signalled under the lock — a <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/>
+    /// source only queues the readers' continuations, it never runs one inline, so the lock is held
+    /// for the queueing alone and the apply loop never executes reader code.
+    /// </summary>
+    private void WakeCoveredAppliedFrontierWaiters(long applied)
+    {
+        lock (appliedFrontierWaitersLock)
+            PopCoveredAppliedFrontierWaitersLocked(applied);
+    }
+
+    private void PopCoveredAppliedFrontierWaitersLocked(long applied)
+    {
+        int covered = 0;
+        while (covered < appliedFrontierWaiters.Count && appliedFrontierWaiters[covered].RequiredIndex <= applied)
+        {
+            AppliedFrontierWaiter waiter = appliedFrontierWaiters[covered];
+            Interlocked.Add(ref appliedFrontierWakeups, waiter.Readers);
+            waiter.Signal();
+            covered++;
         }
 
-        return pulse.Task;
+        if (covered == 0)
+            return;
+
+        appliedFrontierWaiters.RemoveRange(0, covered);
+        Interlocked.Exchange(ref parkedAppliedFrontierWaiters, appliedFrontierWaiters.Count);
+    }
+
+    /// <summary>
+    /// Lease-death release: completes every parked waiter whatever its index, so each reader wakes,
+    /// re-validates the lease, and falls through to the executor path now. Executor thread only.
+    /// </summary>
+    private void ReleaseAppliedFrontierWaiters()
+    {
+        // Same store-buffering shape as the setter (lease store above versus the reader's count
+        // publish followed by its lease re-read), hence the same fence. Rare path; cost irrelevant.
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref parkedAppliedFrontierWaiters) == 0)
+            return;
+
+        lock (appliedFrontierWaitersLock)
+        {
+            foreach (AppliedFrontierWaiter waiter in appliedFrontierWaiters)
+                waiter.Signal();
+
+            appliedFrontierWaiters.Clear();
+            Interlocked.Exchange(ref parkedAppliedFrontierWaiters, 0);
+        }
+    }
+
+    /// <summary>Binary search over the sorted registry: the slot holding <paramref name="requiredIndex"/>,
+    /// or the slot to insert it at when <paramref name="found"/> is false. Caller holds the lock.</summary>
+    private int FindAppliedFrontierSlot(long requiredIndex, out bool found)
+    {
+        int low = 0, high = appliedFrontierWaiters.Count - 1;
+        while (low <= high)
+        {
+            int mid = low + ((high - low) >> 1);
+            long at = appliedFrontierWaiters[mid].RequiredIndex;
+            if (at == requiredIndex)
+            {
+                found = true;
+                return mid;
+            }
+
+            if (at < requiredIndex)
+                low = mid + 1;
+            else
+                high = mid - 1;
+        }
+
+        found = false;
+        return low;
     }
 
     /// <summary>
@@ -520,4 +712,30 @@ internal sealed class RaftPartitionCoreState
     /// <summary>Reply correlation of the request that armed the pending transfer; completed with
     /// <see cref="Data.RaftOperationStatus.Pending"/> on handover or with the reason the wait ended.</summary>
     public ulong? PendingTransferReplyCorrelationId;
+}
+
+/// <summary>
+/// One parked target index in <see cref="RaftPartitionCoreState"/>'s applied-frontier registry: the
+/// index the readers need applied, the shared completion they await, and how many readers share it
+/// (maintained under the registry lock; a reader that gives up decrements it through
+/// <see cref="RaftPartitionCoreState.AbandonAppliedFrontierWaiter"/>). The completion runs its
+/// continuations asynchronously so the apply loop that signals it never runs a reader inline.
+/// </summary>
+internal sealed class AppliedFrontierWaiter
+{
+    private readonly TaskCompletionSource source = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public AppliedFrontierWaiter(long requiredIndex) => RequiredIndex = requiredIndex;
+
+    /// <summary>The applied index the readers on this entry are waiting for.</summary>
+    public long RequiredIndex { get; }
+
+    /// <summary>Readers sharing this entry. Registry-lock protected.</summary>
+    public int Readers = 1;
+
+    /// <summary>Completes when the frontier covers <see cref="RequiredIndex"/>, or on a lease death;
+    /// the reader re-checks the frontier after a wake.</summary>
+    public Task Covered => source.Task;
+
+    internal void Signal() => source.TrySetResult();
 }

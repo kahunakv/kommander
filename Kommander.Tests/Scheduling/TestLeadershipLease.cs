@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Kommander;
+using Kommander.Consensus;
 using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.Scheduling;
@@ -23,6 +24,11 @@ namespace Kommander.Tests.Scheduling;
 ///         explicit step-down, higher-term deposition via append ack, and a step-down notice at
 ///         an EQUAL term (the path that bypasses <c>FailAllActiveProposalWaiters</c>).</item>
 ///   <item>Expiry alone also kills a hit — a lease is never reused past its window.</item>
+///   <item>The off-thread applied-frontier wait (<c>WaitForAppliedFrontierAsync</c>) parks a reader
+///         on its own index: it is woken once, by the advance that covers it, never by advances
+///         below it; a lapse, a step-down or the confirmation deadline turns the wait into a miss;
+///         a step-down releases parked readers at once; a reader that gives up leaves nothing in
+///         the registry.</item>
 /// </list>
 /// </summary>
 public class TestLeadershipLease
@@ -425,6 +431,96 @@ public class TestLeadershipLease
 
         sm.SetLastAppliedIndexForTesting(5);
         Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        // The partial advance to 3 did not touch the reader; only the covering advance signalled it.
+        Assert.Equal(1, sm.AppliedFrontierWakeupsForTesting);
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+    }
+
+    [Fact]
+    public async Task ParkedReaderIsNotWokenByAdvancesBelowItsIndex()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(10);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+        Assert.Equal(1, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        // A leader applies a batch one entry at a time. The reader parked on the batch's end must
+        // see none of the nine advances below it: no continuation, no timer re-arm.
+        for (long applied = 1; applied < 10; applied++)
+            sm.SetLastAppliedIndexForTesting(applied);
+
+        Assert.Equal(0, sm.AppliedFrontierWakeupsForTesting);
+        Assert.False(wait.IsCompleted);
+
+        sm.SetLastAppliedIndexForTesting(10);
+        Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(1, sm.AppliedFrontierWakeupsForTesting);
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+    }
+
+    [Fact]
+    public async Task ReadersWithDifferentTargets_CompleteOnTheirOwnAdvance()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+
+        // Reader A read the commit frontier at 3; reader B read it later, at 5.
+        sm.SetLocalCommittedIndexForTesting(3);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndexA));
+        Task<bool> waitA = sm.WaitForAppliedFrontierAsync(term, readIndexA, CancellationToken.None).AsTask();
+
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out _, out long readIndexB));
+        Task<bool> waitB = sm.WaitForAppliedFrontierAsync(term, readIndexB, CancellationToken.None).AsTask();
+        Assert.Equal(2, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        // The intermediate advance covers A exactly, and only A.
+        sm.SetLastAppliedIndexForTesting(3);
+        Assert.True(await waitA.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(1, sm.AppliedFrontierWakeupsForTesting);
+        Assert.False(waitB.IsCompleted);
+        Assert.Equal(1, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        sm.SetLastAppliedIndexForTesting(4);
+        Assert.Equal(1, sm.AppliedFrontierWakeupsForTesting);
+        Assert.False(waitB.IsCompleted);
+
+        sm.SetLastAppliedIndexForTesting(5);
+        Assert.True(await waitB.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(2, sm.AppliedFrontierWakeupsForTesting);
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+    }
+
+    [Fact]
+    public async Task ReadersOnTheSameIndex_ShareOneWaiterAndWakeTogether()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        Task<bool>[] waits = new Task<bool>[8];
+        for (int i = 0; i < waits.Length; i++)
+            waits[i] = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+
+        // Eight readers, one distinct index: one registry entry, and one covering advance wakes all.
+        Assert.Equal(1, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        sm.SetLastAppliedIndexForTesting(5);
+        bool[] results = await Task.WhenAll(waits).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.All(results, Assert.True);
+        Assert.Equal(waits.Length, sm.AppliedFrontierWakeupsForTesting);
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
     }
 
     [Fact]
@@ -439,12 +535,60 @@ public class TestLeadershipLease
 
         Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
 
-        // The lease lapses while the reader is parked; the next frontier advance wakes it and it
-        // must hand the decision back to the executor path instead of serving on a stale lease.
+        // The lease lapses while the reader is parked. An advance below its index does not wake it;
+        // the covering advance does, and the reader must then hand the decision back to the executor
+        // path instead of serving on a stale lease.
         host.AdvanceMonotonic(host.Configuration.HeartbeatInterval);
         sm.SetLastAppliedIndexForTesting(2);
+        Assert.False(wait.IsCompleted);
+        sm.SetLastAppliedIndexForTesting(5);
 
         Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+    }
+
+    [Fact]
+    public async Task StepDownReleasesParkedReadersAtOnce()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        // A deadline far beyond the assertion window: only the release can end the wait in time.
+        host.Configuration.LeadershipConfirmationTimeout = TimeSpan.FromSeconds(60);
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+        Assert.Equal(1, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        // Nothing applies after the demotion. The reader must not sit on a dead lease until its
+        // deadline: the step-down releases it and it answers a miss now.
+        await sm.StepDownAsync(replyCorrelationId: null);
+
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+        Assert.Equal(0, sm.AppliedFrontierWakeupsForTesting);
+    }
+
+    [Fact]
+    public async Task CancelledFrontierWait_WithdrawsItsRegistration()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        using CancellationTokenSource cts = new();
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, cts.Token).AsTask();
+        Assert.Equal(1, sm.ParkedAppliedFrontierWaitersForTesting);
+
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => wait.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
     }
 
     [Fact]
@@ -481,5 +625,167 @@ public class TestLeadershipLease
         // Nothing ever applies: the wait is bounded by the confirmation timeout and answers a miss,
         // so a wedged consumer cannot park lease readers forever.
         Assert.False(await sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        // The reader that gave up withdrew its registration.
+        Assert.Equal(0, sm.ParkedAppliedFrontierWaitersForTesting);
+    }
+
+    // ── the applied-frontier waiter registry on its own ─────────────────────────
+
+    [Fact]
+    public void Registry_AlreadyCoveredIndex_NeedsNoWaiter()
+    {
+        RaftPartitionCoreState core = new();
+        core.LastAppliedIndex = 5;
+
+        Assert.Null(core.RegisterAppliedFrontierWaiter(5));
+        Assert.Null(core.RegisterAppliedFrontierWaiter(3));
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
+    }
+
+    [Fact]
+    public void Registry_SameIndexSharesOneEntry_AbandonRemovesItOnlyWhenEmpty()
+    {
+        RaftPartitionCoreState core = new();
+
+        AppliedFrontierWaiter? first = core.RegisterAppliedFrontierWaiter(7);
+        AppliedFrontierWaiter? second = core.RegisterAppliedFrontierWaiter(7);
+        Assert.NotNull(first);
+        Assert.Same(first, second);
+        Assert.Equal(1, core.ParkedAppliedFrontierWaiterCount);
+        Assert.Equal(2, first.Readers);
+
+        core.AbandonAppliedFrontierWaiter(first);
+        Assert.Equal(1, core.ParkedAppliedFrontierWaiterCount);
+        Assert.False(first.Covered.IsCompleted);
+
+        core.AbandonAppliedFrontierWaiter(first);
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
+        Assert.False(first.Covered.IsCompleted);
+
+        // A covering advance after the last reader left has nobody to wake.
+        core.LastAppliedIndex = 7;
+        Assert.False(first.Covered.IsCompleted);
+        Assert.Equal(0, core.AppliedFrontierWakeups);
+    }
+
+    [Fact]
+    public void Registry_PopsOnlyTheCoveredHeads_InIndexOrder()
+    {
+        RaftPartitionCoreState core = new();
+
+        // Registered out of order; the registry keeps them sorted.
+        AppliedFrontierWaiter? at9 = core.RegisterAppliedFrontierWaiter(9);
+        AppliedFrontierWaiter? at2 = core.RegisterAppliedFrontierWaiter(2);
+        AppliedFrontierWaiter? at5 = core.RegisterAppliedFrontierWaiter(5);
+        Assert.NotNull(at9);
+        Assert.NotNull(at2);
+        Assert.NotNull(at5);
+        Assert.Equal(3, core.ParkedAppliedFrontierWaiterCount);
+
+        core.LastAppliedIndex = 1;
+        Assert.False(at2.Covered.IsCompleted);
+        Assert.Equal(3, core.ParkedAppliedFrontierWaiterCount);
+
+        core.LastAppliedIndex = 6;
+        Assert.True(at2.Covered.IsCompleted);
+        Assert.True(at5.Covered.IsCompleted);
+        Assert.False(at9.Covered.IsCompleted);
+        Assert.Equal(1, core.ParkedAppliedFrontierWaiterCount);
+        Assert.Equal(2, core.AppliedFrontierWakeups);
+
+        // Abandoning a waiter that already completed is a harmless no-op.
+        core.AbandonAppliedFrontierWaiter(at5);
+        Assert.Equal(1, core.ParkedAppliedFrontierWaiterCount);
+
+        core.LastAppliedIndex = 9;
+        Assert.True(at9.Covered.IsCompleted);
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
+        Assert.Equal(3, core.AppliedFrontierWakeups);
+    }
+
+    [Fact]
+    public void Registry_LeaseDeathReleasesEveryWaiter_WithoutCountingAWake()
+    {
+        RaftPartitionCoreState core = new();
+        core.CurrentTerm = 1;
+        core.NodeState = RaftNodeState.Leader;
+        core.PublishLeadershipLease(term: 1, confirmedTicks: 0);
+
+        AppliedFrontierWaiter? at4 = core.RegisterAppliedFrontierWaiter(4);
+        AppliedFrontierWaiter? at8 = core.RegisterAppliedFrontierWaiter(8);
+        Assert.NotNull(at4);
+        Assert.NotNull(at8);
+
+        // A role change is the structural lease kill; it must also empty the registry.
+        core.NodeState = RaftNodeState.Follower;
+
+        Assert.Null(core.LeadershipLease);
+        Assert.True(at4.Covered.IsCompleted);
+        Assert.True(at8.Covered.IsCompleted);
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
+        Assert.Equal(0, core.AppliedFrontierWakeups);
+
+        // And a term change, with the registry populated again.
+        core.NodeState = RaftNodeState.Leader;
+        core.PublishLeadershipLease(term: 1, confirmedTicks: 0);
+        AppliedFrontierWaiter? again = core.RegisterAppliedFrontierWaiter(12);
+        Assert.NotNull(again);
+
+        core.CurrentTerm = 2;
+        Assert.True(again.Covered.IsCompleted);
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
+    }
+
+    [Fact]
+    public async Task Registry_ConcurrentRegisterAndAdvance_NeverLosesAWake()
+    {
+        // The store-buffering race the fences in RegisterAppliedFrontierWaiter and the frontier
+        // setter exist for. A lost wake shows up as a waiter still parked while the frontier covers
+        // it — exactly the state this loop asserts never happens, across many interleavings.
+        RaftPartitionCoreState core = new();
+        const int rounds = 20_000;
+
+        using Barrier start = new(2);
+        long parkedWhileCovered = 0;
+
+        Task advancer = Task.Run(() =>
+        {
+            for (long i = 1; i <= rounds; i++)
+            {
+                start.SignalAndWait();
+                core.LastAppliedIndex = i;
+            }
+        }, TestContext.Current.CancellationToken);
+
+        Task registrar = Task.Run(() =>
+        {
+            for (long i = 1; i <= rounds; i++)
+            {
+                start.SignalAndWait();
+                AppliedFrontierWaiter? waiter = core.RegisterAppliedFrontierWaiter(i);
+                if (waiter is null)
+                    continue;
+
+                // Either the advance already covered the index (the waiter must be completed by
+                // the time the setter returns) or it will shortly. Spin until the frontier covers
+                // the index, then the waiter must be completed — never still parked.
+                SpinWait spin = new();
+                while (core.LastAppliedIndex < i)
+                    spin.SpinOnce();
+
+                spin = new();
+                while (!waiter.Covered.IsCompleted && spin.Count < 10_000)
+                    spin.SpinOnce();
+
+                if (!waiter.Covered.IsCompleted)
+                    Interlocked.Increment(ref parkedWhileCovered);
+            }
+        }, TestContext.Current.CancellationToken);
+
+        await Task.WhenAll(advancer, registrar).WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, Interlocked.Read(ref parkedWhileCovered));
+        Assert.Equal(0, core.ParkedAppliedFrontierWaiterCount);
     }
 }

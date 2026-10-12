@@ -345,37 +345,58 @@ public sealed class RaftPartitionStateMachine
     /// leader. False means nothing — the lease lapsed, the term moved, the wait outlived
     /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>, or the caller cancelled — and the
     /// caller falls through to the executor path exactly as on a plain miss.</para>
+    /// <para><b>Wake shape.</b> The reader parks on its own index
+    /// (<see cref="RaftPartitionCoreState.RegisterAppliedFrontierWaiter"/>) and is signalled once, by
+    /// the advance that covers it — not by every entry applied below it — and the deadline is one
+    /// timed wait for the whole park, not one per wake. Under a leader that applies an 84-entry batch
+    /// one entry at a time the first shape of this method cost ~37 pool work items and a timer promise
+    /// per reader per batch; this one costs one continuation and one timed wait. A lease death releases
+    /// parked readers early (they re-validate and miss), and a reader that gives up withdraws its
+    /// registration so the registry holds live readers only.</para>
     /// </summary>
     internal async ValueTask<bool> WaitForAppliedFrontierAsync(long leaseTerm, long readIndex, CancellationToken cancellationToken)
     {
         long deadlineTicks = host.GetMonotonicTimestamp()
             + (long)(host.Configuration.LeadershipConfirmationTimeout.TotalSeconds * Stopwatch.Frequency);
 
+        // One pass per wake. A covering advance ends the loop on the next test (the frontier is
+        // monotonic); a lease-death release wakes the reader below its index, and the lease check
+        // then answers the miss.
         while (coreState.LastAppliedIndex < readIndex)
         {
-            Task advance = coreState.WaitForAppliedFrontierAdvanceAsync();
-
-            // Re-read after installing the wait: an advance between the loop test and the install is
-            // not signalled by the task.
-            if (coreState.LastAppliedIndex >= readIndex)
-                break;
+            AppliedFrontierWaiter? waiter = coreState.RegisterAppliedFrontierWaiter(readIndex);
+            if (waiter is null)
+                break;      // covered while registering
 
             // The lease must still be live while the reader waits: a lapse or a term change during the
-            // wait means the executor path decides, not this one.
+            // wait means the executor path decides, not this one. Checked AFTER the registration so a
+            // lease death that lands between the two is caught here or by the release, never missed.
             if (!TryReadFreshLease(out long term, out _) || term != leaseTerm)
+            {
+                coreState.AbandonAppliedFrontierWaiter(waiter);
                 return false;
+            }
 
             long remainingTicks = deadlineTicks - host.GetMonotonicTimestamp();
             if (remainingTicks <= 0)
+            {
+                coreState.AbandonAppliedFrontierWaiter(waiter);
                 return false;
+            }
 
             try
             {
-                await advance.WaitAsync(TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency), cancellationToken).ConfigureAwait(false);
+                await waiter.Covered.WaitAsync(TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency), cancellationToken).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
+                coreState.AbandonAppliedFrontierWaiter(waiter);
                 return false;
+            }
+            catch (OperationCanceledException)
+            {
+                coreState.AbandonAppliedFrontierWaiter(waiter);
+                throw;
             }
         }
 
@@ -1362,6 +1383,15 @@ public sealed class RaftPartitionStateMachine
     /// <summary>Advances the applied frontier for unit tests of the lease fast path's frontier wait,
     /// through the same setter the apply loop uses so the parked readers are woken.</summary>
     public void SetLastAppliedIndexForTesting(long appliedIndex) => coreState.LastAppliedIndex = appliedIndex;
+
+    /// <summary>Readers of the lease fast path woken by a covering applied-frontier advance so far
+    /// (<see cref="RaftPartitionCoreState.AppliedFrontierWakeups"/>); lets a test prove a parked reader
+    /// is signalled exactly once, by the advance that reaches its index.</summary>
+    public long AppliedFrontierWakeupsForTesting => coreState.AppliedFrontierWakeups;
+
+    /// <summary>Distinct indexes lease readers are currently parked on; proves abandoned waits leave
+    /// nothing behind.</summary>
+    public int ParkedAppliedFrontierWaitersForTesting => coreState.ParkedAppliedFrontierWaiterCount;
 
     /// <summary>
     /// Seeds one peer's optimistic replication progress for unit testing, exactly as the

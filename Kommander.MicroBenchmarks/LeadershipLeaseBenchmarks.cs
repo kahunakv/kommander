@@ -27,6 +27,13 @@ namespace Kommander.MicroBenchmarks;
 ///         the state-machine layer: one fresh <c>RaftResponse</c> per reply. The full production
 ///         round trip also paid the executor <c>Ask</c> (reply source + TCS + correlation-dict
 ///         insert + async boxes), so the real saving is larger than this baseline shows.</item>
+///   <item>Frontier wait (Vorpal <c>76ec8df7</c>, follow-up) — <see cref="Readers"/> readers parked
+///         under a fresh lease on the end of a <see cref="BatchEntries"/>-entry batch that the leader
+///         applies one entry at a time. The signal is the <b>allocated bytes per op being flat
+///         across <see cref="BatchEntries"/></b>: a reader is signalled once, by the covering
+///         advance, and arms one timed wait for the whole park. The first shape of this path paid a
+///         continuation plus a timer promise per reader per applied entry, so its bytes grew with
+///         the batch length (~37 pool items per reader on an 84-entry batch in production).</item>
 /// </list>
 /// </summary>
 [Config(typeof(InProcessConfig))]
@@ -91,6 +98,57 @@ public class LeadershipLeaseBenchmarks
     /// </summary>
     [Benchmark(Baseline = true, Description = "baseline: executor-side confirm fast path (RaftResponse per call)")]
     public Task ExecutorSide_ConfirmFastPath() => _sm.ConfirmLeadershipAsync(replyCorrelationId: 1);
+
+    /// <summary>Readers parked on the same batch end in <see cref="Lease_FrontierWait"/>.</summary>
+    [Params(1, 8)]
+    public int Readers { get; set; }
+
+    /// <summary>Entries the leader applies one at a time before the readers' index is covered.</summary>
+    [Params(1, 84)]
+    public int BatchEntries { get; set; }
+
+    private Task<bool>[] _frontierWaits = [];
+    private long _frontier = -1;
+
+    [GlobalSetup(Target = nameof(Lease_FrontierWait))]
+    public void SetupFrontierWait()
+    {
+        Setup();
+        _frontierWaits = new Task<bool>[Readers];
+        _frontier = -1;
+    }
+
+    /// <summary>
+    /// One commit-to-apply window: the commit frontier moves by a batch, <see cref="Readers"/>
+    /// readers read the lease and park on the batch end, then the batch applies entry by entry.
+    /// Expected: bytes/op independent of <see cref="BatchEntries"/>; every reader answers a hit.
+    /// </summary>
+    [Benchmark(Description = "lease: frontier wait, N readers parked on a K-entry batch applied one entry at a time")]
+    public async Task<bool> Lease_FrontierWait()
+    {
+        long target = _frontier + BatchEntries;
+        _sm.SetLocalCommittedIndexForTesting(target);
+
+        if (!_sm.TryReadFreshLease(out long term, out long readIndex) || readIndex != target)
+            throw new InvalidOperationException("Benchmark setup drifted: the lease is not fresh.");
+
+        for (int i = 0; i < _frontierWaits.Length; i++)
+            _frontierWaits[i] = _sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+
+        for (long applied = _frontier + 1; applied <= target; applied++)
+            _sm.SetLastAppliedIndexForTesting(applied);
+
+        _frontier = target;
+
+        bool all = true;
+        for (int i = 0; i < _frontierWaits.Length; i++)
+            all &= await _frontierWaits[i].ConfigureAwait(false);
+
+        if (!all)
+            throw new InvalidOperationException("A parked reader missed under a fresh lease.");
+
+        return all;
+    }
 
     // ── stubs ─────────────────────────────────────────────────────────────────
 
