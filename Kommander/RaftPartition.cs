@@ -788,6 +788,12 @@ public sealed class RaftPartition : IDisposable
         if (stateMachine.TryConfirmLeadershipFast())
             return true;
 
+        // A fresh lease whose applied frontier lags the commit frontier: wait for the apply off the
+        // executor instead of paying a round for it. A false answer here is a plain miss.
+        if (stateMachine.TryReadFreshLease(out long leaseTerm, out long readIndex)
+            && await stateMachine.WaitForAppliedFrontierAsync(leaseTerm, readIndex, cancellationToken).ConfigureAwait(false))
+            return true;
+
         RaftResponse response = await executor.Ask(ConfirmLeadershipRequest, cancellationToken).ConfigureAwait(false);
         return response.Status == RaftOperationStatus.Success;
     }

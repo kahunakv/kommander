@@ -350,4 +350,136 @@ public class TestLeadershipLease
         Assert.True(all);
         Assert.Equal(0, allocated);
     }
+
+    // ── lease refresh from the ack stream ─────────────────────────────────────
+
+    [Fact]
+    public async Task SameTermAppendAcksPublishTheLease_WithoutAReadIndexRound()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        Assert.False(sm.TryConfirmLeadershipFast());
+
+        // One peer ack plus the leader is a majority of three voters: the ordinary replication
+        // stream proves the quorum still follows this leader, so the lease is published with no
+        // read-index round at all.
+        await Ack(sm, host, "node-b");
+        Assert.True(sm.TryConfirmLeadershipFast());
+
+        // The lease still lapses after one heartbeat interval without acks...
+        host.AdvanceMonotonic(host.Configuration.HeartbeatInterval);
+        Assert.False(sm.TryConfirmLeadershipFast());
+
+        // ...and the next same-term ack renews it, so a leader under a steady write stream never lapses.
+        await Ack(sm, host, "node-c");
+        Assert.True(sm.TryConfirmLeadershipFast());
+    }
+
+    [Fact]
+    public async Task AckRefreshAnchorsAtTheMajorityThNewestAck()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c", "node-d", "node-e");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        // Five voters: the leader plus two peers make the majority. One peer alone proves nothing.
+        await Ack(sm, host, "node-b");
+        Assert.False(sm.TryConfirmLeadershipFast());
+
+        // The second peer's ack completes the majority; the lease is anchored at the OLDER of the two
+        // acks (node-b's), so a lease that is fresh now lapses one heartbeat interval after that ack.
+        host.AdvanceMonotonic(host.Configuration.HeartbeatInterval / 2);
+        await Ack(sm, host, "node-c");
+        Assert.True(sm.TryConfirmLeadershipFast());
+
+        host.AdvanceMonotonic(host.Configuration.HeartbeatInterval / 2);
+        Assert.False(sm.TryConfirmLeadershipFast());
+    }
+
+    // ── off-thread applied-frontier wait under a fresh lease ───────────────────
+
+    [Fact]
+    public async Task FreshLeaseWithLaggingApply_WaitsForTheFrontierThenHits()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+
+        // Committed ahead of applied: the synchronous fast path misses, but the lease itself is good
+        // and names the commit frontier the reader has to see applied.
+        Assert.False(sm.TryConfirmLeadershipFast());
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+        Assert.Equal(1, term);
+        Assert.Equal(5, readIndex);
+
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+        await Task.Delay(50);
+        Assert.False(wait.IsCompleted);
+
+        // Applying up to (but not through) the frontier wakes the reader and parks it again.
+        sm.SetLastAppliedIndexForTesting(3);
+        await Task.Delay(50);
+        Assert.False(wait.IsCompleted);
+
+        sm.SetLastAppliedIndexForTesting(5);
+        Assert.True(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task FrontierWaitIsAMissWhenTheLeaseLapsesMeanwhile()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+
+        // The lease lapses while the reader is parked; the next frontier advance wakes it and it
+        // must hand the decision back to the executor path instead of serving on a stale lease.
+        host.AdvanceMonotonic(host.Configuration.HeartbeatInterval);
+        sm.SetLastAppliedIndexForTesting(2);
+
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task FrontierWaitIsAMissAfterAStepDown_EvenWhenTheFrontierArrives()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        Task<bool> wait = sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask();
+
+        // Demoted while parked: the frontier then arrives as a follower applying the new leader's
+        // entries. Covering the index is not enough — the lease is gone, so this is a miss.
+        await sm.StepDownAsync(replyCorrelationId: null);
+        sm.SetLastAppliedIndexForTesting(5);
+
+        Assert.False(await wait.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task FrontierWaitGivesUpAtTheConfirmationTimeout()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+        host.Configuration.LeadershipConfirmationTimeout = TimeSpan.FromMilliseconds(200);
+
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.True(sm.TryReadFreshLease(out long term, out long readIndex));
+
+        // Nothing ever applies: the wait is bounded by the confirmation timeout and answers a miss,
+        // so a wedged consumer cannot park lease readers forever.
+        Assert.False(await sm.WaitForAppliedFrontierAsync(term, readIndex, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+    }
 }

@@ -169,7 +169,8 @@ internal sealed class RaftPartitionCoreState
     public LeadershipLease? LeadershipLease => leadershipLease;
 
     /// <summary>Publishes a fresh leadership lease. Executor thread only; called from the
-    /// read-index quorum confirmation, which is the only event that proves leadership.</summary>
+    /// read-index quorum confirmation and from a same-term ack that completes a majority contact,
+    /// the two events that prove a quorum still follows this leader.</summary>
     public void PublishLeadershipLease(long term, long confirmedTicks) =>
         leadershipLease = new(term, confirmedTicks);
 
@@ -378,10 +379,40 @@ internal sealed class RaftPartitionCoreState
                 localEndpoint);
 
             Volatile.Write(ref lastAppliedIndexValue, value);
+
+            // Wake any off-thread reader parked on the frontier. One volatile read when nobody waits,
+            // which is the steady state; the exchange runs only while a lease reader is parked.
+            if (Volatile.Read(ref appliedFrontierPulse) is not null)
+                Interlocked.Exchange(ref appliedFrontierPulse, null)?.TrySetResult();
         }
     }
 
     private long lastAppliedIndexValue = -1;
+
+    /// <summary>
+    /// Completion that the next advance of <see cref="LastAppliedIndex"/> fires, for readers that hold a
+    /// fresh leadership lease but found the applied frontier behind the commit frontier. Created lazily by
+    /// the first waiter and consumed by the advance that follows, so an idle partition holds nothing here.
+    /// Continuations run asynchronously: the apply loop must never execute a reader's continuation inline.
+    /// </summary>
+    private TaskCompletionSource? appliedFrontierPulse;
+
+    /// <summary>
+    /// A task that completes on the next advance of <see cref="LastAppliedIndex"/>. The caller must re-read
+    /// the frontier after installing the wait and before awaiting it: an advance that landed between its
+    /// first read and this call is not signalled by the task.
+    /// </summary>
+    public Task WaitForAppliedFrontierAdvanceAsync()
+    {
+        TaskCompletionSource? pulse = Volatile.Read(ref appliedFrontierPulse);
+        if (pulse is null)
+        {
+            TaskCompletionSource fresh = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            pulse = Interlocked.CompareExchange(ref appliedFrontierPulse, fresh, null) ?? fresh;
+        }
+
+        return pulse.Task;
+    }
 
     /// <summary>
     /// Ticket of the in-flight promotion-barrier no-op, or <see cref="HLCTimestamp.Zero"/> when no

@@ -297,6 +297,25 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     internal bool TryConfirmLeadershipFast()
     {
+        if (!TryReadFreshLease(out _, out long committed))
+            return false;
+
+        long applied = coreState.LastAppliedIndex;
+        return applied >= committed;
+    }
+
+    /// <summary>
+    /// The first half of <see cref="TryConfirmLeadershipFast"/> on its own: a published lease that is
+    /// fresh, on a node that is the published leader. <paramref name="readIndex"/> is the commit
+    /// frontier read under that lease — what a reader must see applied before it may serve — and
+    /// <paramref name="term"/> is the term the lease was confirmed in. The applied frontier is not
+    /// checked here; <see cref="WaitForAppliedFrontierAsync"/> is the off-thread way to wait for it.
+    /// </summary>
+    internal bool TryReadFreshLease(out long term, out long readIndex)
+    {
+        term = -1;
+        readIndex = -1;
+
         Consensus.LeadershipLease? lease = coreState.LeadershipLease;
         if (lease is null)
             return false;
@@ -310,9 +329,57 @@ public sealed class RaftPartitionStateMachine
         if (RaftMonotonic.Elapsed(lease.ConfirmedTicks, host.GetMonotonicTimestamp()) >= host.Configuration.HeartbeatInterval)
             return false;
 
-        long committed = coreState.LocalCommittedIndex;
-        long applied = coreState.LastAppliedIndex;
-        return applied >= committed;
+        term = lease.Term;
+        readIndex = coreState.LocalCommittedIndex;
+        return true;
+    }
+
+    /// <summary>
+    /// Off-thread second half of the lease fast path: parks the caller until the applied frontier covers
+    /// <paramref name="readIndex"/>, then answers whether the lease is still a hit. This is what the
+    /// executor-side confirmation does with its applied-frontier waiters, without the executor round:
+    /// under a write stream the leader sits in the committed-but-not-yet-applied window a few percent of
+    /// the time, and every read that landed in it used to pay a full <c>Ask(ConfirmLeadership)</c>.
+    /// <para>True means the same thing a <see cref="TryConfirmLeadershipFast"/> hit means: the frontier
+    /// covers the commit index read under a lease that is still fresh, on the same term, on the published
+    /// leader. False means nothing — the lease lapsed, the term moved, the wait outlived
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>, or the caller cancelled — and the
+    /// caller falls through to the executor path exactly as on a plain miss.</para>
+    /// </summary>
+    internal async ValueTask<bool> WaitForAppliedFrontierAsync(long leaseTerm, long readIndex, CancellationToken cancellationToken)
+    {
+        long deadlineTicks = host.GetMonotonicTimestamp()
+            + (long)(host.Configuration.LeadershipConfirmationTimeout.TotalSeconds * Stopwatch.Frequency);
+
+        while (coreState.LastAppliedIndex < readIndex)
+        {
+            Task advance = coreState.WaitForAppliedFrontierAdvanceAsync();
+
+            // Re-read after installing the wait: an advance between the loop test and the install is
+            // not signalled by the task.
+            if (coreState.LastAppliedIndex >= readIndex)
+                break;
+
+            // The lease must still be live while the reader waits: a lapse or a term change during the
+            // wait means the executor path decides, not this one.
+            if (!TryReadFreshLease(out long term, out _) || term != leaseTerm)
+                return false;
+
+            long remainingTicks = deadlineTicks - host.GetMonotonicTimestamp();
+            if (remainingTicks <= 0)
+                return false;
+
+            try
+            {
+                await advance.WaitAsync(TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency), cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
+        }
+
+        return TryReadFreshLease(out long finalTerm, out _) && finalTerm == leaseTerm;
     }
 
     /// <summary>
@@ -1291,6 +1358,10 @@ public sealed class RaftPartitionStateMachine
         // recreate a demoted node, which the monotonic check would reject.
         coreState.SetLocalCommittedIndexUnchecked(committedIndex);
     }
+
+    /// <summary>Advances the applied frontier for unit tests of the lease fast path's frontier wait,
+    /// through the same setter the apply loop uses so the parked readers are woken.</summary>
+    public void SetLastAppliedIndexForTesting(long appliedIndex) => coreState.LastAppliedIndex = appliedIndex;
 
     /// <summary>
     /// Seeds one peer's optimistic replication progress for unit testing, exactly as the

@@ -313,7 +313,64 @@ internal sealed class ReadIndexCoordinator
     /// <see cref="RegisterAckAsync"/> because the two consume the same event for different
     /// purposes: the round proves leadership once, this tracks per-peer recency continuously.
     /// </summary>
-    public void RecordVoterAck(string endpoint, long nowTicks) => lastVoterAckTicks[endpoint] = nowTicks;
+    public void RecordVoterAck(string endpoint, long nowTicks)
+    {
+        lastVoterAckTicks[endpoint] = nowTicks;
+        RefreshLeaseFromAcks();
+    }
+
+    /// <summary>
+    /// Re-publishes the leadership lease from the ordinary ack stream. The instant a majority of voters
+    /// (the leader counting as now) has a same-term ack no older than <c>t</c> proves exactly what a
+    /// read-index round proves at its quorum: at <c>t</c> every one of them still followed this leader,
+    /// and pre-vote stickiness keeps a rival from assembling an election quorum for one heartbeat
+    /// interval after it. Anchoring the lease at the majority-th newest ack (the oldest ack inside the
+    /// majority) is therefore as conservative as the round's own anchor. Without this a leader under a
+    /// steady write stream let its lease lapse every heartbeat interval although every append was being
+    /// acknowledged, and every read in flight at the lapse paid an executor round.
+    /// </summary>
+    private void RefreshLeaseFromAcks()
+    {
+        if (coreState.NodeState != RaftNodeState.Leader)
+            return;
+
+        long contactTicks = MajorityContactTicks(host.GetMonotonicTimestamp());
+        if (contactTicks == 0)
+            return;
+
+        if (lastLeadershipConfirmedTerm == coreState.CurrentTerm && contactTicks <= lastLeadershipConfirmedTicks)
+            return;
+
+        lastLeadershipConfirmedTicks = contactTicks;
+        lastLeadershipConfirmedTerm = coreState.CurrentTerm;
+        coreState.PublishLeadershipLease(coreState.CurrentTerm, contactTicks);
+    }
+
+    /// <summary>
+    /// The monotonic instant at which a majority of voters was last simultaneously in contact: the
+    /// majority-th newest same-term voter ack, the leader itself counting as <paramref name="nowTicks"/>.
+    /// Zero when no majority has acked yet. Executor thread only (uses the shared scratch list).
+    /// </summary>
+    private long MajorityContactTicks(long nowTicks)
+    {
+        int votersTotal = 1;    // the local leader
+        voterAckScratch.Clear();
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (!host.IsVoter(node.Endpoint))
+                continue;
+            votersTotal++;
+            voterAckScratch.Add(lastVoterAckTicks.TryGetValue(node.Endpoint, out long ackTicks) ? ackTicks : 0);
+        }
+
+        int peersNeeded = votersTotal / 2 + 1 - 1; // majority minus the leader itself
+        if (peersNeeded <= 0)
+            return nowTicks; // single-voter partition: the leader alone is the quorum
+
+        voterAckScratch.Sort();
+        voterAckScratch.Reverse();
+        return voterAckScratch[peersNeeded - 1];
+    }
 
     /// <summary>
     /// Starts a new round for the callers that could not join the previous one (the commit
@@ -444,28 +501,7 @@ internal sealed class ReadIndexCoordinator
 
         TimeSpan window = host.Configuration.CheckQuorumWindow;
 
-        int votersTotal = 1;    // the local leader
-        voterAckScratch.Clear();
-        foreach (RaftNode node in host.Nodes)
-        {
-            if (!host.IsVoter(node.Endpoint))
-                continue;
-            votersTotal++;
-            voterAckScratch.Add(lastVoterAckTicks.TryGetValue(node.Endpoint, out long ackTicks) ? ackTicks : 0);
-        }
-
-        int peersNeeded = votersTotal / 2 + 1 - 1; // majority minus the leader itself
-        long contactTicks;
-        if (peersNeeded <= 0)
-        {
-            contactTicks = nowTicks; // single-voter partition: the leader alone is the quorum
-        }
-        else
-        {
-            voterAckScratch.Sort();
-            voterAckScratch.Reverse();
-            contactTicks = voterAckScratch[peersNeeded - 1];
-        }
+        long contactTicks = MajorityContactTicks(nowTicks);
 
         if (contactTicks < leadershipAnchorTicks)
             contactTicks = leadershipAnchorTicks;
