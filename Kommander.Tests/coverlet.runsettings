@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <!-- Coverage is gated on the Kommander library only: the server host, benchmarks, and the test
+       assembly itself are out of scope. Generated sources under obj/ (protobuf stubs, gRPC client
+       bindings, LoggerMessage/STJ/RequestDelegate source-generator output) are excluded by file
+       glob rather than tested. -->
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+          <Include>[Kommander]*</Include>
+          <ExcludeByFile>**/obj/**/*.cs</ExcludeByFile>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

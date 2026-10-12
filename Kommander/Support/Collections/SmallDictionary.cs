@@ -145,6 +145,8 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
     {
         get
         {
+            ArgumentNullException.ThrowIfNull(key);
+
             int index = IndexOf(key);
             if (index < 0)
                 throw new KeyNotFoundException($"The given key '{key}' was not present in the dictionary.");

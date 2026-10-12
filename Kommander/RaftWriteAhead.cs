@@ -1245,16 +1245,12 @@ public sealed class RaftWriteAhead
                     case RaftLogType.Proposed:
                     {
                         log.Type = RaftLogType.RolledBack;
-
-                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
                     }
                     break;
 
                     case RaftLogType.ProposedCheckpoint:
                     {
                         log.Type = RaftLogType.RolledBackCheckpoint;
-
-                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
                     }
                     break;
                 }
