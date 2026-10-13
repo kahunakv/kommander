@@ -26,6 +26,13 @@ namespace Kommander;
 /// Voter was confirmed. A node in that state is a member like any other and must auto-rejoin
 /// after a later eviction; keeping the latch there parked an evicted ex-leaver as NotMember
 /// forever while it still led its ranges (Kahuna nightly, 2026-10-11).
+/// A drain whose <c>Voter → Leaving</c> commit was never confirmed (the request timed out
+/// against an unreachable or mid-election P0 leader) keeps the latch too, because the commit may
+/// still land — but it arms the roster observer, so the next committed roster decides: one that
+/// still names the node <c>Voter</c>, or one that evicts it before any <c>Leaving</c> was ever
+/// committed, releases the latch; one that names it <c>Leaving</c> confirms the drain. Without
+/// that, a timed-out request left the latch raised with nothing able to release it, and a later
+/// eviction parked the node exactly as above (Kahuna nightly, 2026-10-13).
 /// </para>
 /// <para>
 /// Ordering matters throughout: drain → role transition → roster removal → teardown. Committing
@@ -65,7 +72,9 @@ internal sealed class ClusterLeaveService : IDisposable
     /// confirmed — either by the rollback commit itself (<see cref="RollBackDrainAsync"/>) or by a
     /// later committed roster that names this node <c>Voter</c> again
     /// (<see cref="ObserveCommittedRoster"/>, which covers a rollback whose acknowledgement was
-    /// lost). Never released by <see cref="LeaveCluster"/>: teardown follows there regardless.
+    /// lost, and a drain request whose <c>Leaving</c> commit never landed — see
+    /// <see cref="_drainLegUnconfirmed"/>). Never released by <see cref="LeaveCluster"/>: teardown
+    /// follows there regardless.
     /// Election suppression (<see cref="_leaving"/>) is a separate latch — a node that was refused
     /// is still a full member and must keep campaigning.
     /// </para>
@@ -83,6 +92,18 @@ internal sealed class ClusterLeaveService : IDisposable
     /// nothing about the attempt.
     /// </summary>
     private long _drainRoleCommittedVersion;
+
+    /// <summary>
+    /// True while the drain's <c>Voter → Leaving</c> commit is unconfirmed: the request timed out
+    /// (or found no leader) and no committed roster has shown this node <c>Leaving</c> since.
+    /// Distinguishes that state from a drain that did commit <c>Leaving</c>: a roster that
+    /// <i>excludes</i> the node after a confirmed drain is the drain's own removal (the latch must
+    /// stay), while the same roster after an unconfirmed request can only be an eviction (the
+    /// pass removes <c>Leaving</c> members only, and none was ever committed), so the latch is
+    /// released and the node auto-rejoins. Cleared when <c>Leaving</c> is confirmed (by the
+    /// commit's answer or by a committed roster) and when the latch is released.
+    /// </summary>
+    private volatile bool _drainLegUnconfirmed;
 
     /// <summary>
     /// Serializes <see cref="RequestLeaveAsync"/> so two concurrent callers cannot run overlapping
@@ -154,6 +175,15 @@ internal sealed class ClusterLeaveService : IDisposable
     /// (<c>SetMemberRole</c>), or an explicit operator re-admission followed by promotion — and in
     /// both cases the node is a full member again by intent.
     /// <para>
+    /// Also settles a drain request whose <c>Leaving</c> commit was never confirmed
+    /// (<see cref="_drainLegUnconfirmed"/>): a newer roster naming the node <c>Voter</c> releases
+    /// the latch as above; the very next roster excluding the node is an eviction (no
+    /// <c>Leaving</c> was committed in between, and the pass removes <c>Leaving</c> members only),
+    /// so it releases the latch too and the auto-rejoin check that follows re-admits the node; a
+    /// roster naming the node <c>Leaving</c> confirms the drain, re-raises the latch if a roster
+    /// in between had released it, and arms the watermark at that version.
+    /// </para>
+    /// <para>
     /// This is the path that catches a rollback whose acknowledgement was lost:
     /// <see cref="RollBackDrainAsync"/> may return with the roster still showing <c>Leaving</c>
     /// while the commit lands moments later. Ordering is guaranteed by the handler, which runs
@@ -163,16 +193,43 @@ internal sealed class ClusterLeaveService : IDisposable
     /// </summary>
     internal void ObserveCommittedRoster(ClusterMembership membership)
     {
-        long armedAt = Volatile.Read(ref _drainRoleCommittedVersion);
-
-        if (!_leaveRequested || armedAt == 0 || _leaving || membership.MembershipVersion <= armedAt)
+        if (_leaving)
             return;
 
         ClusterMember? self = membership.Members
             .FirstOrDefault(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal));
 
+        // A committed Leaving role can only come from this node's own drain request. It confirms
+        // a request whose acknowledgement was lost (the latch was kept, the watermark armed), and
+        // it re-raises a latch that a Voter roster released in between: the drain is in force and
+        // its removal must not be undone by an auto-rejoin.
+        if (self?.Role == ClusterMemberRole.Leaving)
+        {
+            _leaveRequested = true;
+            _drainLegUnconfirmed = false;
+            ArmDrainRoleWatermark(membership.MembershipVersion);
+            return;
+        }
+
+        long armedAt = Volatile.Read(ref _drainRoleCommittedVersion);
+
+        if (!_leaveRequested || armedAt == 0 || membership.MembershipVersion <= armedAt)
+            return;
+
         if (self?.Role == ClusterMemberRole.Voter)
+        {
             ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} names this node Voter again after a drain");
+            return;
+        }
+
+        // Excluded by the very next roster after an unconfirmed drain request. Roster versions
+        // advance by one per commit, so no Leaving could have been committed in between: the
+        // placement pass removes Leaving members only, which makes this exclusion a dead-member
+        // eviction, not the drain's removal. The handler runs the auto-rejoin check right after
+        // this call, so the release takes effect for this same roster. A roster that skipped
+        // versions (gossip push, snapshot) proves nothing and keeps the latch.
+        if (self is null && _drainLegUnconfirmed && membership.MembershipVersion == armedAt + 1)
+            ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} evicted this node and no roster since the unconfirmed drain request (v{armedAt}) named it Leaving");
     }
 
     /// <summary>
@@ -186,6 +243,7 @@ internal sealed class ClusterLeaveService : IDisposable
             return;
 
         _leaveRequested = false;
+        _drainLegUnconfirmed = false;
         Volatile.Write(ref _drainRoleCommittedVersion, 0);
 
         if (logger.IsEnabled(LogLevel.Information))
@@ -486,7 +544,9 @@ internal sealed class ClusterLeaveService : IDisposable
                     // A refusal committed nothing and sent nothing that can still land: the node
                     // is the same full Voter it was before the call. (A DrainTimedOut release is
                     // decided inside RollBackDrainAsync, where the rollback's confirmation is
-                    // known; a Timeout keeps the latch — the Leaving commit may still land.)
+                    // known; a Timeout keeps the latch — the Leaving commit may still land —
+                    // but arms ObserveCommittedRoster, which releases it on the next committed
+                    // roster that names the node Voter or evicts it before any Leaving landed.)
                     if (terminal.Outcome is LeaveClusterOutcome.RefusedDrainInProgress or LeaveClusterOutcome.RefusedInsufficientVoters)
                         ReleaseLeaveRequest($"the drain was refused ({terminal.Outcome}) and nothing was committed");
 
@@ -594,7 +654,20 @@ internal sealed class ClusterLeaveService : IDisposable
                         .FirstOrDefault(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal));
 
                     if (self?.Role != ClusterMemberRole.Leaving)
+                    {
+                        // The latch stays raised (the commit may still land) but must not stay
+                        // raised forever: arm the roster observer at the current version. The
+                        // next committed roster settles it — Voter or an eviction before any
+                        // Leaving releases the latch, Leaving confirms the drain. Without this
+                        // the node had no release path at all, and a later eviction parked it
+                        // as a NotMember range leader (Kahuna nightly, 2026-10-13).
+                        _drainLegUnconfirmed = true;
+                        ArmDrainRoleWatermark(0);
+
+                        logger.LogWarning("[{LocalEndpoint}] RequestLeaveAsync: the Voter -> Leaving commit was not confirmed ({Status}); the roster still names this node Voter. The leave request stays in force until the next committed roster settles it.", localEndpoint, status);
+
                         return new(LeaveClusterOutcome.Timeout, systemCoordinator.GetMembership().MembershipVersion);
+                    }
 
                     break;
             }
@@ -604,6 +677,7 @@ internal sealed class ClusterLeaveService : IDisposable
         // the roster after a lost acknowledgement, or resumed from a previous attempt). Arm the
         // roster observer: a roster newer than this one naming the node Voter can now only be
         // the rollback. (Idempotent after the Success branch above.)
+        _drainLegUnconfirmed = false;
         ArmDrainRoleWatermark(0);
 
         // ── Wait for evacuation ──────────────────────────────────────────────

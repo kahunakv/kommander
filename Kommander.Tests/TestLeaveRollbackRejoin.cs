@@ -24,6 +24,14 @@ namespace Kommander.Tests;
 /// back by construction; the latch must be released; a subsequent SWIM eviction must then
 /// trigger auto-rejoin, and the placement map must settle with no transitional replica left.
 /// </para>
+/// <para>
+/// The 2026-10-13 recurrence took the other exit of the drain: the <c>Voter → Leaving</c> commit
+/// itself timed out against a P0 leader that was mid-election, so no roster ever named the node
+/// Leaving, the latch stayed raised with nothing armed to release it, and the next eviction
+/// parked the node the same way. The <c>DrainCommitTimedOut</c> tests drive that exit by
+/// dropping the leaver's messages to the P0 leader (one way, so it keeps hearing heartbeats and
+/// neither campaigns nor gets evicted) until the request reports <c>Timeout</c>.
+/// </para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestLeaveRollbackRejoin
@@ -244,6 +252,96 @@ public sealed class TestLeaveRollbackRejoin
             ct, timeoutMs: 15_000);
     }
 
+    /// <summary>
+    /// Forces the drain-leg exit of the 2026-10-13 incident: the leaver's messages to the P0
+    /// leader are dropped (one way) so its <c>SetMemberRole(Leaving)</c> never arrives, the
+    /// request reports <see cref="LeaveClusterOutcome.Timeout"/>, and no committed roster names
+    /// the leaver Leaving. The latch is deliberately still raised on return — the commit could
+    /// still land — and the link is restored. Returns the roster version at which the request
+    /// gave up: the watermark the next committed roster is judged against.
+    /// </summary>
+    private static async Task<long> DrainCommitTimesOutAndKeepsLatch(
+        InMemoryCommunication comm, RaftManager[] nodes, RaftManager leaver, RaftManager p0Leader, CancellationToken ct)
+    {
+        string leaverEndpoint = leaver.LocalEndpoint;
+        long versionBefore = leaver.GetMembership().MembershipVersion;
+
+        comm.BlockLink(leaverEndpoint, p0Leader.LocalEndpoint);
+        try
+        {
+            LeaveClusterResult result = await leaver.RequestLeaveAsync(ct);
+
+            Assert.Equal(LeaveClusterOutcome.Timeout, result.Outcome);
+            Assert.False(result.Left);
+            Assert.False(result.Drained);
+        }
+        finally
+        {
+            comm.UnblockLink(leaverEndpoint, p0Leader.LocalEndpoint);
+        }
+
+        Assert.All(nodes, n => Assert.True(RosterEntry(n, leaverEndpoint) is { Role: ClusterMemberRole.Voter },
+            "the Leaving commit must never have landed: every node still names the leaver Voter"));
+        Assert.Equal(versionBefore, leaver.GetMembership().MembershipVersion);
+        Assert.True(leaver.IsLeaveRequested,
+            "an unconfirmed drain request keeps the latch until a committed roster settles it");
+
+        return versionBefore;
+    }
+
+    /// <summary>
+    /// Admits a fifth node to a running four-node cluster. The join commits a new roster that
+    /// still names every existing member Voter — the shape of the roster advance (an unrelated
+    /// eviction, v14) that followed the timed-out request in the incident.
+    /// </summary>
+    private static async Task<RaftManager> JoinFifthNode(
+        InMemoryCommunication comm, RaftManager[] nodes, ILogger<IRaft> logger, int basePort, TimeSpan drainTimeout, CancellationToken ct)
+    {
+        string Ep(int i) => $"localhost:{basePort + i}";
+        RaftManager fifth = MakeNode(comm, basePort + 5, 5, [Ep(1), Ep(2), Ep(3), Ep(4)], logger, drainTimeout);
+
+        Dictionary<string, IRaft> all = new();
+        foreach (RaftManager n in nodes)
+            all[n.LocalEndpoint] = n;
+        all[fifth.LocalEndpoint] = fifth;
+        comm.SetNodes(all);
+
+        await fifth.UpdateNodes();
+        await fifth.JoinCluster([Ep(1), Ep(2), Ep(3), Ep(4)], ct);
+
+        await WaitForCondition(
+            () => nodes.All(n => RosterEntry(n, fifth.LocalEndpoint) is not null),
+            ct, timeoutMs: 30_000);
+
+        return fifth;
+    }
+
+    /// <summary>
+    /// The heal-and-rejoin tail shared by the eviction tests: the evicted leaver learns the
+    /// excluding roster through its own gossip, must auto-rejoin, return to Voter, and the map
+    /// must settle at full RF with no transitional replica.
+    /// </summary>
+    private static async Task HealAndExpectRejoin(
+        InMemoryCommunication comm, RaftManager[] nodes, RaftManager[] survivors, RaftManager leaver, long evictedVersion, CancellationToken ct)
+    {
+        string leaverEndpoint = leaver.LocalEndpoint;
+        comm.HealPartition(leaverEndpoint);
+
+        await WaitForCondition(
+            () =>
+            {
+                leaver.GossipAsync(ct).GetAwaiter().GetResult();
+                return survivors.All(s => RosterEntry(s, leaverEndpoint) is not null);
+            },
+            ct, timeoutMs: 30_000);
+
+        Assert.True(survivors[0].GetMembership().MembershipVersion > evictedVersion,
+            "re-admission must commit a new roster version");
+
+        await WaitForCondition(() => leaver.LocalRole == ClusterMemberRole.Voter, ct, timeoutMs: 30_000);
+        await WaitForCondition(() => nodes.All(n => MapSettled(n, 3)), ct, timeoutMs: 30_000);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -356,6 +454,95 @@ public sealed class TestLeaveRollbackRejoin
                     ct);
                 Assert.False(first.IsLeaveRequested);
             }
+        }
+        finally
+        {
+            comm.HealAll();
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The 2026-10-13 chain. The drain's Leaving commit times out and no roster ever names the
+    /// leaver Leaving. A later, unrelated roster advance (here a fifth node joining; in the
+    /// incident the eviction of another node) still names the leaver Voter: that must release
+    /// the latch, so that when the leaver is evicted afterwards it auto-rejoins and the planner's
+    /// repair completes. Red before the fix: the request left the roster observer unarmed, the
+    /// latch stayed raised for the life of the process, and the leaver stayed NotMember.
+    /// </summary>
+    [Fact]
+    public async Task RequestLeave_DrainCommitTimedOut_LaterRosterNamesVoter_ReleasesLatchAndAutoRejoinsAfterEviction()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        const int basePort = 8900;
+        TimeSpan drainTimeout = TimeSpan.FromMilliseconds(300);
+        (RaftManager[] nodes, InMemoryCommunication comm) = await BuildCluster(logger, basePort, drainTimeout, ct);
+        RaftManager? fifth = null;
+
+        try
+        {
+            RaftManager p0Leader = await P0Leader(nodes, ct);
+            RaftManager leaver = nodes.First(n => !ReferenceEquals(n, p0Leader) && NamedInMap(n, n.LocalEndpoint));
+            string leaverEndpoint = leaver.LocalEndpoint;
+
+            long unconfirmedAt = await DrainCommitTimesOutAndKeepsLatch(comm, nodes, leaver, p0Leader, ct);
+
+            fifth = await JoinFifthNode(comm, nodes, logger, basePort, drainTimeout, ct);
+            RaftManager[] all = [.. nodes, fifth];
+
+            // The join committed a roster newer than the unconfirmed request that still names
+            // the leaver Voter: the Leaving commit did not land by then, so the request is
+            // settled and the node is the full member it always was.
+            await WaitForCondition(() => leaver.GetMembership().MembershipVersion > unconfirmedAt, ct);
+            await WaitForCondition(() => !leaver.IsLeaveRequested, ct);
+
+            RaftManager[] survivors = [.. all.Where(n => !ReferenceEquals(n, leaver))];
+            long versionBeforeEviction = survivors[0].GetMembership().MembershipVersion;
+            await PartitionUntilEvicted(comm, survivors, leaver, ct);
+            long evictedVersion = survivors[0].GetMembership().MembershipVersion;
+            Assert.True(evictedVersion > versionBeforeEviction);
+
+            await HealAndExpectRejoin(comm, all, survivors, leaver, evictedVersion, ct);
+        }
+        finally
+        {
+            comm.HealAll();
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+            fifth?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The same unconfirmed request, with the eviction as the very next roster. No roster in
+    /// between could have named the leaver Voter, and none named it Leaving either — roster
+    /// versions advance by one per commit, so the exclusion cannot be the drain's own removal.
+    /// The latch must be released on that roster and the auto-rejoin check that follows it must
+    /// re-admit the node.
+    /// </summary>
+    [Fact]
+    public async Task RequestLeave_DrainCommitTimedOut_EvictedByTheNextRoster_AutoRejoins()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (RaftManager[] nodes, InMemoryCommunication comm) =
+            await BuildCluster(logger, basePort: 8910, drainTimeout: TimeSpan.FromMilliseconds(300), ct);
+
+        try
+        {
+            RaftManager p0Leader = await P0Leader(nodes, ct);
+            RaftManager leaver = nodes.First(n => !ReferenceEquals(n, p0Leader) && NamedInMap(n, n.LocalEndpoint));
+            RaftManager[] survivors = [.. nodes.Where(n => !ReferenceEquals(n, leaver))];
+
+            long unconfirmedAt = await DrainCommitTimesOutAndKeepsLatch(comm, nodes, leaver, p0Leader, ct);
+
+            await PartitionUntilEvicted(comm, survivors, leaver, ct);
+            long evictedVersion = survivors[0].GetMembership().MembershipVersion;
+            Assert.Equal(unconfirmedAt + 1, evictedVersion);
+            Assert.Equal(3, survivors[0].GetMembership().Members.Count);
+
+            await HealAndExpectRejoin(comm, nodes, survivors, leaver, evictedVersion, ct);
+            Assert.False(leaver.IsLeaveRequested);
         }
         finally
         {
