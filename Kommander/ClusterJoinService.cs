@@ -14,12 +14,27 @@ namespace Kommander;
 /// seed-based), the leader-side handler that admits somebody else, and the diagnostics a stalled
 /// join needs.
 /// <para>
-/// Every wait here is bounded by <see cref="JoinHardCeilingMs"/> <b>unconditionally</b> — including
-/// when the caller passes a cancelable token. A caller whose token never actually fires (an xUnit
-/// test-context token with no configured timeout, say) would otherwise have no liveness bound at
-/// all, so a cluster that failed to assemble hung forever and silently. A cluster that cannot
-/// initialize within the ceiling is broken; failing loudly with a state dump beats hanging. The
-/// caller's token still cancels earlier than the ceiling.
+/// Every wait here is bounded <b>unconditionally</b> — including when the caller passes a cancelable
+/// token. A caller whose token never actually fires (an xUnit test-context token with no configured
+/// timeout, say) would otherwise have no liveness bound at all, so a cluster that failed to assemble
+/// hung forever and silently. The caller's token still cancels earlier than either bound.
+/// </para>
+/// <para>
+/// There are two bounds, because the waits fail for two different reasons. Admission and
+/// initialization are bounded by <see cref="RaftConfiguration.JoinTimeout"/>, measured from the start
+/// of the join: a cluster that cannot admit or initialize this node within it is wedged, and failing
+/// loudly with a state dump beats hanging. The seed join's wait for promotion to Voter is a catch-up
+/// whose length follows the data size and the write rate, so it is bounded by progress instead
+/// (<see cref="RaftConfiguration.JoinPromotionStallTimeout"/>, judged by
+/// <see cref="JoinCatchUpProgress"/>). A single fixed 60 s bound over all three waits aborted every
+/// replacement of a node on a loaded cluster while the learner was still catching up (Caraxes,
+/// 2026-10-14).
+/// </para>
+/// <para>
+/// A seed join that fails after this node was admitted withdraws the node from the roster before
+/// it throws (<see cref="ClusterLeaveService.WithdrawFailedJoinAsync"/>); otherwise the failed join
+/// left a Learner in the roster that the survivors keep tracking for as long as it stays. A join
+/// canceled by the caller does not withdraw: the caller owns that decision.
 /// </para>
 /// <para>
 /// Concurrency: the terminal-reason map is the only shared state and is a concurrent dictionary
@@ -29,14 +44,8 @@ namespace Kommander;
 /// </summary>
 internal sealed class ClusterJoinService
 {
-    /// <summary>
-    /// Hard upper bound (ms) on how long any join overload will wait for cluster assembly before
-    /// throwing a <see cref="TimeoutException"/>. Enforced unconditionally as a liveness safety
-    /// net so a stalled assembly can never hang indefinitely and silently. Normal assembly
-    /// completes in well under this bound; a join that exceeds it indicates a genuinely wedged
-    /// cluster.
-    /// </summary>
-    private const long JoinHardCeilingMs = 60_000;
+    /// <summary>Interval between the Information lines that report a long promotion wait.</summary>
+    private const long PromotionReportIntervalMs = 10_000;
 
     /// <summary>
     /// Per-endpoint terminal reasons set by the system-partition leader when it determines a
@@ -61,6 +70,8 @@ internal sealed class ClusterJoinService
     private readonly Action startSystemPartition;
     private readonly Func<Task> refreshNodes;
     private readonly Func<RaftNode, JoinRequest, Task<JoinResponse>> sendJoin;
+    private readonly Func<long> getSnapshotProgressMarker;
+    private readonly Func<IReadOnlyList<string>, CancellationToken, Task<bool>> withdrawFailedJoin;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
     private readonly int localNodeId;
@@ -78,6 +89,8 @@ internal sealed class ClusterJoinService
         Action startSystemPartition,
         Func<Task> refreshNodes,
         Func<RaftNode, JoinRequest, Task<JoinResponse>> sendJoin,
+        Func<long> getSnapshotProgressMarker,
+        Func<IReadOnlyList<string>, CancellationToken, Task<bool>> withdrawFailedJoin,
         ILogger<IRaft> logger,
         string localEndpoint,
         int localNodeId)
@@ -94,6 +107,8 @@ internal sealed class ClusterJoinService
         this.startSystemPartition = startSystemPartition;
         this.refreshNodes = refreshNodes;
         this.sendJoin = sendJoin;
+        this.getSnapshotProgressMarker = getSnapshotProgressMarker;
+        this.withdrawFailedJoin = withdrawFailedJoin;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
         this.localNodeId = localNodeId;
@@ -216,6 +231,7 @@ internal sealed class ClusterJoinService
         // Wait for the system coordinator to replicate the initial partition map and start the
         // user partitions. On a slow or loaded host this can take longer than expected; the
         // unconditional ceiling (see the type summary) keeps it from blocking indefinitely.
+        long joinTimeoutMs = (long)configuration.JoinTimeout.TotalMilliseconds;
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
         Task initializedTask = getInitializedSignal();
         while (!isInitialized())
@@ -230,9 +246,9 @@ internal sealed class ClusterJoinService
                 "JoinCluster: waiting for initialization ({ElapsedMs} ms elapsed): {State}",
                 elapsedMs, DescribeAssemblyState());
 
-            if (elapsedMs > JoinHardCeilingMs)
+            if (elapsedMs > joinTimeoutMs)
                 throw new TimeoutException(
-                    $"RaftManager.JoinCluster timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
+                    $"RaftManager.JoinCluster timed out after {configuration.JoinTimeout.TotalSeconds:0.#} s (JoinTimeout) waiting for cluster initialization. State: {DescribeAssemblyState()}");
 
             // Return the instant initialization signals; otherwise re-log and ceiling-check on the
             // next 1 s tick. Replaces a flat Task.Delay(1000) that made a node which assembles in a
@@ -253,6 +269,12 @@ internal sealed class ClusterJoinService
     /// set and begins sending heartbeats. Once the system-partition logs are replicated the
     /// coordinator starts the user partitions and initialization completes.
     /// </para>
+    /// <para>
+    /// Admission and initialization are bounded by <see cref="RaftConfiguration.JoinTimeout"/> from
+    /// the start of the join; the promotion wait by catch-up progress (see the type summary). Any
+    /// failure after admission other than the caller's cancellation withdraws the node from the
+    /// roster before the exception propagates.
+    /// </para>
     /// </summary>
     internal async Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default)
     {
@@ -269,6 +291,8 @@ internal sealed class ClusterJoinService
 
         // Contact seeds until a leader accepts us as a Learner.
         JoinResponse? accepted = null;
+        string? admittedBy = null;
+        long joinTimeoutMs = (long)configuration.JoinTimeout.TotalMilliseconds;
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
 
         List<string> seedList = [.. seeds];
@@ -276,8 +300,8 @@ internal sealed class ClusterJoinService
         while (accepted is null || !accepted.Success)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
-                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s before being admitted as a Learner.");
+            if (joinStopwatch.GetElapsedMilliseconds() > joinTimeoutMs)
+                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {configuration.JoinTimeout.TotalSeconds:0.#} s (JoinTimeout) before being admitted as a Learner.");
 
             string? leaderHint = null;
 
@@ -292,6 +316,7 @@ internal sealed class ClusterJoinService
                     if (resp.Success)
                     {
                         accepted = resp;
+                        admittedBy = target;
                         break;
                     }
                     if (!string.IsNullOrEmpty(resp.LeaderHint))
@@ -305,6 +330,7 @@ internal sealed class ClusterJoinService
                             if (resp.Success)
                             {
                                 accepted = resp;
+                                admittedBy = leaderHint;
                                 break;
                             }
                         }
@@ -326,48 +352,170 @@ internal sealed class ClusterJoinService
 
         logger.LogInfoJoinClusterAdmittedAsLearner(accepted.MembershipVersion);
 
-        // Wait for initialization (the system coordinator receives the partition map from the
-        // leader). Also check for a terminal block: if the leader cannot backfill this node (WAL is
-        // compacted, no snapshot transfer registered), initialization will never complete and we
-        // must surface the permanent-block reason rather than spinning to the timeout.
-        //
-        // Unlike the discovery-based overload, this loop deliberately keeps the raw 500 ms poll
-        // rather than awaiting the initialization signal. The seed-join learner path races the
-        // terminal-block decision against promotion, and the terminal reason is polled here every
-        // tick; waking early on the signal perturbs that interleaving enough to let a below-floor
-        // learner slip past the block. This path is also not latency-sensitive the way single-node
-        // boot is — a lone in-memory node is leader-from-seed via the discovery overload, never a
-        // seed-joining learner — so the poll stays.
+        try
+        {
+            await WaitForInitializationAsync(joinStopwatch, joinTimeoutMs, cancellationToken).ConfigureAwait(false);
+            await WaitForPromotionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // This node is in the committed roster as a Learner. Throwing without taking it back out
+            // left the survivors tracking a member that will never be promoted, and the operator's
+            // replacement made the cluster worse than before (Caraxes, 2026-10-14).
+            logger.LogWarning(
+                "JoinCluster: the join failed after this node was admitted ({Message}); withdrawing it from the roster",
+                ex.Message);
+
+            List<string> contacts = admittedBy is null ? seedList : [admittedBy, .. seedList];
+
+            try
+            {
+                await withdrawFailedJoin(contacts, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception withdrawEx)
+            {
+                // The join's own failure is the error the caller must see; the withdrawal is best effort.
+                logger.LogWarning("JoinCluster: withdrawal after the failed join threw ({Message})", withdrawEx.Message);
+            }
+
+            throw;
+        }
+
+        logger.LogInformation("JoinCluster: promoted to Voter; join complete");
+    }
+
+    /// <summary>
+    /// The seed join's wait for initialization (the system coordinator receives the partition map
+    /// from the leader). Bounded by <see cref="RaftConfiguration.JoinTimeout"/> on the join's own
+    /// stopwatch, which started before admission: this is the liveness part of the join.
+    /// <para>
+    /// Also checks for a terminal block: if the leader cannot backfill this node (WAL is compacted,
+    /// no snapshot transfer registered), initialization will never complete and the permanent-block
+    /// reason must surface rather than spin to the timeout.
+    /// </para>
+    /// <para>
+    /// Unlike the discovery-based overload, this loop deliberately keeps the raw 500 ms poll rather
+    /// than awaiting the initialization signal. The seed-join learner path races the terminal-block
+    /// decision against promotion, and the terminal reason is polled here every tick; waking early
+    /// on the signal perturbs that interleaving enough to let a below-floor learner slip past the
+    /// block. This path is also not latency-sensitive the way single-node boot is — a lone in-memory
+    /// node is leader-from-seed via the discovery overload, never a seed-joining learner — so the
+    /// poll stays.
+    /// </para>
+    /// </summary>
+    private async Task WaitForInitializationAsync(ValueStopwatch joinStopwatch, long joinTimeoutMs, CancellationToken cancellationToken)
+    {
         while (!isInitialized())
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
+            if (joinStopwatch.GetElapsedMilliseconds() > joinTimeoutMs)
                 throw new TimeoutException(
-                    $"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
+                    $"RaftManager.JoinCluster(seeds) timed out after {configuration.JoinTimeout.TotalSeconds:0.#} s (JoinTimeout) waiting for cluster initialization. State: {DescribeAssemblyState()}");
             string? terminalReasonInit = GetJoinTerminalReason(localEndpoint);
             if (terminalReasonInit is not null)
                 throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReasonInit}");
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
+    }
 
-        // Wait for promotion to Voter.
+    /// <summary>
+    /// The seed join's wait for promotion to Voter. Not bounded by time: it fails only when the
+    /// learner makes no catch-up progress for <see cref="RaftConfiguration.JoinPromotionStallTimeout"/>
+    /// (see <see cref="JoinCatchUpProgress"/> for what counts), or when the leader records a terminal
+    /// block for this endpoint. A catch-up that keeps moving is waited for however long it takes;
+    /// an Information line every <see cref="PromotionReportIntervalMs"/> keeps a long one visible.
+    /// <para>
+    /// The stall clock starts when this wait starts, not when the join did, so a slow admission
+    /// cannot eat into the catch-up's allowance.
+    /// </para>
+    /// </summary>
+    private async Task WaitForPromotionAsync(CancellationToken cancellationToken)
+    {
+        long stallMs = (long)configuration.JoinPromotionStallTimeout.TotalMilliseconds;
+        JoinCatchUpProgress progress = new();
+        ValueStopwatch promotionStopwatch = ValueStopwatch.StartNew();
+        long nextReportMs = PromotionReportIntervalMs;
+
         while (getLocalRole() != ClusterMemberRole.Voter)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
-                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for Voter promotion.");
 
             // The leader signals a terminal condition (e.g., learner is below the WAL compaction
             // floor and no snapshot transfer is registered) so the joiner fails fast with a
-            // descriptive error rather than spinning to the 60 s deadline.
+            // descriptive error rather than spinning to the stall timeout.
             string? terminalReason = GetJoinTerminalReason(localEndpoint);
             if (terminalReason is not null)
                 throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReason}");
 
+            long nowMs = promotionStopwatch.GetElapsedMilliseconds();
+            progress.Observe(SampleCommitFrontiers(), SampleSnapshotProgress(), nowMs);
+
+            long quietMs = progress.MillisecondsSinceProgress(nowMs);
+            if (quietMs >= stallMs)
+                throw new TimeoutException(
+                    $"RaftManager.JoinCluster(seeds) gave up waiting for Voter promotion: the learner made no catch-up progress " +
+                    $"for {quietMs / 1000.0:0.#} s (JoinPromotionStallTimeout {configuration.JoinPromotionStallTimeout.TotalSeconds:0.#} s) " +
+                    $"after {nowMs / 1000.0:0.#} s of waiting. Last progress: {progress.LastProgress} at {progress.LastProgressMs / 1000.0:0.#} s. " +
+                    $"Commit frontiers: {progress.DescribeFrontiers()}. State: {DescribeAssemblyState()}");
+
+            if (nowMs >= nextReportMs && logger.IsEnabled(LogLevel.Information))
+            {
+                nextReportMs = nowMs + PromotionReportIntervalMs;
+                logger.LogInformation(
+                    "JoinCluster: still catching up as a Learner after {ElapsedSeconds:0} s; last progress {LastProgress} {QuietSeconds:0.#} s ago; commit frontiers {Frontiers}",
+                    nowMs / 1000.0, progress.LastProgress, quietMs / 1000.0, progress.DescribeFrontiers());
+            }
+
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
+    }
 
-        logger.LogInformation("JoinCluster: promoted to Voter; join complete");
+    /// <summary>
+    /// The published commit frontier of every partition this node hosts now, system partition
+    /// included. Lock-free reads of each partition's durability-gated frontier; never routed through
+    /// an executor, which may be the thing that is busy installing a snapshot.
+    /// </summary>
+    private List<(int PartitionId, long CommitIndex)> SampleCommitFrontiers()
+    {
+        List<(int PartitionId, long CommitIndex)> frontiers = new(partitionProvider.DataPartitionCount + 1);
+
+        try
+        {
+            RaftPartition? systemPartition = partitionProvider.SystemPartition;
+            if (systemPartition is not null)
+                frontiers.Add((systemPartition.PartitionId, systemPartition.GetCommitIndex()));
+
+            foreach (RaftPartition partition in partitionProvider.DataPartitions)
+                frontiers.Add((partition.PartitionId, partition.GetCommitIndex()));
+        }
+        catch (Exception ex)
+        {
+            // A partition removed or disposed mid-enumeration: this sample shows less, the next one
+            // more. A diagnostic read must never be the reason a join fails.
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("JoinCluster: commit frontier sample failed ({Message})", ex.Message);
+        }
+
+        return frontiers;
+    }
+
+    /// <summary>
+    /// The snapshot receiver's progress marker, or null when it cannot be read. Null rather than a
+    /// placeholder value: the marker is compared for inequality, so a placeholder would read as progress.
+    /// </summary>
+    private long? SampleSnapshotProgress()
+    {
+        try
+        {
+            return getSnapshotProgressMarker();
+        }
+        catch (Exception ex)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("JoinCluster: snapshot progress sample failed ({Message})", ex.Message);
+
+            return null;
+        }
     }
 
     /// <summary>
@@ -382,7 +530,7 @@ internal sealed class ClusterJoinService
     /// <b>Idempotency:</b> if the endpoint is already committed in the roster (e.g. a previous
     /// <c>AddMember</c> committed but the response was lost before the joiner saw it), this
     /// returns success with the current roster version rather than an error. This prevents the
-    /// joiner's retry loop from spinning to the 60 s timeout.
+    /// joiner's retry loop from spinning to the join timeout.
     /// </para>
     /// </summary>
     internal async Task<JoinResponse> ReceiveJoin(JoinRequest request)

@@ -192,6 +192,132 @@ internal sealed class ClusterLeaveService : IDisposable
             logger.LogInformation("[{LocalEndpoint}] Leave request released: {Reason}; the node stays a full member and will auto-rejoin after an eviction", localEndpoint, reason);
     }
 
+    /// <summary>Overall bound on <see cref="WithdrawFailedJoinAsync"/>; each attempt has its own shorter bound.</summary>
+    private static readonly TimeSpan WithdrawDeadline = TimeSpan.FromSeconds(10);
+
+    /// <summary>Bound on one <c>LeaveRequest</c> round trip inside <see cref="WithdrawFailedJoinAsync"/>.</summary>
+    private static readonly TimeSpan WithdrawAttemptTimeout = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Takes a node whose seed join failed after admission back out of the committed roster, so the
+    /// failure does not leave a Learner the survivors keep tracking. Called by
+    /// <see cref="ClusterJoinService"/> just before it throws; returns true when a P0 leader
+    /// acknowledged the removal.
+    /// <para>
+    /// Why it cannot use <see cref="RequestLeaveAsync"/>: a join can fail before this node has
+    /// initialized (no partition map, possibly no known leader), and that path refuses an
+    /// uninitialized node. This one only needs the transport: it sends a <see cref="LeaveRequest"/>
+    /// to the system-partition leader this node knows of, else to each of
+    /// <paramref name="contacts"/> (the join's seeds and the endpoint that admitted it), and follows
+    /// one leader hint per answer. The leader-side handler is idempotent, so a retry after a lost
+    /// reply is answered with success.
+    /// </para>
+    /// <para>
+    /// Raises <see cref="IsLeaveRequested"/> first and leaves it raised: a removal sent here can
+    /// commit after the deadline, and auto-rejoin must not re-admit the node into the state the
+    /// withdrawal exists to undo. The node does not campaign either way — it never became a Voter.
+    /// </para>
+    /// <para>
+    /// Best effort and bounded by <see cref="WithdrawDeadline"/>: a failed withdrawal is logged and
+    /// the caller throws its original error regardless. The caller's token ends it earlier.
+    /// </para>
+    /// </summary>
+    internal async Task<bool> WithdrawFailedJoinAsync(IReadOnlyList<string> contacts, CancellationToken cancellationToken)
+    {
+        _leaveRequested = true;
+
+        LeaveRequest request = new(localEndpoint, configuration.NodeId);
+        ValueStopwatch sw = ValueStopwatch.StartNew();
+
+        while (sw.GetElapsedMilliseconds() < (long)WithdrawDeadline.TotalMilliseconds)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return false;
+
+            // Known P0 leader first (it saves a hint round trip), then every contact in turn.
+            List<string> targets = new(contacts.Count + 1);
+
+            string? knownLeader = partitionProvider.SystemPartition?.Leader;
+            if (!string.IsNullOrEmpty(knownLeader) && !string.Equals(knownLeader, localEndpoint, StringComparison.Ordinal))
+                targets.Add(knownLeader);
+
+            foreach (string contact in contacts)
+            {
+                if (!string.Equals(contact, localEndpoint, StringComparison.Ordinal) && !targets.Contains(contact))
+                    targets.Add(contact);
+            }
+
+            foreach (string target in targets)
+            {
+                LeaveResponse response = await TrySendWithdrawalAsync(target, request, cancellationToken).ConfigureAwait(false);
+
+                if (!response.Success
+                    && !string.IsNullOrEmpty(response.LeaderHint)
+                    && !string.Equals(response.LeaderHint, target, StringComparison.Ordinal)
+                    && !string.Equals(response.LeaderHint, localEndpoint, StringComparison.Ordinal))
+                    response = await TrySendWithdrawalAsync(response.LeaderHint, request, cancellationToken).ConfigureAwait(false);
+
+                if (response.Success)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}] JoinCluster: withdrew this node from the roster after the failed join (membership version {Version})",
+                        localEndpoint, response.MembershipVersion);
+                    return true;
+                }
+
+                // A learner's removal is never refused for quorum reasons; a Terminal answer means
+                // the leader will not remove it, so retrying changes nothing.
+                if (response.Terminal)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}] JoinCluster: the leader refused to withdraw this node after the failed join; it stays in the roster",
+                        localEndpoint);
+                    return false;
+                }
+            }
+
+            try
+            {
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+        }
+
+        logger.LogWarning(
+            "[{LocalEndpoint}] JoinCluster: could not withdraw this node from the roster within {DeadlineSeconds} s after the failed join; " +
+            "no system-partition leader acknowledged the removal (a removal already sent may still commit). Remove it with RemoveMember if it stays",
+            localEndpoint, WithdrawDeadline.TotalSeconds);
+
+        return false;
+    }
+
+    /// <summary>
+    /// One withdrawal round trip, bounded by <see cref="WithdrawAttemptTimeout"/>. A transport failure
+    /// or timeout is a failed answer, never an exception: the caller moves on to the next target.
+    /// </summary>
+    private async Task<LeaveResponse> TrySendWithdrawalAsync(string target, LeaveRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using CancellationTokenSource attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attemptCts.CancelAfter(WithdrawAttemptTimeout);
+
+            return await sendLeave(new RaftNode(target), request, attemptCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}] JoinCluster: withdrawal request to {Target} failed: {Message}",
+                    localEndpoint, target, ex.Message);
+
+            return new LeaveResponse(false);
+        }
+    }
+
     /// <summary>
     /// Handles an inbound <see cref="LeaveRequest"/>: only the system-partition leader commits the
     /// <c>RemoveMember</c>; a non-leader answers with a leader hint so the caller can retry against

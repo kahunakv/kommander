@@ -629,6 +629,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             StartSystemPartition,
             UpdateNodes,
             (node, request) => communication.SendJoin(this, node, request),
+            () => snapshotReceiver.ProgressMarker,
+            // leaveService is assigned just below; the join only calls this after admission.
+            (contacts, ct) => leaveService!.WithdrawFailedJoinAsync(contacts, ct),
             Logger,
             LocalEndpoint,
             LocalNodeId);

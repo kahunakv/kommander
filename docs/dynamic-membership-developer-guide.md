@@ -283,12 +283,37 @@ await raft.JoinCluster(cancellationToken: cts.Token);
 ```
 
 Both overloads end in the same state — this node is a committed Voter — and both block until that
-happens or the deadline (default 60 s) trips. Pass a `CancellationToken` with a shorter deadline for
-tighter control. Internally, `JoinCluster(seeds)`:
+happens or the join fails. Pass a `CancellationToken` to stop the join earlier. Internally,
+`JoinCluster(seeds)`:
 
 1. Contacts each seed until one (or its P0-leader hint) commits an `AddMember(Learner)` entry.
 2. Waits for the P0 leader to replicate the partition map to this node (`IsInitialized`).
 3. Waits for the leader to auto-promote this node Learner → Voter.
+
+The join has two bounds, because its waits fail for different reasons:
+
+| Option | Default | Bounds |
+|---|---|---|
+| `JoinTimeout` | 60 s | Steps 1 and 2, measured from the start of the join. A cluster that cannot admit or initialize the node in this time is wedged. |
+| `JoinPromotionStallTimeout` | 5 min | Step 3, by progress and not by time. The join fails only when the Learner makes no catch-up progress for this long. |
+
+Step 3 is a catch-up: a snapshot install plus a backfill of whatever committed meanwhile. Its length
+follows the data size and the write rate, so a node that replaces a member of a cluster that has run
+under load can take many minutes to be promoted. While the Learner makes progress, the join waits.
+Progress is anything the joiner can see locally: a partition's commit index moving forward, a new
+partition, a snapshot chunk received, or a snapshot install that starts, continues, or completes. The
+join logs an `Information` line every 10 s while it waits.
+
+`JoinPromotionStallTimeout` must be longer than `LearnerPromotionStableWindow` plus
+`UpdateNodesInterval`, and `Validate()` refuses a shorter value. On an idle cluster a caught-up Learner
+makes no progress while the leader observes it for the stable window, so a shorter value would fail a
+healthy join. Make it longer than the longest snapshot import of one partition that shows no progress.
+
+If a seed join fails after the node was admitted (initialization timeout, promotion stall, or a
+permanent block), the node first asks the P0 leader to remove it from the roster, and then throws.
+This takes up to 10 s. A failed join therefore does not leave a Learner in the roster that will never
+be promoted. If no leader acknowledges the removal in time, the node logs a `Warning`; remove the
+member manually in that case. A join that you cancel with the token does not withdraw the node.
 
 ### Leave the cluster gracefully
 
@@ -644,7 +669,8 @@ operator checks.
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `JoinCluster` throws `TimeoutException` | Seeds unreachable, or the Learner never catches up (e.g. compacted partition, no snapshot install) | `ReceiveJoin`, backfill in `RaftPartitionStateMachine`; check the partition compaction floor |
+| `JoinCluster` throws `TimeoutException` naming `JoinTimeout` | Seeds unreachable, or the cluster never sends the partition map to the node | `ReceiveJoin`; the assembly state in the message (`systemLeader`, `p0MaxLog`, `userPartitions`) |
+| `JoinCluster` throws `TimeoutException` naming `JoinPromotionStallTimeout` | The Learner stopped catching up: no commit index moved and no snapshot work happened for the whole stall timeout | The commit indexes and last progress in the message; backfill in `RaftPartitionStateMachine`; snapshot transfer to the node |
 | New node stays `Learner` forever | Lag never reaches `LearnerPromotionLag`, or it can't catch up on a partition (e.g. compacted past the floor with no snapshot install) | `CheckLearnerPromotionsAsync`; `GetRemoteFollowerLag` in `ICommunication`; partition compaction floor |
 | Healthy nodes get evicted | `SuspicionTimeout` or `PingTimeout` too short for network latency; or nodes are genuinely unreachable | Increase `SuspicionTimeout`; check connectivity; set `PingInterval = Zero` to disable |
 | `LeaveCluster` doesn't shrink the roster | Leaving node couldn't reach the P0 leader, or the removal would leave zero voters (`InsufficientVoters`) | `CommitGracefulLeaveAsync`, `TryRemoveMember`; check connectivity to the P0 leader |
