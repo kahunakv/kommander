@@ -1690,7 +1690,12 @@ public class RaftConfiguration
     /// replication</b> — every roster voter hosts every range, today's behavior. When &gt; 0,
     /// initial placement assigns each range a replica set of this size (spread evenly across
     /// voters) and quorum is computed per range over its voter replicas only. A cluster with
-    /// fewer voters than the factor degrades to full replication with no loss of safety.
+    /// fewer voters than the factor degrades to full replication with no loss of safety; with
+    /// <see cref="EnablePlacementRebalancer"/> on, the placement pass then gives each such range
+    /// an explicit replica set (every roster voter) and the planner tops it up as voters join, or
+    /// trims it once the cluster has more voters than the factor. With the rebalancer off such
+    /// ranges stay fully replicated and every node that joins adds one more copy — see
+    /// <see cref="IRaft.GetPartitionsAwaitingPlacement"/>.
     /// <para>Even values give a fragile quorum (3-of-4 tolerates the same single failure as
     /// 2-of-3); prefer odd values.</para>
     /// </summary>
@@ -1701,7 +1706,16 @@ public class RaftConfiguration
     /// When <see langword="false"/> (the default) no rebalancing moves are planned; in-flight
     /// replica transitions (learner promotion, removal completion) are still driven to
     /// completion so a crash mid-move can always converge. Initial placement at
-    /// <see cref="ReplicationFactor"/> is applied regardless of this flag.
+    /// <see cref="ReplicationFactor"/> is applied at bootstrap regardless of this flag.
+    /// <para>
+    /// This switch also gates the conversion of legacy fully replicated ranges — an empty replica
+    /// set while a factor applies, which is what a cluster that bootstrapped at or below its
+    /// factor, a split made while at or below it, or a factor turned on later leaves behind —
+    /// into placed ranges. The conversion itself changes no quorum (the set assigned is every
+    /// roster voter), but it ends with the planner removing copies, which is this switch's
+    /// authority. With it off those ranges stay fully replicated and the pass logs one Warning
+    /// per P0 leadership naming how many wait.
+    /// </para>
     /// </summary>
     public bool EnablePlacementRebalancer { get; set; }
 

@@ -385,6 +385,12 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement drain of {Endpoint} complete (no range names it); committing removal")]
     public static partial void LogInfoPlacementDrainComplete(this ILogger<IRaft> logger, string local, string endpoint);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Initial placement: partition {Id} replica set assigned to every current roster voter [{Endpoints}], generation {Generation}; the planner trims it to the replication factor on later passes")]
+    public static partial void LogInfoPlacementInitialAssignment(this ILogger<IRaft> logger, string local, int id, string endpoints, long generation);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Local}] {Count} range(s) have an empty replica set although a replication factor applies to them (legacy full replication: every roster voter hosts them and every node that joins adds a copy); EnablePlacementRebalancer is off, so the placement pass does not assign them a replica set")]
+    public static partial void LogWarningPlacementLegacyRangesRebalancerOff(this ILogger<IRaft> logger, string local, int count);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Dropping learner {Endpoint} of partition {Id}: host is no longer a roster member")]
     public static partial void LogInfoPlacementLearnerHostGone(this ILogger<IRaft> logger, string local, string endpoint, int id);
 

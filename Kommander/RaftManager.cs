@@ -1322,6 +1322,23 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         routingTable.GetEffectiveReplicationFactor(partitionId);
 
     /// <summary>
+    /// See <see cref="IRaft.GetPartitionsAwaitingPlacement"/>. Uses the same predicate as the P0
+    /// placement pass (<see cref="ReplicaPlacementService.IsAwaitingInitialPlacement"/>), so what
+    /// this reports and what the pass converts can never drift apart.
+    /// </summary>
+    public IReadOnlyList<int> GetPartitionsAwaitingPlacement()
+    {
+        List<int> awaiting = [];
+        foreach (RaftPartitionRange range in routingTable.GetPartitionMap())
+        {
+            if (ReplicaPlacementService.IsAwaitingInitialPlacement(range, configuration.ReplicationFactor))
+                awaiting.Add(range.PartitionId);
+        }
+
+        return awaiting;
+    }
+
+    /// <summary>
     /// Leaves the cluster and tears the node down. See <see cref="ClusterLeaveService.LeaveCluster"/>;
     /// this node's ordered teardown is supplied to that service as <see cref="TearDownAfterLeaveAsync"/>.
     /// </summary>

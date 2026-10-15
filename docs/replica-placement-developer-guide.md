@@ -49,7 +49,10 @@ die.
 
 The feature is **off by default** (`ReplicationFactor = 0` keeps today's full replication), and a
 range whose replica set is empty always behaves the legacy way, so existing clusters and maps keep
-working unchanged.
+working unchanged. When a replication factor *does* apply to such a range — a cluster that
+bootstrapped at or below its factor, or a factor turned on later — the controller converts it to a
+placed range once `EnablePlacementRebalancer` is on (see
+[Interplay](#interplay-initial-placement-splitmerge-membership)).
 
 ```
 Full replication (before):          RF = 3 on six nodes (after):
@@ -110,8 +113,11 @@ range:
 ### Effective replication factor
 `RaftConfiguration.ReplicationFactor` is the cluster-wide target; each range may carry an override.
 The effective RF is `min(target, number of live voters)` — a cluster with fewer voters than RF simply
-degrades to full replication (all voters host the range), with no loss of safety, and expands back
-out as voters join.
+degrades to full replication (all voters host the range), with no loss of safety. With the rebalancer
+on, the controller records that full set as an explicit replica set and the planner expands it back
+out (repair) as voters join, or trims it once voters exceed RF. With the rebalancer off the set stays
+empty and every node that joins adds one more copy; `IRaft.GetPartitionsAwaitingPlacement()` lists
+such ranges.
 
 ### Generation as the fence
 Every placement change bumps the range's `Generation`, exactly like a split or merge does. Consumers
@@ -377,7 +383,12 @@ member removal (graceful leave or dead-node eviction). Each pass:
 1. **Drives transitions to completion** — re-issues the final drop for any `Removing` replica and
    promotes learners that have stayed caught-up for the stable window. This part runs **even when
    the rebalancer is disabled**, so an interrupted move always converges.
-2. **Plans new moves** — only when `EnablePlacementRebalancer` is on, and only with budget to
+2. **Assigns initial placement to legacy ranges** — only when `EnablePlacementRebalancer` is on
+   and the roster is committed: ranges with an empty replica set and an effective RF above 0 get
+   the explicit set of every roster voter (a quorum no-op; see *Converting a legacy range* above),
+   `MaxReplicaMovesPerPass` ranges per pass in one commit. The same pass then plans against the
+   converted map, so the first trim can start without waiting another interval.
+3. **Plans new moves** — only when `EnablePlacementRebalancer` is on, and only with budget to
    spare. Moves are budgeted by class: **repairs** (re-replicating an under-replicated range,
    shedding a replica stranded on an evicted node) draw on `MaxConcurrentReplicaRepairs`, while
    **balance** moves (cosmetic trims and skew spreading) draw on `MaxConcurrentReplicaTransfers`
@@ -435,8 +446,32 @@ node can still build a correctly-fenced proposal before forwarding it.
 each initial range gets an RF-sized, all-`Voter` replica set assigned round-robin over the nodes
 visible at bootstrap — a deterministic even spread (six nodes, four ranges, RF=3 ⇒ each range on 3
 distinct nodes, each node hosting exactly 2 ranges). A cluster at or below RF nodes keeps empty
-replica sets — full replication — and the rebalancer spreads things out later as voters join.
-Dynamically created partitions get the RF least-loaded voters at creation time.
+replica sets — full replication — at bootstrap. Dynamically created partitions get the RF
+least-loaded voters at creation time, or an empty set too while voters do not exceed RF.
+
+**Converting a legacy range.** An empty replica set is not a final state when a factor applies to
+the range. On every pass the controller counts the `Active` ranges whose set is empty while their
+effective RF is above 0 (the `raft.placement.ranges_awaiting_initial` gauge and
+`IRaft.GetPartitionsAwaitingPlacement()` expose the same count), and — with
+`EnablePlacementRebalancer` on and a committed roster — gives up to `MaxReplicaMovesPerPass` of them,
+lowest id first, an explicit replica set in **one** map commit: **every current roster `Voter`**, each
+as a `Voter`, dead or alive, with the generation bumped. That set is deliberately *not* RF of them. A
+legacy range's quorum already is the roster's voter set, so recording it changes no quorum anywhere:
+nodes that have and have not applied the new map agree on the denominator, and no election in the
+apply window can produce disjoint majorities. A one-shot cut to RF voters has no such guarantee
+(with 5 voters and RF 3 a majority of the new set and a majority of the old one can be disjoint), and
+choosing "caught-up" voters does not close the gap under concurrent writes. The shrink to RF is left
+to the ordinary trim path — one voter per commit, behind the leadership fence and the leader
+hand-off — so the whole conversion is one quorum no-op followed by moves the planner already knows
+how to make safely. Roster members that are not voters (`Learner`, `Leaving`) stop hosting the
+converted ranges, which is the placed-model contract. With the rebalancer off nothing converts, and
+the P0 leader logs one Warning per leadership naming how many ranges wait: the conversion ends with
+copies being removed, which is what that switch authorizes.
+
+Consequences worth knowing: a 3-node cluster at RF 3 converts to explicit three-voter sets, so a
+fourth node that joins hosts no data range until the balancer moves one onto it (it used to host a
+fourth copy of everything, forever); and a split made while voters do not exceed RF gives the child an
+empty set that the next pass converts the same way.
 
 **Split.** The child range **inherits the parent's replica set**. The data already lives on those
 nodes, so the child is at RF from birth with zero transfer; the rebalancer may spread it later.
@@ -483,7 +518,7 @@ All knobs live on `RaftConfiguration`:
 | Setting | Default | Meaning |
 |---|---|---|
 | `ReplicationFactor` | `0` | Target voter copies per range. **0 = full replication (feature off).** Prefer odd values: RF 4 needs 3-of-4 to commit — the same failure tolerance as RF 3, with an extra copy's cost. |
-| `EnablePlacementRebalancer` | `false` | Master switch for *ongoing* rebalancing (repair, trim, skew). Initial placement at RF applies regardless; in-flight transitions always complete regardless. |
+| `EnablePlacementRebalancer` | `false` | Master switch for *ongoing* rebalancing (repair, trim, skew) and for converting legacy fully replicated ranges that a factor applies to. Initial placement at RF applies at bootstrap regardless; in-flight transitions always complete regardless. |
 | `PlacementPassInterval` | `5 s` | Cadence of the controller pass on the P0 leader, independent of the leader balancer's timer. Bounds convergence speed (see the worst-case bound above). Non-positive disables the timer; event-driven kicks still fire. |
 | `MaxReplicaMovesPerPass` | `4` | New moves initiated per controller pass, across all priorities. Bounds the blast radius of a bad plan. Keep ≥ `MaxConcurrentReplicaRepairs` + `MaxConcurrentReplicaTransfers` or it binds before the per-class budgets. |
 | `MaxConcurrentReplicaTransfers` | `1` | Balance-class moves (cosmetic trims, skew spreading) allowed mid-transition at once. Caps concurrent backfill/snapshot traffic so rebalancing never starves client writes. Repairs in flight count against it too, so balance work pauses during a repair wave. |
@@ -537,6 +572,12 @@ distributed-systems failure mode.
 6. **Idempotent re-drive.** Every lifecycle handler treats "already done" as success, and every
    controller decision is re-derived from the committed map. P0 leadership can move at any point in
    any sequence and the new leader converges without double-applying anything.
+
+7. **Legacy conversion is a quorum no-op.** The first replica set a legacy range receives is every
+   roster voter — the quorum it already had — never a subset. Cutting straight to RF voters would be
+   a multi-member configuration change whose old and new majorities need not overlap, which is the
+   split-brain the single-mover rule exists to prevent; the shrink happens afterwards, one voter per
+   commit, through the same trim path as any over-replicated range.
 
 What the rebalancer *cannot* do, even misconfigured: it cannot commit through a minority (quorum math
 follows the committed voter set), cannot lose data by moving replicas (adds fully promote before the

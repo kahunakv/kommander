@@ -295,7 +295,10 @@ internal sealed class PartitionMapService
     /// round-robin across the nodes visible at bootstrap (discovery peers plus self, the same
     /// set the membership seed captures). A cluster with fewer nodes than the factor leaves the
     /// replica sets empty — the RF floor degrades to legacy full replication with no loss of
-    /// safety, and the placement controller expands placement as voters join.
+    /// safety. The placement pass gives those ranges an explicit replica set (every roster voter)
+    /// once the roster commits, when <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is
+    /// on, and the planner tops it up or trims it from there; before that step existed the empty
+    /// sets were permanent and every node that joined added one more copy of every range.
     /// </summary>
     private void AssignInitialPlacement(List<RaftPartitionRange> ranges)
     {
@@ -323,7 +326,7 @@ internal sealed class PartitionMapService
         if (assignment.Count == 0)
         {
             logger.LogWarning(
-                "AssignInitialPlacement: cluster has {Nodes} node(s), replication factor {Rf} — degrading to full replication",
+                "AssignInitialPlacement: cluster has {Nodes} node(s), replication factor {Rf} — degrading to full replication; the placement pass assigns replica sets once the roster commits (EnablePlacementRebalancer on)",
                 nodes.Count, configuration.ReplicationFactor);
             return;
         }
@@ -507,7 +510,8 @@ internal sealed class PartitionMapService
     /// <see cref="RaftConfiguration.ReplicationFactor"/> &gt; 0: the RF least-loaded committed
     /// roster voters (replica load counted from the current map), founding configuration all
     /// Voter. Returns an empty list — legacy full replication — when RF is 0 or the voter count
-    /// does not exceed RF.
+    /// does not exceed RF; in the latter case the placement pass converts the range on its next
+    /// tick (rebalancer on), exactly as it does for ranges bootstrapped at or below RF.
     /// <para>
     /// Voters whose SWIM liveness is not <see cref="MemberLivenessState.Alive"/> sort behind
     /// every live voter (the local endpoint always counts as alive, mirroring

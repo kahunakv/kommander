@@ -950,6 +950,285 @@ public sealed class TestReplicaPlacement
         }
     }
 
+    // ── Initial placement of legacy ranges (RunPlacementPass) ────────────────
+
+    /// <summary>A range with an empty replica set: legacy full replication.</summary>
+    private static RaftPartitionRange LegacyRange(
+        int partitionId, int replicationFactor = 0, RaftPartitionState state = RaftPartitionState.Active) =>
+        new()
+        {
+            PartitionId = partitionId,
+            StartRange = 0,
+            EndRange = int.MaxValue,
+            Generation = 1,
+            State = state,
+            RoutingMode = RaftRoutingMode.HashRange,
+            ReplicationFactor = replicationFactor,
+            Replicas = []
+        };
+
+    private static RaftSystemRequest MakeRosterReplicated(
+        params (string Endpoint, Kommander.System.ClusterMemberRole Role)[] members)
+    {
+        Kommander.System.ClusterMembership membership = new()
+        {
+            MembershipVersion = 1,
+            Members =
+            [
+                .. members.Select((m, i) => new Kommander.System.ClusterMember
+                {
+                    Endpoint = m.Endpoint, NodeId = i + 1, Role = m.Role, JoinedVersion = 1
+                })
+            ]
+        };
+
+        return new RaftSystemRequest(
+            RaftSystemRequestType.ConfigReplicated,
+            SerializeMessage(RaftSystemConfigKeys.Members, JsonSerializer.Serialize(membership)));
+    }
+
+    /// <summary>
+    /// The conversion that was missing: a legacy range (empty replica set) whose replication
+    /// factor is below the voter count. The pass must first commit the explicit set of EVERY
+    /// roster voter — a quorum no-op, the only conversion whose successive configurations are
+    /// guaranteed to overlap — and only then shrink it through the ordinary one-voter-per-commit
+    /// trim path, never straight to RF in one cut.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LegacyRange_AssignsAllRosterVotersThenTrimsToRf()
+    {
+        RaftManager manager = Build(replicationFactor: 2, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1)]));
+            await WaitForIdleAsync(manager);
+
+            Assert.Equal([1], manager.GetPartitionsAwaitingPlacement().ToList());
+            Assert.True(manager.HostsPartition(1)); // legacy: hosted everywhere
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            // First commit: the conversion itself — every roster voter, all Voter, generation bumped.
+            RaftPartitionRange converted = Assert.Single(DecodeMap(payloads[0]).Partitions);
+            Assert.Equal(2, converted.Generation);
+            Assert.Equal(["b:1", "c:1", Local], converted.Replicas.Select(r => r.Endpoint).ToList());
+            Assert.All(converted.Replicas, r =>
+            {
+                Assert.Equal(RaftReplicaRole.Voter, r.Role);
+                Assert.Equal(2, r.SinceGeneration);
+            });
+
+            // Same pass: the planner saw an over-replicated range and trimmed ONE voter (the
+            // ordinal-first non-leader) through the two-commit removal.
+            Assert.Equal(3, payloads.Count); // conversion, mark Removing, final drop
+            RaftPartitionRange after = MapEntry(manager, 1);
+            Assert.Equal(2, after.Replicas.Count);
+            Assert.DoesNotContain(after.Replicas, r => r.Endpoint == "b:1");
+            Assert.All(after.Replicas, r => Assert.Equal(RaftReplicaRole.Voter, r.Role));
+            Assert.Equal(4, after.Generation);
+            Assert.Empty(manager.GetPartitionsAwaitingPlacement());
+        }
+    }
+
+    /// <summary>
+    /// The documented contract of the switch: converting ends with copies being removed, so with
+    /// <c>EnablePlacementRebalancer</c> off the range stays legacy, stays reported as awaiting
+    /// placement, and the operator is told once per leadership — not once per tick.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LegacyRange_RebalancerOff_StaysLegacyAndWarnsOnce()
+    {
+        CapturingLogger log = new();
+        RaftManager manager = Build(replicationFactor: 3, logger: log); // rebalancer off
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1)]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+            for (int i = 0; i < 2; i++)
+            {
+                manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+                await RunEnqueuedPassToCompletionAsync(manager);
+            }
+
+            Assert.Empty(payloads);
+            Assert.Empty(MapEntry(manager, 1).Replicas);
+            Assert.Equal([1], manager.GetPartitionsAwaitingPlacement().ToList());
+            Assert.Equal(1, log.Count(LogLevel.Warning, "EnablePlacementRebalancer is off"));
+        }
+    }
+
+    /// <summary>
+    /// Three voters at RF 3 — the starting shape the Kubernetes operator cares about. Both ranges
+    /// get the explicit set of all three voters in one commit (so a fourth voter adds no copy),
+    /// nothing is trimmed, and a second pass commits nothing: the conversion is a fixed point.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LegacyRangesAtRf_AssignAllVotersOnceAndPlanNothing()
+    {
+        RaftManager manager = Build(replicationFactor: 3, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1), LegacyRange(2)]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.Single(payloads); // both ranges converted in one commit
+            foreach (int id in new[] { 1, 2 })
+            {
+                RaftPartitionRange range = MapEntry(manager, id);
+                Assert.Equal(["b:1", "c:1", Local], range.Replicas.Select(r => r.Endpoint).ToList());
+                Assert.All(range.Replicas, r => Assert.Equal(RaftReplicaRole.Voter, r.Role));
+                Assert.Equal(2, range.Generation);
+            }
+
+            Assert.Empty(manager.GetPartitionsAwaitingPlacement());
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.Single(payloads);
+            Assert.Equal(2, MapEntry(manager, 1).Generation);
+        }
+    }
+
+    /// <summary>
+    /// The assigned set must equal the quorum the range already had — the roster's Voters — so
+    /// the commit changes no quorum: a Learner and a Leaving member are left out (they were never
+    /// in the denominator), and a Voter that SWIM considers dead stays in (it was).
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LegacyRange_SetIsExactlyTheRosterVoters()
+    {
+        RaftManager manager = Build(replicationFactor: 3, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeRosterReplicated(
+                (Local, Kommander.System.ClusterMemberRole.Voter),
+                ("b:1", Kommander.System.ClusterMemberRole.Voter),
+                ("c:1", Kommander.System.ClusterMemberRole.Voter),
+                ("d:1", Kommander.System.ClusterMemberRole.Learner),
+                ("e:1", Kommander.System.ClusterMemberRole.Leaving)));
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1)]));
+            await WaitForIdleAsync(manager);
+
+            manager.Liveness.MarkSuspect("c:1");
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            RaftPartitionRange range = MapEntry(manager, 1);
+            Assert.Equal(["b:1", "c:1", Local], range.Replicas.Select(r => r.Endpoint).ToList());
+            Assert.All(range.Replicas, r => Assert.Equal(RaftReplicaRole.Voter, r.Role));
+        }
+    }
+
+    /// <summary>
+    /// "RF turned on later" for one range: a global factor of 0 keeps full replication by choice,
+    /// so range 1 is neither converted nor reported; range 2 carries an override of 2 and
+    /// converges to two voters through convert-then-trim.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_GlobalRfZero_ConvertsOnlyRangesWithAnOverride()
+    {
+        RaftManager manager = Build(replicationFactor: 0, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1), LegacyRange(2, replicationFactor: 2)]));
+            await WaitForIdleAsync(manager);
+
+            Assert.Equal([2], manager.GetPartitionsAwaitingPlacement().ToList());
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.Empty(MapEntry(manager, 1).Replicas);
+            Assert.Equal(2, MapEntry(manager, 2).Replicas.Count);
+            Assert.All(MapEntry(manager, 2).Replicas, r => Assert.Equal(RaftReplicaRole.Voter, r.Role));
+            Assert.Empty(manager.GetPartitionsAwaitingPlacement());
+        }
+    }
+
+    /// <summary>
+    /// Rate: a cluster with many legacy ranges converts <c>MaxReplicaMovesPerPass</c> of them per
+    /// pass (lowest ids first) in ONE map commit, so the generation bump that fences in-flight
+    /// proposals is spread over passes instead of hitting every range at once.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_ManyLegacyRanges_ConvertsMaxReplicaMovesPerPassPerCommit()
+    {
+        RaftManager manager = Build(replicationFactor: 3, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                [.. Enumerable.Range(1, 6).Select(id => LegacyRange(id))]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            // Default MaxReplicaMovesPerPass is 4: the lowest four ids convert in one commit.
+            Assert.Single(payloads);
+            Assert.Equal([5, 6], manager.GetPartitionsAwaitingPlacement().ToList());
+            Assert.All(new[] { 1, 2, 3, 4 }, id => Assert.Equal(3, MapEntry(manager, id).Replicas.Count));
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.Equal(2, payloads.Count);
+            Assert.Empty(manager.GetPartitionsAwaitingPlacement());
+        }
+    }
+
+    /// <summary>
+    /// The replica set is derived from the committed roster, never from discovery: before the
+    /// roster commits (version 0) there is nothing authoritative to assign, so the range waits.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LegacyRange_WaitsForCommittedRoster()
+    {
+        RaftManager manager = Build(replicationFactor: 3, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeConfigReplicated([LegacyRange(1)]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.Empty(payloads);
+            Assert.Empty(MapEntry(manager, 1).Replicas);
+            Assert.Equal([1], manager.GetPartitionsAwaitingPlacement().ToList());
+        }
+    }
+
     // ── Ranges the P0 leader does not host ───────────────────────────────────
 
     /// <summary>
