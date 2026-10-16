@@ -1014,8 +1014,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
                             // Route the terminal signal to the actual joiner. In-process (InMemoryCommunication)
                             // this calls SetJoinTerminalReason directly on the target manager. Over gRPC/REST the
-                            // default ICommunication stub is a no-op (joiner times out after 60 s — a future task
-                            // adds the wire notification).
+                            // default ICommunication stub is a no-op: the joiner makes no catch-up progress and
+                            // fails on JoinPromotionStallTimeout (default 5 min) instead — a future task adds the
+                            // wire notification.
                             await manager.Communication.NotifyJoinBlocked(manager, endpoint, reason, cancellationToken).ConfigureAwait(false);
                         }
                     }

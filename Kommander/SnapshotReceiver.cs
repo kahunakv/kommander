@@ -108,6 +108,11 @@ internal sealed class SnapshotReceiver
     // the receiver lock.
     private readonly Dictionary<int, SnapshotInstallRecord> _installs = new();
 
+    // Count of receive events that move a joiner's catch-up forward: a chunk staged, an install started, an
+    // install completed. Monotonic for the life of the receiver; read through ProgressMarker. Written and
+    // read under the receiver lock.
+    private long _progressEvents;
+
     // Highest managed-heap size seen at the start or end of an install, or when a sender asked about one
     // that was running. Published as a gauge so a run can report what an install cost without a profiler.
     private long _installPeakHeapBytes;
@@ -510,6 +515,7 @@ internal sealed class SnapshotReceiver
 
             session.NextExpectedChunkIndex++;
             session.LastActivityTimestamp = getMonotonicTimestamp();
+            Interlocked.Increment(ref _progressEvents);
 
             // A staged chunk is not an install: the outcome says so, and the sender treats a
             // terminal chunk answered this way as a failed transfer rather than a seeded follower.
@@ -559,6 +565,7 @@ internal sealed class SnapshotReceiver
             // Replaces the record of the partition's previous install, which has completed: a sender
             // still waiting for that one is told there is a new install and waits for it instead.
             _installs[request.PartitionId] = installRecord;
+            Interlocked.Increment(ref _progressEvents);
         }
 
         // Hand the staged snapshot to the partition executor's single-writer install path. All term
@@ -631,6 +638,7 @@ internal sealed class SnapshotReceiver
                 record.Buffer = null;
                 record.Outcome = outcome;
                 record.Completed = true;
+                Interlocked.Increment(ref _progressEvents);
 
                 elapsedTicks = getMonotonicTimestamp() - record.StartedTimestamp;
                 answer = DescribeInstallLocked(record);
@@ -1005,6 +1013,36 @@ internal sealed class SnapshotReceiver
                     "[{Endpoint}] Snapshot session {Old} for partition {PartitionId} (index {OldIndex}, term {OldTerm}, {Bytes} bytes staged) superseded by a new session at index {Index}, term {Term} from {Leader}",
                     localEndpoint, session.Key.SessionId, newKey.PartitionId, session.SnapshotIndex, session.LeaderTerm,
                     session.AccumulatedBytes, opener.SnapshotIndex, opener.LeaderTerm, newKey.LeaderEndpoint);
+        }
+    }
+
+    /// <summary>
+    /// A value that changes whenever snapshot receipt on this node moves forward: a chunk is staged, an
+    /// install starts or completes, or a running install consumes more of its snapshot. Compare two reads
+    /// for <b>inequality</b>, not order: the consumed bytes of an install leave the sum when it completes,
+    /// so the value can fall at that moment — and a completion is itself progress.
+    /// <para>
+    /// Exists for <see cref="ClusterJoinService"/>, whose promotion wait is bounded by catch-up progress
+    /// rather than by time. A large snapshot transfer and its import can run for minutes without moving
+    /// any partition's commit frontier; without this marker that span read as a stalled join.
+    /// </para>
+    /// </summary>
+    internal long ProgressMarker
+    {
+        get
+        {
+            lock (_pendingSnapshotsLock)
+            {
+                long marker = Volatile.Read(ref _progressEvents);
+
+                foreach (SnapshotInstallRecord record in _installs.Values)
+                {
+                    if (!record.Completed && record.Buffer is { } buffer)
+                        marker += buffer.ConsumedBytes;
+                }
+
+                return marker;
+            }
         }
     }
 

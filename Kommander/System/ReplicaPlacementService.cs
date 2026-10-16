@@ -14,7 +14,9 @@ namespace Kommander.System;
 /// Owns per-partition replica placement for <see cref="RaftSystemCoordinator"/>: the committed
 /// replica-lifecycle mutations (<see cref="TryAddReplica"/>, <see cref="TryPromoteReplica"/>,
 /// <see cref="TryRemoveReplica"/>, <see cref="TrySetReplicationFactor"/>) and the P0 placement
-/// controller pass (<see cref="RunPlacementPassAsync"/>).
+/// controller pass (<see cref="RunPlacementPassAsync"/>), which also gives legacy fully replicated
+/// ranges their first replica set (<see cref="AssignInitialPlacementAsync"/>) — without that step a
+/// cluster that bootstrapped at or below its replication factor stayed fully replicated forever.
 /// <para>
 /// Runs exclusively on the coordinator's single-reader channel loop, which is what enforces the
 /// two safety disciplines placement depends on: <b>single mover per range</b> (a range never has
@@ -77,6 +79,11 @@ internal sealed class ReplicaPlacementService
     // feeds the stall diagnostic, never a decision. Cleared on P0 leadership loss, and the entry
     // is dropped the moment the learner is observed caught up or leaves the transitional set.
     private readonly Dictionary<(int PartitionId, string Endpoint), (DateTimeOffset Since, bool Warned)> _learnerStalledSince = new();
+
+    // Set once per P0 leadership episode when ranges await initial placement while the rebalancer
+    // is off: the operator turned a replication factor on without the switch that converts the
+    // ranges, and a Warning on every pass would be noise. Advisory only; cleared on leadership loss.
+    private bool _legacyRangesRebalancerOffWarned;
 
     internal ReplicaPlacementService(
         ConcurrentDictionary<string, string> systemConfiguration,
@@ -610,6 +617,8 @@ internal sealed class ReplicaPlacementService
         {
             _replicaCaughtUpSince.Clear();
             _learnerStalledSince.Clear();
+            _legacyRangesRebalancerOffWarned = false;
+            Diagnostics.KommanderMetrics.PlacementRangesAwaitingInitial = 0;
             return;
         }
 
@@ -661,7 +670,22 @@ internal sealed class ReplicaPlacementService
             .Where(r => r.State == RaftPartitionState.Active && r.Replicas.Count > 0)
             .ToList();
 
-        if (placed.Count == 0)
+        // ── Ranges awaiting initial placement ──────────────────────────────
+        // Legacy full replication with a replication factor above 0: every roster voter hosts the
+        // range and every node that joins adds one more copy. Nothing but this pass can give such
+        // a range a replica set (AddReplica refuses an empty set by design, and the bootstrap and
+        // split paths only ever produce one), so they are counted on every pass and converted
+        // below once the rebalancer gate and the committed-roster gate pass. Counted BEFORE the
+        // placed early-return: a cluster whose ranges are all legacy has nothing placed yet and
+        // must still get here — that early return is what kept such a cluster legacy forever.
+        List<RaftPartitionRange> awaiting = map.Partitions
+            .Where(r => IsAwaitingInitialPlacement(r, configuration.ReplicationFactor))
+            .OrderBy(r => r.PartitionId)
+            .ToList();
+
+        Diagnostics.KommanderMetrics.PlacementRangesAwaitingInitial = awaiting.Count;
+
+        if (placed.Count == 0 && awaiting.Count == 0)
             return;
 
         int transitionalCount = 0;
@@ -753,10 +777,40 @@ internal sealed class ReplicaPlacementService
 
         // ── Plan rebalancing moves ─────────────────────────────────────────
         if (!configuration.EnablePlacementRebalancer)
+        {
+            // Converting a legacy range ends with copies being removed (the trim to RF), which is
+            // exactly what the rebalancer switch exists to authorize — so with it off the ranges
+            // stay legacy, and the operator is told once per P0 leadership why the copies keep
+            // multiplying, instead of a Warning every tick.
+            if (awaiting.Count > 0 && !_legacyRangesRebalancerOffWarned)
+            {
+                _legacyRangesRebalancerOffWarned = true;
+                logger.LogWarningPlacementLegacyRangesRebalancerOff(localEndpoint, awaiting.Count);
+            }
+
             return;
+        }
 
         if (roster.MembershipVersion == 0)
             return;
+
+        // ── Initial placement of legacy ranges ─────────────────────────────
+        if (awaiting.Count > 0)
+        {
+            if (!await AssignInitialPlacementAsync(map, awaiting, roster, cancellationToken).ConfigureAwait(false))
+                return; // the commit failed; the next pass retries from the committed map
+
+            // The commit mutated `map` in place and `map` is now the committed map: re-derive the
+            // placeable set so the planner can start trimming the converted ranges in this same
+            // pass instead of waiting a full interval. The trim requests below reload the map
+            // from the committed configuration, so they see the conversion too.
+            placed = map.Partitions
+                .Where(r => r.State == RaftPartitionState.Active && r.Replicas.Count > 0)
+                .ToList();
+
+            Diagnostics.KommanderMetrics.PlacementRangesAwaitingInitial =
+                map.Partitions.Count(r => IsAwaitingInitialPlacement(r, configuration.ReplicationFactor));
+        }
 
         List<CandidateNode> candidates = roster.Members
             .Where(m => m.Role == ClusterMemberRole.Voter)
@@ -805,6 +859,135 @@ internal sealed class ReplicaPlacementService
                     : RaftSystemRequestType.RemoveReplica,
                 move.PartitionId, move.Endpoint, nodeId));
         }
+    }
+
+    /// <summary>
+    /// True for a range that still runs legacy full replication although a replication factor
+    /// applies to it: <see cref="RaftPartitionState.Active"/>, an empty replica set, and an
+    /// effective factor (the per-range override, else <paramref name="globalReplicationFactor"/>)
+    /// above 0. Every roster voter hosts such a range and every node that joins adds one more
+    /// copy. It is the shape <see cref="RunPlacementPassAsync"/> converts and
+    /// <see cref="IRaft.GetPartitionsAwaitingPlacement"/> reports — one predicate, so the pass
+    /// and the operator's view can never disagree. A factor of 0 is full replication by choice,
+    /// not a range waiting for placement.
+    /// </summary>
+    internal static bool IsAwaitingInitialPlacement(RaftPartitionRange range, int globalReplicationFactor) =>
+        range.State == RaftPartitionState.Active
+        && range.Replicas.Count == 0
+        && (range.ReplicationFactor > 0 ? range.ReplicationFactor : globalReplicationFactor) > 0;
+
+    /// <summary>
+    /// Gives the first <see cref="RaftConfiguration.MaxReplicaMovesPerPass"/> ranges of
+    /// <paramref name="awaiting"/> (legacy full replication: empty replica set, effective RF above
+    /// 0) an explicit replica set in ONE committed map mutation: every current roster
+    /// <see cref="ClusterMemberRole.Voter"/>, each as a <see cref="RaftReplicaRole.Voter"/>, alive
+    /// or not. Returns false only when that commit failed; the next pass retries from the
+    /// committed map.
+    /// <para>
+    /// <b>Why all voters, not RF of them.</b> A legacy range's quorum already <i>is</i> the roster's
+    /// voter set (<c>PartitionRoutingTable.IsPartitionVoter</c> falls back to it), so this commit
+    /// changes no quorum anywhere: a node that applied the new map and a node that has not yet
+    /// agree on the voter set, and no election inside the apply window can produce two disjoint
+    /// majorities. A one-shot cut to RF voters has no such guarantee — with 5 voters and RF 3 a
+    /// majority of the new set (2) and a majority of the old one (3) can be disjoint, so a leader
+    /// crash inside the window can elect, from the new set, a leader that lacks entries the old
+    /// set acknowledged. Choosing only "caught-up" voters does not close that gap: catch-up is
+    /// measured once while writes keep landing, and quorum overlap is the only argument that
+    /// holds under concurrency. The shrink to RF is therefore left to the ordinary trim path,
+    /// which removes one voter per commit behind the leadership fence and the leader hand-off —
+    /// the discipline every other placement change already obeys.
+    /// </para>
+    /// <para>
+    /// Because the quorum is unchanged, the per-partition fence
+    /// (<see cref="ConfirmPartitionLeadershipAsync"/>) is deliberately not consulted here: it
+    /// guards quorum changes, and one read-index round per legacy range would let a single
+    /// unreachable range block the conversion of every other one. What does change is the
+    /// hosting set: roster members that are not Voters (Learner, Leaving) stop hosting the
+    /// converted ranges, which is the placed-model contract — a learner is placed onto ranges by
+    /// the planner once it is a voter, and a leaver is being evacuated. Dead Voters are kept on
+    /// purpose: dropping one would be a quorum change. A range whose current leader is not in
+    /// the set (a Leaving node that still leads) gets a best-effort leadership hand-off first so
+    /// the un-host costs one transfer rather than one election.
+    /// </para>
+    /// <para>
+    /// Rate: lowest partition id first, at most <see cref="RaftConfiguration.MaxReplicaMovesPerPass"/>
+    /// ranges per pass in one commit, so a cluster with many ranges converts gradually and the
+    /// generation bump (which fences in-flight proposals) is spread over passes. The trims that
+    /// follow are paced by the planner's own budgets.
+    /// </para>
+    /// </summary>
+    private async Task<bool> AssignInitialPlacementAsync(
+        RaftPartitionMap map,
+        List<RaftPartitionRange> awaiting,
+        ClusterMembership roster,
+        CancellationToken cancellationToken)
+    {
+        List<ClusterMember> voters = roster.Members
+            .Where(m => m.Role == ClusterMemberRole.Voter)
+            .OrderBy(m => m.Endpoint, StringComparer.Ordinal)
+            .ToList();
+
+        if (voters.Count == 0)
+        {
+            logger.LogWarning(
+                "RunPlacementPass: {Count} range(s) await initial placement but the committed roster has no Voter; nothing to assign",
+                awaiting.Count);
+            return true;
+        }
+
+        int budget = Math.Min(awaiting.Count, Math.Max(0, configuration.MaxReplicaMovesPerPass));
+        if (budget == 0)
+            return true;
+
+        string endpoints = string.Join(",", voters.Select(v => v.Endpoint));
+
+        foreach (RaftPartitionRange range in awaiting.Take(budget))
+        {
+            string? leader = getPartitionLeader(range.PartitionId);
+            if (!string.IsNullOrEmpty(leader) && voters.All(v => v.Endpoint != leader))
+            {
+                string? successor = voters
+                    .OrderByDescending(v => v.Endpoint == localEndpoint || getNodeLiveness(v.Endpoint) == MemberLivenessState.Alive)
+                    .ThenBy(v => v.Endpoint, StringComparer.Ordinal)
+                    .Select(v => v.Endpoint)
+                    .FirstOrDefault();
+
+                if (successor is not null)
+                {
+                    try
+                    {
+                        await transferLeadership(range.PartitionId, successor, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        logger.LogWarning(
+                            "RunPlacementPass: leadership transfer of partition {Id} away from non-voter {Endpoint} before initial placement failed: {Message}",
+                            range.PartitionId, leader, ex.Message);
+                    }
+                }
+            }
+
+            range.Generation++;
+            range.Replicas = voters
+                .Select(v => new RaftReplica
+                {
+                    Endpoint = v.Endpoint,
+                    NodeId = v.NodeId,
+                    Role = RaftReplicaRole.Voter,
+                    SinceGeneration = range.Generation
+                })
+                .ToList();
+
+            logger.LogInfoPlacementInitialAssignment(localEndpoint, range.PartitionId, endpoints, range.Generation);
+        }
+
+        map.MapVersion++;
+
+        if (!await ReplicateMapAsync(map, null, cancellationToken).ConfigureAwait(false))
+            return false;
+
+        Diagnostics.KommanderMetrics.PlacementInitialAssignmentsTotal.Add(budget);
+        return true;
     }
 
     /// <summary>

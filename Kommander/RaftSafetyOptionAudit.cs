@@ -190,6 +190,8 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.SnapshotRescueProbeInterval)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotExportRetryCacheMaxBytes)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.MaxPreAuthRequestBodyBytes)] = RaftOptionKind.Safety,
+        [nameof(RaftConfiguration.JoinTimeout)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.JoinPromotionStallTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LearnerPromotionLag)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LearnerPromotionStableWindow)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LearnerPromotionStallWarningAfter)] = RaftOptionKind.Performance,

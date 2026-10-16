@@ -547,6 +547,35 @@ public static class KommanderMetrics
         set => Interlocked.Exchange(ref _balancerSlowNodes, value);
     }
 
+    // ── Replica placement ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Ranges the P0 placement pass gave an explicit replica set in place of legacy full
+    /// replication (an empty replica set while a replication factor applied). One per range; the
+    /// pass caps conversions per tick, so a converting cluster shows a steady climb that stops at
+    /// the number of ranges it had.
+    /// </summary>
+    internal static readonly Counter<long> PlacementInitialAssignmentsTotal =
+        Meter.CreateCounter<long>(
+            "raft.placement.initial_assignments_total",
+            description: "Ranges given an explicit replica set by the placement pass in place of legacy full replication.");
+
+    private static long _placementRangesAwaitingInitial;
+
+    /// <summary>
+    /// Active ranges whose replica set is still empty while their effective replication factor is
+    /// above 0, as counted by the last placement pass (P0 leader only; 0 when this node is not the
+    /// P0 leader). Every roster voter hosts such a range and every node that joins adds one more
+    /// copy. A non-zero value that does not fall means the pass cannot convert them:
+    /// <c>EnablePlacementRebalancer</c> is off, the roster is not committed yet, or the P0 leader
+    /// cannot commit.
+    /// </summary>
+    internal static long PlacementRangesAwaitingInitial
+    {
+        get => Interlocked.Read(ref _placementRangesAwaitingInitial);
+        set => Interlocked.Exchange(ref _placementRangesAwaitingInitial, value);
+    }
+
     // ── Observable gauges (dynamic per-partition) ─────────────────────────────
 
     // Weak references allow GC to collect stopped instances without leaking.
@@ -681,6 +710,11 @@ public static class KommanderMetrics
             "raft.balancer.slow_nodes",
             static () => BalancerSlowNodes,
             description: "Nodes currently classified slow by commit-wait (P0 leader only; 0 when not applicable).");
+
+        Meter.CreateObservableGauge(
+            "raft.placement.ranges_awaiting_initial",
+            static () => PlacementRangesAwaitingInitial,
+            description: "Active ranges with an empty replica set while a replication factor applies to them — legacy full replication the placement pass has not converted yet (P0 leader only; 0 when not applicable).");
     }
 
     /// <summary>

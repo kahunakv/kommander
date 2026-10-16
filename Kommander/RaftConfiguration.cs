@@ -1330,6 +1330,49 @@ public class RaftConfiguration
     /// </remarks>
     public long MaxPreAuthRequestBodyBytes { get; set; } = 32L * 1024 * 1024;
 
+    // ── Join ───────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Liveness ceiling of <c>JoinCluster</c>: the longest the join waits to be admitted (seed join)
+    /// and for the node to initialize (both overloads), measured from the start of the join, before
+    /// it throws a <see cref="TimeoutException"/> with an assembly-state dump.
+    /// <para>
+    /// It bounds only the phases whose duration says something about liveness: a seed that never
+    /// answers, a leader that never commits the <c>AddMember</c>, a partition map that never arrives.
+    /// It does <b>not</b> bound the seed join's wait for Learner → Voter promotion, which is a catch-up
+    /// whose duration follows the data size and the write rate — a snapshot install plus a backfill on
+    /// a cluster that has run under load for a while. That wait is bounded by progress instead, see
+    /// <see cref="JoinPromotionStallTimeout"/>. A fixed 60 s bound on it aborted every replacement of a
+    /// node on a loaded cluster that needed more than a minute to catch up (Caraxes, 2026-10-14).
+    /// </para>
+    /// <para>
+    /// The caller's cancellation token still ends the join earlier. Default 60 seconds.
+    /// </para>
+    /// </summary>
+    public TimeSpan JoinTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How long a seed-joining Learner may go without any catch-up progress while it waits for
+    /// promotion to Voter before <c>JoinCluster(seeds)</c> gives up, withdraws the node from the
+    /// roster, and throws a <see cref="TimeoutException"/> that names the stall.
+    /// <para>
+    /// Progress is anything the joiner can observe locally that only moves while the leader is
+    /// catching it up: the published commit frontier of any hosted partition (system partition
+    /// included) moving forward, a partition appearing, a snapshot chunk staged, a snapshot install
+    /// starting or completing, or a running install consuming more of its snapshot. While any of
+    /// these moves the promotion wait is not a timeout condition, however long it takes.
+    /// </para>
+    /// <para>
+    /// Must be longer than <see cref="LearnerPromotionStableWindow"/> plus
+    /// <see cref="UpdateNodesInterval"/>: on an idle cluster a caught-up learner makes no progress
+    /// at all while the leader observes it for the stable window and then waits for its next
+    /// promotion tick, and a shorter value would fail that healthy join. It must also cover the
+    /// longest quiet gap of a single catch-up step that reports no progress of its own. Default
+    /// 5 minutes.
+    /// </para>
+    /// </summary>
+    public TimeSpan JoinPromotionStallTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
     // ── Learner promotion ──────────────────────────────────────────────────────
 
     /// <summary>
@@ -1647,7 +1690,12 @@ public class RaftConfiguration
     /// replication</b> — every roster voter hosts every range, today's behavior. When &gt; 0,
     /// initial placement assigns each range a replica set of this size (spread evenly across
     /// voters) and quorum is computed per range over its voter replicas only. A cluster with
-    /// fewer voters than the factor degrades to full replication with no loss of safety.
+    /// fewer voters than the factor degrades to full replication with no loss of safety; with
+    /// <see cref="EnablePlacementRebalancer"/> on, the placement pass then gives each such range
+    /// an explicit replica set (every roster voter) and the planner tops it up as voters join, or
+    /// trims it once the cluster has more voters than the factor. With the rebalancer off such
+    /// ranges stay fully replicated and every node that joins adds one more copy — see
+    /// <see cref="IRaft.GetPartitionsAwaitingPlacement"/>.
     /// <para>Even values give a fragile quorum (3-of-4 tolerates the same single failure as
     /// 2-of-3); prefer odd values.</para>
     /// </summary>
@@ -1658,7 +1706,16 @@ public class RaftConfiguration
     /// When <see langword="false"/> (the default) no rebalancing moves are planned; in-flight
     /// replica transitions (learner promotion, removal completion) are still driven to
     /// completion so a crash mid-move can always converge. Initial placement at
-    /// <see cref="ReplicationFactor"/> is applied regardless of this flag.
+    /// <see cref="ReplicationFactor"/> is applied at bootstrap regardless of this flag.
+    /// <para>
+    /// This switch also gates the conversion of legacy fully replicated ranges — an empty replica
+    /// set while a factor applies, which is what a cluster that bootstrapped at or below its
+    /// factor, a split made while at or below it, or a factor turned on later leaves behind —
+    /// into placed ranges. The conversion itself changes no quorum (the set assigned is every
+    /// roster voter), but it ends with the planner removing copies, which is this switch's
+    /// authority. With it off those ranges stay fully replicated and the pass logs one Warning
+    /// per P0 leadership naming how many wait.
+    /// </para>
     /// </summary>
     public bool EnablePlacementRebalancer { get; set; }
 
@@ -2144,6 +2201,20 @@ public class RaftConfiguration
                 $"[Kommander] SelfRepairPeerDownGrace ({SelfRepairPeerDownGrace}) must not be negative. " +
                 "It is how long a promotion gate defers its destructive self-repair while a voter peer " +
                 "is down; use TimeSpan.Zero to disable the grace and let the refusal counts alone govern.");
+
+        if (JoinTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] JoinTimeout ({JoinTimeout}) must be positive. " +
+                "It is the liveness ceiling on join admission and initialization; without it a join " +
+                "against a cluster that cannot assemble would hang silently.");
+
+        if (JoinPromotionStallTimeout <= LearnerPromotionStableWindow + UpdateNodesInterval)
+            throw new RaftException(
+                $"[Kommander] JoinPromotionStallTimeout ({JoinPromotionStallTimeout}) must be longer than " +
+                $"LearnerPromotionStableWindow ({LearnerPromotionStableWindow}) plus UpdateNodesInterval " +
+                $"({UpdateNodesInterval}). A caught-up learner on an idle cluster makes no progress while the " +
+                "leader observes it for the stable window and waits for its next promotion tick, so a shorter " +
+                "stall timeout would fail a healthy join.");
 
         if (SnapshotReceiveSessionTtl <= TimeSpan.Zero)
             throw new RaftException(

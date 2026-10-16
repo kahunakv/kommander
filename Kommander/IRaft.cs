@@ -1040,6 +1040,30 @@ public interface IRaft
     public int GetEffectiveReplicationFactor(int partitionId);
 
     /// <summary>
+    /// Partition ids of the <see cref="RaftPartitionState.Active"/> ranges whose replica set is
+    /// empty while their effective replication factor is above 0: ranges that still run legacy
+    /// full replication (every roster voter hosts them, and every node that joins adds one more
+    /// copy) and wait for the P0 placement pass to assign them a replica set. The pass assigns one
+    /// only when <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on; with it off this
+    /// list is the operator's signal that growing the cluster adds copies instead of spreading
+    /// data. Empty for a fully placed cluster, and for
+    /// <see cref="RaftConfiguration.ReplicationFactor"/> 0 without per-range overrides (full
+    /// replication by choice). Computed from the committed map on every call.
+    /// </summary>
+    public IReadOnlyList<int> GetPartitionsAwaitingPlacement()
+    {
+        List<int> awaiting = [];
+        foreach (RaftPartitionRange range in GetPartitionMap())
+        {
+            if (range.State == RaftPartitionState.Active && range.Replicas.Count == 0 &&
+                GetEffectiveReplicationFactor(range.PartitionId) > 0)
+                awaiting.Add(range.PartitionId);
+        }
+
+        return awaiting;
+    }
+
+    /// <summary>
     /// Commits a per-range replication-factor override (0 clears it, inheriting the global
     /// configuration). Leader-only (P0). The change adjusts the target only — the placement
     /// controller moves replicas toward it on subsequent passes when

@@ -126,8 +126,9 @@ public enum RaftSystemRequestType
     /// <summary>
     /// Triggers one replica-placement controller pass on the P0 leader: drives in-flight replica
     /// transitions to completion (learner promotion, removal finalization) and — when
-    /// <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on — plans and dispatches
-    /// rebalancing moves. Sent by the timer service every
+    /// <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on — gives legacy fully
+    /// replicated ranges that a replication factor applies to their first replica set, then plans
+    /// and dispatches rebalancing moves. Sent by the timer service every
     /// <see cref="RaftConfiguration.PlacementPassInterval"/> whenever
     /// <see cref="RaftConfiguration.PlacementPassEnabled"/> is true (independent of
     /// <see cref="RaftConfiguration.EnableLeaderBalancer"/>), and additionally kicked once after

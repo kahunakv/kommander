@@ -314,7 +314,10 @@ public static class PlacementPlanner
     /// cover yet (same best-effort tiebreak as <see cref="PickAddTarget"/> — node
     /// anti-affinity stays absolute, zone spread bends to the load balance). Returns an empty
     /// assignment (legacy full replication) when there are fewer nodes than the factor — the RF
-    /// floor degrades to full replication.
+    /// floor degrades to full replication. That empty assignment is not final: once the roster
+    /// commits, the placement pass (<c>ReplicaPlacementService.RunPlacementPassAsync</c>, with the
+    /// rebalancer on) gives each such range an explicit set of every roster voter, and the planner
+    /// takes it from there.
     /// </summary>
     public static Dictionary<int, List<CandidateNode>> AssignInitial(
         IReadOnlyList<int> partitionIds,
