@@ -241,7 +241,7 @@ internal sealed class SplitMergeController
                     "TrySplitPartition: Phase 1 replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                if (result.Status is not (RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.StaleSystemConfiguration))
                 {
                     try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                     catch (OperationCanceledException)
@@ -370,6 +370,16 @@ internal sealed class SplitMergeController
                 logger.LogWarning(
                     "TrySplitPartitionCommit: Phase 2 replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
+
+                // The commit was built from a map that committed entries have since replaced.
+                // The pending entry stays registered; run the commit again from the current map
+                // (it re-reads the map and is idempotent), instead of leaving the operation
+                // half done until the next P0 leadership change re-enqueues it.
+                if (result.Status == RaftOperationStatus.StaleSystemConfiguration)
+                {
+                    send(new RaftSystemRequest(RaftSystemRequestType.SplitPartitionCommit, sourcePartitionId));
+                    return;
+                }
 
                 if (result.Status != RaftOperationStatus.NodeIsNotLeader)
                 {
@@ -507,7 +517,7 @@ internal sealed class SplitMergeController
                     "TryMergePartitions: Phase 1 replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                if (result.Status is not (RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.StaleSystemConfiguration))
                 {
                     try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                     catch (OperationCanceledException)
@@ -645,6 +655,16 @@ internal sealed class SplitMergeController
                 logger.LogWarning(
                     "TryMergePartitionCommit: Phase 2 replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
+
+                // The commit was built from a map that committed entries have since replaced.
+                // The pending entry stays registered; run the commit again from the current map
+                // (it re-reads the map and is idempotent), instead of leaving the operation
+                // half done until the next P0 leadership change re-enqueues it.
+                if (result.Status == RaftOperationStatus.StaleSystemConfiguration)
+                {
+                    send(new RaftSystemRequest(RaftSystemRequestType.MergePartitionCommit, sourcePartitionId));
+                    return;
+                }
 
                 if (result.Status != RaftOperationStatus.NodeIsNotLeader)
                 {

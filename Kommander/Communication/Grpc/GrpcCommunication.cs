@@ -968,6 +968,9 @@ public class GrpcCommunication : ICommunication
     /// <paramref name="followerEndpoint"/> on <paramref name="partitionId"/> via the
     /// <c>GetFollowerLag</c> gRPC RPC.  Returns <see langword="null"/> when the remote
     /// node reports that it has no record for the follower on that partition.
+    /// <para>Bounded by <see cref="RaftConfiguration.RemoteProbeTimeout"/>: the P0 placement pass
+    /// calls this from the coordinator loop, so an unanswered call on a dead connection must not
+    /// hold that loop until the HTTP/2 keepalive gives up.</para>
     /// </summary>
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
@@ -983,7 +986,7 @@ public class GrpcCommunication : ICommunication
         try
         {
             GrpcGetFollowerLagResponse response = await client
-                .GetFollowerLagAsync(grpcRequest, new CallOptions(metadata))
+                .GetFollowerLagAsync(grpcRequest, new CallOptions(metadata, deadline: DateTime.UtcNow + manager.Configuration.RemoteProbeTimeout))
                 .ResponseAsync
                 .ConfigureAwait(false);
 
@@ -1001,7 +1004,10 @@ public class GrpcCommunication : ICommunication
     /// Fetches a quorum-confirmed read index from <paramref name="node"/> (believed partition
     /// leader) via the <c>GetReadIndex</c> gRPC RPC on behalf of a non-leader running
     /// <c>ConfirmLocalApplicationAsync</c>. Every transport failure maps to a failed response —
-    /// the caller must fail closed, so no error may surface as an exception here.
+    /// the caller must fail closed, so no error may surface as an exception here. Bounded by
+    /// <see cref="RaftConfiguration.RemoteProbeTimeout"/> (the answering node bounds its own round by
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>), so a call on a connection
+    /// that died during a partition fails in seconds, not when the keepalive ping gives up.
     /// </summary>
     public async Task<GetReadIndexResponse> GetReadIndex(
         RaftManager manager, RaftNode node, GetReadIndexRequest request,
@@ -1018,7 +1024,7 @@ public class GrpcCommunication : ICommunication
         try
         {
             GrpcGetReadIndexResponse response = await client
-                .GetReadIndexAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .GetReadIndexAsync(grpcRequest, new CallOptions(metadata, deadline: DateTime.UtcNow + manager.Configuration.RemoteProbeTimeout, cancellationToken: cancellationToken))
                 .ResponseAsync
                 .ConfigureAwait(false);
 

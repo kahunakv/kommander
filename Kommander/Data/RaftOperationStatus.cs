@@ -166,4 +166,15 @@ public enum RaftOperationStatus
     /// caller may retry once the partition has a reachable, confirmed leader.
     /// </summary>
     LeadershipNotConfirmed = 26,
+
+    /// <summary>
+    /// A system-partition write was refused before it was proposed, because it was computed from a
+    /// local system configuration that has since moved on. Every map and roster write carries the
+    /// whole record, built from this node's installed copy when the handler started; when committed
+    /// entries from another leader were installed while that handler was running (it waited on a
+    /// remote confirmation, or the node lost and won P0 leadership in between), proposing it would
+    /// overwrite those entries and roll the committed map back. Nothing was proposed. The caller
+    /// re-reads the current state and retries; the placement pass does so on its next tick.
+    /// </summary>
+    StaleSystemConfiguration = 27,
 }

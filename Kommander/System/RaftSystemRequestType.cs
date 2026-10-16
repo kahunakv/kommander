@@ -146,5 +146,15 @@ public enum RaftSystemRequestType
     /// <see cref="RaftConfiguration.LeaderBalancerInterval"/>; silently ignored when this
     /// node is not the P0 leader or <see cref="RaftConfiguration.EnableLeaderBalancer"/> is false.
     /// </summary>
-    RunBalancerPass
+    RunBalancerPass,
+
+    /// <summary>
+    /// Runs <c>TrySetInitialPartitions</c> again on the P0 leader. Sent by
+    /// <c>TrySetInitialPartitions</c> itself when its write was refused with
+    /// <see cref="Kommander.Data.RaftOperationStatus.StaleSystemConfiguration"/>: a newer committed
+    /// map or roster was installed after it read the old one. It starts over through the channel,
+    /// as a new dispatch, so it reads the installed state and the stale-base fence is re-armed for
+    /// it. Ignored when this node is no longer the P0 leader by then.
+    /// </summary>
+    RetryInitialPartitions
 }

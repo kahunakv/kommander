@@ -958,6 +958,17 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LeadershipConfirmationTimeout { get; set; } = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// Client-side bound on one remote probe that the P0 coordinator makes from its loop: a
+    /// <c>GetReadIndex</c> leadership confirmation or a <c>GetFollowerLag</c> query. Derived, not
+    /// configured: the answering node already bounds a read-index round by
+    /// <see cref="LeadershipConfirmationTimeout"/>, so this only adds transport slack. Without a
+    /// client bound, a call sent on an HTTP/2 connection that died during a network partition
+    /// waits until the keepalive ping fails (75 s in the Kahuna nightly of 2026-10-16), and the
+    /// coordinator loop, which processes one request at a time, waits with it.
+    /// </summary>
+    internal TimeSpan RemoteProbeTimeout => LeadershipConfirmationTimeout + TimeSpan.FromSeconds(3);
+
     // ── Check-quorum ─────────────────────────────────────────────────────────
 
     /// <summary>

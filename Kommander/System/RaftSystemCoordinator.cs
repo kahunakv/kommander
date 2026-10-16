@@ -9,6 +9,7 @@ using Kommander.Logging;
 using Microsoft.Extensions.Logging;
 using Kommander.Discovery;
 using Kommander.Support.Parallelization;
+using Kommander.Time;
 
 namespace Kommander.System;
 
@@ -42,6 +43,39 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </para>
     /// </summary>
     private long appliedSystemLogIndex = -1;
+
+    /// <summary>
+    /// Committed system entries waiting to be installed, in the order the log applicator (or WAL
+    /// replay) delivered them. <see cref="Send"/> puts every
+    /// <see cref="RaftSystemRequestType.ConfigReplicated"/>, <see cref="RaftSystemRequestType.ConfigRestored"/>
+    /// and <see cref="RaftSystemRequestType.ConfigCheckpointRestored"/> request here as well as on
+    /// the channel; the channel copy only wakes the loop.
+    /// <para>
+    /// A committed entry must not wait behind handler requests. The loop is single-reader FIFO and a
+    /// handler can hold it for a long time; on 2026-10-16 a <c>TryAddReplica</c> held it for 75 s on
+    /// a remote read-index call while the node lost P0 leadership, another leader committed eleven
+    /// map entries, and the node won P0 back. The placement passes queued during the wait then ran
+    /// as leader on the old map and committed it over the eleven entries, which the in-order guard
+    /// then (correctly) refused to install. Installing this queue before every handler dispatch, and
+    /// again inside <see cref="Replicate"/>, keeps a handler from starting, or proposing, on a map
+    /// that the log has already moved past.
+    /// </para>
+    /// </summary>
+    private readonly ConcurrentQueue<RaftSystemRequest> _committedDeliveries = new();
+
+    /// <summary>
+    /// Number of committed deliveries installed so far (deliveries skipped as already installed do
+    /// not count). Touched only on the coordinator loop.
+    /// </summary>
+    private long _installedDeliveries;
+
+    /// <summary>
+    /// <see cref="_installedDeliveries"/> when the request now being processed was dispatched. Set
+    /// only at dispatch, so a refusal holds for the rest of the dispatch. The
+    /// <see cref="Replicate"/> fence compares the two: a difference means the handler built its
+    /// write from a state that a committed entry has since replaced.
+    /// </summary>
+    private long _installedDeliveriesAtDispatch;
 
     private readonly RaftManager manager;
 
@@ -83,6 +117,20 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// empty) resolution.
     /// </summary>
     internal Func<int, CancellationToken, Task<string?>>? ResolvePartitionLeaderOverride;
+
+    /// <summary>
+    /// Test hook called when a <see cref="RaftSystemRequestType.LeaderChanged"/> request is
+    /// dispatched, with the leader it names and <see cref="appliedSystemLogIndex"/> at that
+    /// moment. Pins the ordering the stale-base fence relies on: a new P0 leader has installed
+    /// every system entry committed before its term when it learns it leads.
+    /// </summary>
+    internal Action<string?, long>? LeaderChangedForTest;
+
+    /// <summary>
+    /// Test hook called at the start of <see cref="Replicate"/>, before the stale-base fence. Lets a test deliver a committed entry at the exact point where a
+    /// handler that never waits (a Phase 2 commit, the initial-map re-assert) can still meet one.
+    /// </summary>
+    internal Action? BeforeReplicateForTest;
 
     /// <summary>
     /// Test hook for <see cref="ReplicateCheckpointForPartition"/>.
@@ -234,9 +282,22 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
     /// <summary>
     /// Enqueues a request for serial processing. Safe to call from any thread.
+    /// <para>A committed-entry delivery also goes to <see cref="_committedDeliveries"/>, so the loop
+    /// installs it before the next handler runs, even when older handler requests are still
+    /// queued in front of it.</para>
     /// </summary>
-    internal void Send(RaftSystemRequest request) =>
+    internal void Send(RaftSystemRequest request)
+    {
+        if (IsCommittedDelivery(request.Type))
+            _committedDeliveries.Enqueue(request);
+
         _channel.Writer.TryWrite(request);
+    }
+
+    private static bool IsCommittedDelivery(RaftSystemRequestType type) =>
+        type is RaftSystemRequestType.ConfigReplicated
+            or RaftSystemRequestType.ConfigRestored
+            or RaftSystemRequestType.ConfigCheckpointRestored;
 
     /// <summary>1 while the loop is inside <see cref="Receive"/>; 0 when it is idle.</summary>
     private int _processing;
@@ -251,7 +312,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// without blocking on a barrier the driver itself would have to satisfy.</para>
     /// </summary>
     internal bool HasPendingWork =>
-        (_channel.Reader.CanCount && _channel.Reader.Count > 0) || Volatile.Read(ref _processing) != 0;
+        !_committedDeliveries.IsEmpty
+        || (_channel.Reader.CanCount && _channel.Reader.Count > 0)
+        || Volatile.Read(ref _processing) != 0;
 
     /// <summary>
     /// Returns a <see cref="Task"/> that completes only after all requests
@@ -282,6 +345,15 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
                     try
                     {
+                        // Committed entries first, whatever their position in the channel. A
+                        // delivery's own channel copy is only a wake-up: its payload was installed
+                        // here, by this call or an earlier one.
+                        InstallCommittedDeliveries();
+
+                        if (IsCommittedDelivery(request.Type))
+                            continue;
+
+                        _installedDeliveriesAtDispatch = _installedDeliveries;
                         await Receive(request, _cts.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
@@ -340,70 +412,16 @@ internal sealed class RaftSystemCoordinator : IDisposable
         switch (message.Type)
         {
             case RaftSystemRequestType.ConfigRestored:
-            {
-                if (message.LogData is null)
-                {
-                    logger.LogWarning("Restored message is null");
-                    return;
-                }
-
-                if (!TryAdvanceAppliedIndex(message))
-                    return;
-
-                RaftSystemMessage systemMessage = Unserialize(message.LogData);
-                systemConfiguration[systemMessage.Key] = systemMessage.Value;
-                logger.LogInfoRestoredSystemConfiguration(systemMessage.Key);
-
-                if (systemMessage.Key == RaftSystemConfigKeys.Members)
-                    ApplyMembershipFromCache();
-            }
-            break;
-
             case RaftSystemRequestType.ConfigCheckpointRestored:
-            {
-                if (message.LogData is null)
-                {
-                    logger.LogWarning("Checkpoint-restored message is null");
-                    return;
-                }
-
-                if (!TryAdvanceAppliedIndex(message))
-                    return;
-
-                ApplyRestoredCheckpointSnapshot(message.LogData);
-            }
-            break;
-
             case RaftSystemRequestType.ConfigReplicated:
-            {
-                if (message.LogData is null)
-                {
-                    logger.LogWarning("Replication message is null");
-                    return;
-                }
-
-                // The handler that committed this entry installed it already; this is the log
-                // applicator's delivery of the same entry, or of an older one. Installing it again
-                // would move the local map backwards.
-                if (!TryAdvanceAppliedIndex(message))
-                    return;
-
-                RaftSystemMessage systemMessage = Unserialize(message.LogData);
-                systemConfiguration[systemMessage.Key] = systemMessage.Value;
-                logger.LogInfoReplicatedSystemConfiguration(systemMessage.Key);
-
-                // Live replication: dispatch to the correct subsystem based on the key.
-                // Followers must never attempt to drive Phase 2 commits, and leaders already
-                // track in-progress operations via _pendingSplits/_pendingMerges.
-                if (systemMessage.Key == RaftSystemConfigKeys.Partitions)
-                    _partitionMap.InitializePartitions(crashRecovery: false);
-                else if (systemMessage.Key == RaftSystemConfigKeys.Members)
-                    ApplyMembershipFromCache();
-            }
-            break;
+                // Unreachable: the loop installs deliveries from _committedDeliveries and never
+                // dispatches them here, and the shutdown drain returns above on the cancelled
+                // token. Deliveries still queued at shutdown are dropped with the coordinator.
+                break;
 
             case RaftSystemRequestType.LeaderChanged:
                 leaderNode = message.LeaderNode;
+                LeaderChangedForTest?.Invoke(leaderNode, appliedSystemLogIndex);
 
                 if (string.IsNullOrEmpty(leaderNode))
                 {
@@ -421,6 +439,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     // register stale _pendingSplits/_pendingMerges entries on followers that
                     // would cause double-commits if this node later wins leadership.
                     _partitionMap.InitializePartitions(crashRecovery: false);
+                break;
+
+            case RaftSystemRequestType.RetryInitialPartitions:
+                // leaderNode follows LeaderChanged in channel order, so it is current here.
+                if (!string.IsNullOrEmpty(leaderNode) && manager.LocalEndpoint == leaderNode)
+                    await _partitionMap.TrySetInitialPartitions(cancellationToken).ConfigureAwait(false);
                 break;
 
             case RaftSystemRequestType.SplitPartition:
@@ -512,10 +536,144 @@ internal sealed class RaftSystemCoordinator : IDisposable
         }
     }
 
+    // ── Committed-entry installation ───────────────────────────────────────
+
+    /// <summary>
+    /// Installs every queued committed delivery, in delivery order. Runs only on the coordinator
+    /// loop: before each handler dispatch, and from <see cref="Replicate"/> inside a handler (a
+    /// handler is awaited by the loop, so nothing else runs on it meanwhile).
+    /// <para>Installing a map entry re-runs <see cref="PartitionMapService.InitializePartitions"/>,
+    /// which starts and stops local partitions. That is the same work the loop would do for the
+    /// entry anyway; doing it inside a handler is safe because the handler that sees the install
+    /// is refused by the <see cref="Replicate"/> fence before it changes anything.</para>
+    /// </summary>
+    private void InstallCommittedDeliveries()
+    {
+        while (_committedDeliveries.TryDequeue(out RaftSystemRequest? delivery))
+        {
+            try
+            {
+                if (InstallDelivery(delivery))
+                    _installedDeliveries++;
+            }
+            catch (Exception ex)
+            {
+                // Contained per delivery: this runs ahead of every handler and inside Replicate,
+                // so an escaping exception would abort an unrelated request. Trade-off:
+                // TryAdvanceAppliedIndex has already moved appliedSystemLogIndex past this entry,
+                // so a payload that failed to parse is never installed (as before this queue
+                // existed). Advancing after the install is no better: InitializePartitions can
+                // throw after the systemConfiguration write. The entry may be partly installed,
+                // so it counts as an install for the stale-base fence.
+                _installedDeliveries++;
+                logger.LogError(
+                    "[RaftSystemCoordinator] Failed to install {Type} of system entry {LogIndex}: {Message}\n{StackTrace}",
+                    delivery.Type, delivery.LogIndex, ex.Message, ex.StackTrace);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Installs one committed delivery into <see cref="systemConfiguration"/>. Returns false when
+    /// it was not installed: no payload, or an entry at or below <see cref="appliedSystemLogIndex"/>
+    /// (the handler that committed it installed it already, or a newer entry is installed).
+    /// </summary>
+    private bool InstallDelivery(RaftSystemRequest message)
+    {
+        if (message.LogData is null)
+        {
+            logger.LogWarning("[RaftSystemCoordinator] {Type} message is null", message.Type);
+            return false;
+        }
+
+        // The handler that committed this entry installed it already; this is the log
+        // applicator's delivery of the same entry, or of an older one. Installing it again
+        // would move the local map backwards.
+        if (!TryAdvanceAppliedIndex(message))
+            return false;
+
+        switch (message.Type)
+        {
+            case RaftSystemRequestType.ConfigCheckpointRestored:
+                ApplyRestoredCheckpointSnapshot(message.LogData);
+                return true;
+
+            case RaftSystemRequestType.ConfigRestored:
+            {
+                RaftSystemMessage systemMessage = Unserialize(message.LogData);
+                systemConfiguration[systemMessage.Key] = systemMessage.Value;
+                logger.LogInfoRestoredSystemConfiguration(systemMessage.Key);
+
+                if (systemMessage.Key == RaftSystemConfigKeys.Members)
+                    ApplyMembershipFromCache();
+
+                return true;
+            }
+
+            default:
+            {
+                RaftSystemMessage systemMessage = Unserialize(message.LogData);
+                systemConfiguration[systemMessage.Key] = systemMessage.Value;
+                logger.LogInfoReplicatedSystemConfiguration(systemMessage.Key);
+
+                // Live replication: dispatch to the correct subsystem based on the key.
+                // Followers must never attempt to drive Phase 2 commits, and leaders already
+                // track in-progress operations via _pendingSplits/_pendingMerges.
+                if (systemMessage.Key == RaftSystemConfigKeys.Partitions)
+                    _partitionMap.InitializePartitions(crashRecovery: false);
+                else if (systemMessage.Key == RaftSystemConfigKeys.Members)
+                    ApplyMembershipFromCache();
+
+                return true;
+            }
+        }
+    }
+
     // ── Partition helpers ──────────────────────────────────────────────────
 
+
+    /// <summary>
+    /// Proposes one system entry for the handler now running on the loop.
+    /// <para><b>Stale-base fence.</b> Every map and roster write carries the whole record, built
+    /// from <see cref="systemConfiguration"/> when the handler started. Before proposing, this
+    /// installs any committed delivery that arrived since; if one was installed after the
+    /// handler's dispatch, the record was built from a state the log has moved past, and
+    /// proposing it would overwrite the newer entries (they would then be refused as older than
+    /// it, for good). The write is refused with
+    /// <see cref="RaftOperationStatus.StaleSystemConfiguration"/> and nothing is proposed. A
+    /// handler's own earlier commit does not trip the fence: its applicator echo is at or below
+    /// <see cref="appliedSystemLogIndex"/> and is not installed.</para>
+    /// <para><b>What the fence can see.</b> Only entries the log applicator has handed to
+    /// <see cref="Send"/>. That covers every entry committed before this node's P0 term: the
+    /// promotion barrier publishes leadership (and sends <c>LeaderChanged</c>) only after the
+    /// committed drain, plus the barrier no-op's drain of any inherited tail, has applied every
+    /// prior-term entry, and the applicator sends each system entry before it moves the applied
+    /// frontier. Entries committed during the term are this node's own, installed by the handler
+    /// that committed them. A node that does not hold published P0 leadership cannot commit at
+    /// all (the manager refuses the proposal). A read-index confirmation here would add nothing,
+    /// and it fails for a fresh leader with no entry of its own term yet, which would block the
+    /// first map write of a new cluster. TestSystemLeaderChangeDeliveryOrder pins the
+    /// ordering.</para>
+    /// <para>The fence stays armed for the whole dispatch: a second write in the same dispatch,
+    /// after a refusal, is refused too, so a caller that retried the refused bytes could never
+    /// commit them. A handler that wants to start over from the installed state sends itself back
+    /// through the channel (the Phase 2 commits, <c>TrySetInitialPartitions</c>).</para>
+    /// </summary>
     private async Task<RaftReplicationResult> Replicate(string type, byte[] data, bool autoCommit, CancellationToken ct)
     {
+        BeforeReplicateForTest?.Invoke();
+
+        InstallCommittedDeliveries();
+
+        if (_installedDeliveries != _installedDeliveriesAtDispatch)
+        {
+            logger.LogWarning(
+                "[RaftSystemCoordinator] Refusing a system write built from a stale configuration: {Count} committed entries were installed while the handler ran (installed through {AppliedLogIndex})",
+                _installedDeliveries - _installedDeliveriesAtDispatch, appliedSystemLogIndex);
+
+            return new(false, RaftOperationStatus.StaleSystemConfiguration, HLCTimestamp.Zero, 0);
+        }
+
         RaftReplicationResult result = ReplicateOverride is { } fn
             ? await fn(type, data, autoCommit, ct).ConfigureAwait(false)
             : await manager.ReplicateSystemLogs(type, data, autoCommit, ct).ConfigureAwait(false);
@@ -568,8 +726,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// range and make the fence independent of the hint's freshness — right after a step-down the
     /// hint names the old leader for a few gossip rounds, and refusing every replica change until
     /// it catches up would stall the placement pass for no safety gain. A failed or timed-out round
-    /// and a transport error fail closed. Bounded per candidate by
-    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/> on the answering node.
+    /// and a transport error fail closed. The answering node bounds its round by
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>; this side bounds the whole
+    /// resolution by <see cref="RaftConfiguration.RemoteProbeTimeout"/> (see
+    /// <see cref="ResolvePartitionLeaderAsync"/>), because it runs on the coordinator loop.
     /// </summary>
     private async Task<bool> ConfirmPartitionLeadershipAsync(int partitionId, CancellationToken ct)
     {
@@ -581,11 +741,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
     /// <summary>
     /// Finds the quorum-confirmed leader of one data partition and returns its endpoint, or null
-    /// when no candidate answers a read-index round. Same candidate order as
+    /// when no candidate answers a read-index round. Same candidates as
     /// <see cref="ConfirmPartitionLeadershipAsync"/> (which is this method's boolean view): the
-    /// local node when it leads the partition, then the gossiped leader hint, then every other
+    /// local node when it leads the partition; otherwise the gossiped leader hint and every other
     /// voter of the committed replica set (the roster's voters on a legacy full-replication
-    /// range).
+    /// range), probed concurrently under one <see cref="RaftConfiguration.RemoteProbeTimeout"/>
+    /// budget, the first success winning.
     /// <para>This is the leader source the placement pass falls back to when the gossiped hint
     /// is empty or does not answer the learner-lag probe. The hint is cheap but advisory: it is
     /// reduced from load reports that a restarted or silent node may fail to refresh, and a pass
@@ -627,18 +788,69 @@ internal sealed class RaftSystemCoordinator : IDisposable
             }
         }
 
-        foreach (string endpoint in candidates)
-        {
-            ct.ThrowIfCancellationRequested();
+        if (candidates.Count == 0)
+            return null;
 
+        // All candidates at once, under one budget. Only a leader that still commands its voters
+        // answers with success, so the first success is authoritative and the others are cancelled.
+        // One budget, not one per candidate: this runs on the coordinator loop, and RF sequential
+        // timeouts per replica change, several changes per placement pass, would hold every queued
+        // request (committed entries included) for tens of seconds under a partition.
+        using CancellationTokenSource probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        probeCts.CancelAfter(manager.Configuration.RemoteProbeTimeout);
+
+        List<Task<string?>> probes = candidates.Select(endpoint => ProbeReadIndexAsync(endpoint, partitionId, probeCts.Token)).ToList();
+
+        while (probes.Count > 0)
+        {
+            Task<string?> done = await Task.WhenAny(probes).ConfigureAwait(false);
+            probes.Remove(done);
+
+            if (await done.ConfigureAwait(false) is { } leader)
+            {
+                // The losing probes are still in flight when the using disposes probeCts. That is
+                // safe: the token is cancelled first, and ProbeReadIndexAsync swallows everything.
+                await probeCts.CancelAsync().ConfigureAwait(false);
+                return leader;
+            }
+        }
+
+        ct.ThrowIfCancellationRequested();
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebug(
+                "[RaftSystemCoordinator] No candidate confirmed leadership of partition {PartitionId} within {Timeout} ({Candidates})",
+                partitionId, manager.Configuration.RemoteProbeTimeout, string.Join(", ", candidates));
+        return null;
+    }
+
+    /// <summary>
+    /// One read-index probe of <paramref name="endpoint"/> for <see cref="ResolvePartitionLeaderAsync"/>.
+    /// Returns the endpoint when it answered as the partition's confirmed leader, null otherwise.
+    /// Never throws: a cancelled, failed or timed-out call fails closed. The gRPC transport already
+    /// carries its own deadline and maps every error to a failed response; the token here is the
+    /// guard for any other <see cref="ICommunication"/> implementation.
+    /// </summary>
+    private async Task<string?> ProbeReadIndexAsync(string endpoint, int partitionId, CancellationToken ct)
+    {
+        try
+        {
             GetReadIndexResponse response = await manager.Communication.GetReadIndex(
                 manager, new RaftNode(endpoint), new GetReadIndexRequest(partitionId), ct).ConfigureAwait(false);
 
-            if (response.Success && response.ReadIndex >= 0)
-                return endpoint;
+            return response.Success && response.ReadIndex >= 0 ? endpoint : null;
         }
-
-        return null;
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "[RaftSystemCoordinator] GetReadIndex from {Endpoint} partition {PartitionId} failed: {Message}",
+                endpoint, partitionId, ex.Message);
+            return null;
+        }
     }
 
     private Task<RaftReplicationResult> ReplicateCheckpointForPartition(int partitionId, CancellationToken ct) =>
@@ -1276,8 +1488,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     // ProposalOutcomeUnknown: leadership moved with the proposal in flight — the
                     // membership entry may still commit via the new leader's §5.4.2 inherited
                     // commit, so retrying here risks a duplicate delta; stop and report the
-                    // indeterminate status to the caller.
-                    if (result.Status is RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.ProposalOutcomeUnknown)
+                    // indeterminate status to the caller. StaleSystemConfiguration: the roster
+                    // was built from a state that committed entries replaced; the same bytes can
+                    // never become valid, so the caller re-reads and retries.
+                    if (result.Status is RaftOperationStatus.NodeIsNotLeader
+                        or RaftOperationStatus.ProposalOutcomeUnknown
+                        or RaftOperationStatus.StaleSystemConfiguration)
                     {
                         completion?.TrySetResult((result.Status, 0));
                         return;

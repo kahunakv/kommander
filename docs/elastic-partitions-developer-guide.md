@@ -782,6 +782,31 @@ runs before the `ConfigReplicated` event arrives (which would otherwise update
 `systemConfiguration` via the replication callback). Without step 5, the second operation
 would find `systemConfiguration` empty and return `Errored`.
 
+The opposite hazard matters as much. Step 4 writes the **whole** map, built in step 1 from the
+local copy. If committed entries from another P0 leader are installed after step 1 (the handler
+waited on a remote leadership confirmation, and the node lost and won P0 leadership meanwhile),
+the write would overwrite them, and the in-order install guard would then refuse them as older
+than the write: the committed map goes back in time on every node. Two rules prevent this:
+
+- **Committed entries go first.** `ConfigReplicated`, `ConfigRestored` and
+  `ConfigCheckpointRestored` deliveries are also queued apart from the channel, and the loop
+  installs all of them before it dispatches the next handler, whatever their channel position.
+  A handler therefore never starts on a map that the log has already moved past.
+- **Stale-base fence.** `Replicate` installs any delivery that arrived since the handler was
+  dispatched. Every entry committed before this node's P0 term has been delivered by then: the
+  promotion barrier publishes leadership only after every prior-term entry was applied, and the
+  applicator delivers each system entry before it moves the applied frontier
+  (`TestSystemLeaderChangeDeliveryOrder` pins this). If one was installed, it proposes nothing and returns
+  `RaftOperationStatus.StaleSystemConfiguration`, and it keeps refusing for the rest of that
+  dispatch. Every caller stops on that status: the placement pass re-plans on its next tick, and
+  the split and merge Phase 2 commits and `TrySetInitialPartitions` send themselves back through
+  the channel, so they start over from the installed state as a new dispatch.
+
+The remote calls that a handler can wait on from the loop (`GetReadIndex`, `GetFollowerLag`) are
+bounded by `RaftConfiguration.RemoteProbeTimeout` (the leadership confirmation timeout plus 3 s),
+so one dead connection cannot hold the loop for minutes. A partition-leadership resolution probes
+all its candidates at once under one such budget.
+
 ---
 
 ## 15. Public API Reference

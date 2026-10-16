@@ -197,6 +197,7 @@ internal sealed class PartitionMapService
                     Value = partitions
                 };
 
+                RaftOperationStatus reassertStatus = RaftOperationStatus.Errored;
                 try
                 {
                     RaftReplicationResult result = await replicate(
@@ -206,7 +207,8 @@ internal sealed class PartitionMapService
                         cancellationToken
                     ).ConfigureAwait(false);
 
-                    if (result.Status != RaftOperationStatus.Success)
+                    reassertStatus = result.Status;
+                    if (result.Status is not (RaftOperationStatus.Success or RaftOperationStatus.StaleSystemConfiguration))
                         logger.LogWarning(
                             "[RaftSystemCoordinator] Failed to re-assert existing partition map to followers: {Status}",
                             result.Status);
@@ -214,6 +216,16 @@ internal sealed class PartitionMapService
                 catch (OperationCanceledException)
                 {
                     logger.LogWarning("[RaftSystemCoordinator] TrySetInitialPartitions re-assert aborted on shutdown");
+                }
+
+                if (reassertStatus == RaftOperationStatus.StaleSystemConfiguration)
+                {
+                    // A newer committed map was installed after this handler read the old one
+                    // (and started it); starting the old one below would move the local routing
+                    // backwards. Start over from the installed map as a new dispatch.
+                    logger.LogDebug("TrySetInitialPartitions: re-assert refused as stale; starting over from the installed map");
+                    send(new RaftSystemRequest(RaftSystemRequestType.RetryInitialPartitions));
+                    return;
                 }
 
                 startPartitions(existingMap);
@@ -263,6 +275,17 @@ internal sealed class PartitionMapService
                 // duplicate; stop for the same reason.
                 if (result.Status is RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.ProposalOutcomeUnknown)
                     return;
+
+                // StaleSystemConfiguration: a map or roster committed by an earlier leader was
+                // installed while this one was being built. Never overwrite it with a fresh
+                // initial map; start over as a new dispatch, which takes the re-assert path when
+                // a map is installed.
+                if (result.Status == RaftOperationStatus.StaleSystemConfiguration)
+                {
+                    logger.LogDebug("TrySetInitialPartitions: initial map refused as stale; starting over from the installed state");
+                    send(new RaftSystemRequest(RaftSystemRequestType.RetryInitialPartitions));
+                    return;
+                }
 
                 try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                 catch (OperationCanceledException)
@@ -480,7 +503,7 @@ internal sealed class PartitionMapService
                     "TryCreatePartition: Replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                if (result.Status is not (RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.StaleSystemConfiguration))
                 {
                     try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                     catch (OperationCanceledException)
@@ -664,7 +687,7 @@ internal sealed class PartitionMapService
                     "TryRemovePartition: Replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                if (result.Status is not (RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.StaleSystemConfiguration))
                 {
                     try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                     catch (OperationCanceledException)

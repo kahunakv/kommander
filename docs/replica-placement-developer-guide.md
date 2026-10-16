@@ -177,6 +177,14 @@ no reachable, confirmed leader answers `RaftOperationStatus.LeadershipNotConfirm
 untouched; the placement pass simply retries on a later tick. Re-driving an interrupted removal (a
 replica already marked `Removing`) is exempt, because its final drop changes no quorum.
 
+The fence runs on the coordinator loop, between the handler's read of the map and its write. Each
+forwarded `GetReadIndex` is bounded by `RaftConfiguration.RemoteProbeTimeout`, and a candidate that
+does not answer in time counts as unconfirmed. If committed map entries from another P0 leader are
+installed while the handler waits, the write is refused with
+`RaftOperationStatus.StaleSystemConfiguration` and nothing is proposed: the map the handler built
+no longer matches the log. The placement pass re-plans from the installed map on its next tick.
+See the elastic partitions guide, section 14, for the general rule.
+
 ---
 
 ## Partial materialization: hosting only what you replicate

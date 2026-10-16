@@ -176,7 +176,7 @@ internal sealed class ReplicaPlacementService
                     "ReplicaPlacementService: map replication failed {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                if (result.Status is not (RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.StaleSystemConfiguration))
                 {
                     try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }
                     catch (OperationCanceledException)
