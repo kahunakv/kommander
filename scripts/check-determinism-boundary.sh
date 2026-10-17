@@ -51,8 +51,10 @@ ALLOWED_FILES=(
 
 # Patterns that leak wall-clock or thread-pool nondeterminism into a simulated run.
 # Each entry is "label|extended-regex".
+# wall-clock-ticks matches the bare Stopwatch name only: ValueStopwatch.GetTimestamp is the
+# approved measurement seam, and a plain substring match would count it as a direct read.
 PATTERNS=(
-  "wall-clock-ticks|Stopwatch[[:space:]]*\.[[:space:]]*GetTimestamp[[:space:]]*\("
+  "wall-clock-ticks|(^|[^[:alnum:]_])Stopwatch[[:space:]]*\.[[:space:]]*GetTimestamp[[:space:]]*\("
   "wall-clock-date|(DateTime|DateTimeOffset)[[:space:]]*\.[[:space:]]*(UtcNow|Now)"
   "thread-pool-hop|Task[[:space:]]*\.[[:space:]]*Run[[:space:]]*\("
   "wall-clock-sleep|(Task[[:space:]]*\.[[:space:]]*Delay|Thread[[:space:]]*\.[[:space:]]*Sleep)[[:space:]]*\("

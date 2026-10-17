@@ -750,7 +750,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         bool wantsInline = hint == ReadExecutionHint.InlineWhenIdle && !inlineExecution && t_executionDepth == 0;
 
         if (KommanderMetrics.ReadSchedulerHandoffLatencyUs.Enabled)
-            StampEnqueuedAt(work, Stopwatch.GetTimestamp());
+            StampEnqueuedAt(work, ValueStopwatch.GetTimestamp());
 
         // Admission runs under the READ lock so that Stop() (WRITE lock) cannot begin
         // draining until every in-flight admission has finished publishing its work. The
@@ -816,7 +816,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     private void RunInline(int partitionId, PartitionState state, object work)
     {
         bool timing = KommanderMetrics.ReadSchedulerRunDurationUs.Enabled || KommanderMetrics.ReadSchedulerHandoffLatencyUs.Enabled;
-        long start = timing ? Stopwatch.GetTimestamp() : 0;
+        long start = timing ? ValueStopwatch.GetTimestamp() : 0;
 
         if (timing)
             RecordHandoff(work, start, _pathInlineTag);
@@ -1314,7 +1314,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
                         runLength++;
                 }
 
-                long start = handoff || duration ? Stopwatch.GetTimestamp() : 0;
+                long start = handoff || duration ? ValueStopwatch.GetTimestamp() : 0;
 
                 if (handoff)
                 {
@@ -1528,7 +1528,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     }
 
     private static double ElapsedMicroseconds(long start) =>
-        (Stopwatch.GetTimestamp() - start) * 1_000_000.0 / Stopwatch.Frequency;
+        (ValueStopwatch.GetTimestamp() - start) * 1_000_000.0 / Stopwatch.Frequency;
 
     // ── IDisposable ────────────────────────────────────────────────────────
 
