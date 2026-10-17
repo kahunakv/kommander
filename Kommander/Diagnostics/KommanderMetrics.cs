@@ -576,6 +576,71 @@ public static class KommanderMetrics
         set => Interlocked.Exchange(ref _placementRangesAwaitingInitial, value);
     }
 
+    // ── Read scheduler (per instance, tagged "scheduler") ─────────────────────
+
+    /// <summary>
+    /// Read operations completed by a <see cref="FairReadScheduler"/>, tagged <c>scheduler</c> (the
+    /// instance name) and <c>path</c>: <c>inline</c> for an <see cref="ReadExecutionHint.InlineWhenIdle"/>
+    /// read that ran on its caller, <c>worker</c> for one a scheduler worker ran.
+    /// </summary>
+    internal static readonly Counter<long> ReadSchedulerOperationsTotal =
+        Meter.CreateCounter<long>(
+            "raft.read_scheduler.operations_total",
+            description: "Read operations completed by a read scheduler, tagged by scheduler instance and path (inline or worker).");
+
+    /// <summary>
+    /// Times a parked read-scheduler worker was woken. Every wake-up is a thread hand-off with an OS
+    /// wake cost; the ratio to <see cref="ReadSchedulerOperationsTotal"/> is the hand-offs per read.
+    /// </summary>
+    internal static readonly Counter<long> ReadSchedulerWakeupsTotal =
+        Meter.CreateCounter<long>(
+            "raft.read_scheduler.wakeups_total",
+            description: "Parked read-scheduler workers woken, tagged by scheduler instance.");
+
+    /// <summary>
+    /// Wake-ups after which the worker found the ready queue empty: another worker took the work first.
+    /// Wasted hand-offs; a high share means the worker count is above what the load needs.
+    /// </summary>
+    internal static readonly Counter<long> ReadSchedulerEmptyWakeupsTotal =
+        Meter.CreateCounter<long>(
+            "raft.read_scheduler.empty_wakeups_total",
+            description: "Read-scheduler worker wake-ups that found no work, tagged by scheduler instance.");
+
+    /// <summary>
+    /// Time from admission to the start of the operation, in microseconds. Recorded only while a
+    /// listener is attached (the timestamp is taken at admission only then).
+    /// </summary>
+    internal static readonly Histogram<double> ReadSchedulerHandoffLatencyUs =
+        Meter.CreateHistogram<double>(
+            "raft.read_scheduler.handoff_latency_us",
+            unit: "us",
+            description: "Read-scheduler time from enqueue to the start of the operation, tagged by scheduler instance and path.");
+
+    /// <summary>
+    /// Duration of one run, in microseconds: one operation, or one coalesced
+    /// <see cref="IReadBatchExecutor{TArg,T}.ExecuteBatch"/> call with its completions.
+    /// </summary>
+    internal static readonly Histogram<double> ReadSchedulerRunDurationUs =
+        Meter.CreateHistogram<double>(
+            "raft.read_scheduler.run_duration_us",
+            unit: "us",
+            description: "Read-scheduler run duration (one operation or one coalesced batch), tagged by scheduler instance and path.");
+
+    /// <summary>
+    /// Operations per coalesced batch run on the batchable path; the histogram's count is the number of
+    /// batch runs.
+    /// </summary>
+    internal static readonly Histogram<int> ReadSchedulerBatchSize =
+        Meter.CreateHistogram<int>(
+            "raft.read_scheduler.batch_size",
+            description: "Operations coalesced into one IReadBatchExecutor call, tagged by scheduler instance.");
+
+    /// <summary>Admissions refused because the partition's queue depth was at its limit.</summary>
+    internal static readonly Counter<long> ReadSchedulerBackpressureRejectionsTotal =
+        Meter.CreateCounter<long>(
+            "raft.read_scheduler.backpressure_rejections_total",
+            description: "Read admissions refused by per-partition back-pressure, tagged by scheduler instance.");
+
     // ── Observable gauges (dynamic per-partition) ─────────────────────────────
 
     // Weak references allow GC to collect stopped instances without leaking.
@@ -584,6 +649,9 @@ public static class KommanderMetrics
 
     private static readonly object _schedulerLock = new();
     private static readonly List<WeakReference<FairWalScheduler>> _registeredSchedulers = [];
+
+    private static readonly object _readSchedulerLock = new();
+    private static readonly List<WeakReference<FairReadScheduler>> _registeredReadSchedulers = [];
 
     private static readonly object _snapshotReceiverLock = new();
     private static readonly List<WeakReference<SnapshotReceiver>> _registeredSnapshotReceivers = [];
@@ -673,6 +741,11 @@ public static class KommanderMetrics
             description: "Age of the oldest WAL operation accepted for each partition and not yet completed by the storage engine (0 when idle). Rises for as long as a write hangs; the durable-write stall signal.");
 
         Meter.CreateObservableGauge(
+            "raft.read_scheduler.queue_depth_high_water",
+            MeasureReadSchedulerQueueDepthHighWater,
+            description: "Highest pending-or-in-flight depth any one partition reached in a read scheduler since it was built, tagged by scheduler instance. A high-water mark: it does not fall.");
+
+        Meter.CreateObservableGauge(
             "raft.snapshot.receive_staged_bytes",
             static () => SumSnapshotReceivers(static receiver => receiver.PendingByteCount),
             unit: "By",
@@ -737,6 +810,18 @@ public static class KommanderMetrics
     {
         lock (_schedulerLock)
             _registeredSchedulers.Add(new WeakReference<FairWalScheduler>(scheduler));
+    }
+
+    /// <summary>
+    /// Registers a read scheduler so its queue-depth high-water mark feeds the
+    /// <c>raft.read_scheduler.queue_depth_high_water</c> gauge. Called by the
+    /// <see cref="FairReadScheduler"/> constructor; weak references let a disposed scheduler be
+    /// collected without unregistration.
+    /// </summary>
+    internal static void RegisterReadScheduler(FairReadScheduler scheduler)
+    {
+        lock (_readSchedulerLock)
+            _registeredReadSchedulers.Add(new WeakReference<FairReadScheduler>(scheduler));
     }
 
     /// <summary>
@@ -928,6 +1013,28 @@ public static class KommanderMetrics
 
             foreach (WeakReference<FairWalScheduler> d in dead)
                 _registeredSchedulers.Remove(d);
+        }
+        return result;
+    }
+
+    private static IEnumerable<Measurement<int>> MeasureReadSchedulerQueueDepthHighWater()
+    {
+        List<Measurement<int>> result;
+        lock (_readSchedulerLock)
+        {
+            result = new List<Measurement<int>>(_registeredReadSchedulers.Count);
+            List<WeakReference<FairReadScheduler>> dead = [];
+
+            foreach (WeakReference<FairReadScheduler> wr in _registeredReadSchedulers)
+            {
+                if (wr.TryGetTarget(out FairReadScheduler? scheduler))
+                    result.Add(new Measurement<int>(scheduler.QueueDepthHighWater, scheduler.SchedulerTag));
+                else
+                    dead.Add(wr);
+            }
+
+            foreach (WeakReference<FairReadScheduler> d in dead)
+                _registeredReadSchedulers.Remove(d);
         }
         return result;
     }

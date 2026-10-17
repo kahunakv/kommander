@@ -734,7 +734,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         readScheduler = new(
             logger,
             configuration.ReadIOThreads,
-            inlineExecution: !configuration.EnableInternalSchedulingThreads);
+            inlineExecution: !configuration.EnableInternalSchedulingThreads,
+            name: "wal");
         walScheduler = new(
             walAdapter,
             logger,

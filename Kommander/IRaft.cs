@@ -46,7 +46,10 @@ public interface IRaft
     public HybridLogicalClock HybridLogicalClock { get; }
     
     /// <summary>
-    /// Fair read scheduler for partition-tagged synchronous WAL reads.
+    /// Fair read scheduler for partition-tagged synchronous WAL reads. This is the WAL instance only
+    /// (meter tag <c>scheduler=wal</c>): a host that builds its own <see cref="WAL.IO.FairReadScheduler"/>
+    /// instances (Kahuna's backend read and write schedulers) reads their counters from those instances,
+    /// not from here.
     /// </summary>
     public IRaftReadScheduler ReadScheduler { get; }
     

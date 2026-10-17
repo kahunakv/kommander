@@ -47,17 +47,9 @@ using System.Diagnostics.CodeAnalysis;
 // ── Write-ahead-log read scheduler (inline mode) ───────────────────────────────────────────────
 // In the browser build every read runs inline on the caller: RaftManager builds the scheduler with
 // inlineExecution when scheduling threads are off, and Start throws without it. A read is finished
-// before EnqueueTask returns, so no read is ever in flight when another call looks.
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairReadScheduler.#ctor(Microsoft.Extensions.Logging.ILogger{Kommander.IRaft},System.Int32,System.Int32,System.Boolean,System.Boolean)",
-    Justification = "Constructs the BlockingCollection only. Construction does not block.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairReadScheduler.TryScheduleLocked(System.Int32,Kommander.WAL.IO.FairReadScheduler.PartitionState)~System.Boolean",
-    Justification = "TryAdd on an unbounded queue with no timeout does not block.")]
+// before EnqueueTask returns, so no read is ever in flight when another call looks. The worker loop
+// and its park are compiled out of the thread-free build; the ready queue is a ConcurrentQueue and the
+// idle-worker stack is always empty, so admission and the inline drain call nothing that blocks.
 
 [assembly: SuppressMessage("Interoperability", "CA1416",
     Scope = "member",
@@ -66,18 +58,8 @@ using System.Diagnostics.CodeAnalysis;
 
 [assembly: SuppressMessage("Interoperability", "CA1416",
     Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairReadScheduler.DrainInline",
-    Justification = "TryTake with no timeout does not block. Verified on the single-threaded runtime.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
     Target = "~M:Kommander.WAL.IO.FairReadScheduler.DrainRemaining(System.Collections.Generic.List{System.Object})",
-    Justification = "TryTake with no timeout does not block. The timed ManualResetEventSlim.Wait runs only while a read is in flight, and inline reads finish before the caller continues.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairReadScheduler.Dispose",
-    Justification = "Disposes the BlockingCollection. Dispose does not block.")]
+    Justification = "TryDequeue does not block. The timed ManualResetEventSlim.Wait runs only while a read is in flight, and inline reads finish before the caller continues.")]
 
 // ── Certificate-based transport security ───────────────────────────────────────────────────────
 // RaftConfiguration.Validate refuses, in the browser build, every option that reaches this code:
