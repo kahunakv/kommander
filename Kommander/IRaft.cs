@@ -362,7 +362,7 @@ public interface IRaft
     /// <paramref name="entries"/>).
     /// </para>
     /// <para>
-    /// Slice-1 scope: the batch is <b>auto-commit only</b>. Any entry with
+    /// Scope: the batch is <b>auto-commit only</b>. Any entry with
     /// <see cref="RaftProposalEntry.AutoCommit"/> set to <see langword="false"/>, or a batch that mixes
     /// distinct non-zero <see cref="RaftProposalEntry.ExpectedGeneration"/> values, is a batch-level rejection
     /// (<see cref="RaftBatchReplicationResult.Success"/> is <see langword="false"/> and nothing is appended).

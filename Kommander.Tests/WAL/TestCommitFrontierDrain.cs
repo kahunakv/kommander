@@ -237,7 +237,7 @@ public sealed class TestCommitFrontierDrain
 
     /// <summary>
     /// A resolution that rode sync-off does not count as durable until a later synced write on the
-    /// partition completes (DST FINDING 7).
+    /// partition completes.
     ///
     /// <para>The single-fsync fast path writes a <c>Committed</c> marker over a present
     /// <c>Proposed</c> row without an fsync. A crash before the next synced write returns the row to

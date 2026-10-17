@@ -18,8 +18,8 @@ namespace Kommander.Tests.Simulation.Cluster;
 /// the library handed the node for application, up to <c>upToIndex</c>, as id, term and payload
 /// hash (see <see cref="Apply"/>). It used to be a header only, which was honest while the nodes kept
 /// no state, but it made a receiver that acknowledged an install and imported nothing look exactly
-/// like one that imported everything (<c>14b564a</c> item 6, the Kahuna run of Sept 20). The run-level
-/// rule <c>applied-state-agrees</c> now tells them apart (DST-20).</para>
+/// like one that imported everything (as a Kahuna run showed). The run-level rule
+/// <c>applied-state-agrees</c> now tells them apart.</para>
 ///
 /// <para>The header bytes are not decoration. An import that received a truncated or foreign stream
 /// would otherwise succeed silently, and a rescue that "worked" while transferring nothing is
@@ -31,8 +31,8 @@ namespace Kommander.Tests.Simulation.Cluster;
 ///
 /// <para><b>The hang fault, and why a simulated application needs one.</b>
 /// <see cref="HangNextExports"/> makes the next exports never return, and they ignore their
-/// cancellation token. That is the shape of the Caraxes anchor-1 wedge (vorpal <c>d11fd5f9</c>,
-/// round 2): the application's export began with a persistence drain that could not be cancelled,
+/// cancellation token. That is the shape of the Caraxes anchor-1 wedge, in the form that survived
+/// the first fix: the application's export began with a persistence drain that could not be cancelled,
 /// the transfer task parked forever, its in-flight guard never released, and the leader silently
 /// vetoed every later rescue of that follower. <c>SnapshotTransferStepTimeout</c> is the library's
 /// repair. Without a fault that can hang, no simulated run can reach the state that repair exists
@@ -202,7 +202,7 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
             imported[id] = new AppliedEntry(term, hash);
         }
 
-        // The Control A hook of DST-20: a receiver that reads the blob, reports success, and keeps
+        // The negative-control hook: a receiver that reads the blob, reports success, and keeps
         // its old state. Everything above ran, so the transfer itself looks complete.
         if (SkipImports)
         {
@@ -235,7 +235,8 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
 
     /// <summary>
     /// When true, an import reads the whole blob and then keeps the old state: the receiver reports
-    /// success and imports nothing. For Control A only.
+    /// success and imports nothing. Only for the negative control that proves
+    /// <c>applied-state-agrees</c> can fail.
     /// </summary>
     public bool SkipImports { get; set; }
 

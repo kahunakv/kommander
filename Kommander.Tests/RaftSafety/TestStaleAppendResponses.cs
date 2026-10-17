@@ -136,7 +136,7 @@ public class TestStaleAppendResponses
     // against the state machine in
     // Kommander.Tests.Scheduling.TestRaftPartitionStateMachine.CompleteAppendLogs_StaleTerm_IsFenced_BeforeAnyMutation.
     // A prior boolean-only test lived here but never invoked CompleteAppendLogsAsync, so it was
-    // removed in favour of that real exercise (finding S5).
+    // removed in favour of that real exercise.
 
     // ── Scheduler harness: operation carry the right term metadata ────────
 

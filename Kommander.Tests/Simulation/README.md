@@ -131,7 +131,7 @@ worth knowing about:
   stops exploring and starts paying.
 
 - The snapshot-rescue sweep, `AGeneratedRunUnderSnapshotRescue_HoldsEveryCheck`, runs with the
-  others in `DSTRandom`. Its first full run found DST FINDING 6, a backfill anchored exactly at the
+  others in `DSTRandom`. Its first full run found a real defect: a backfill anchored exactly at the
   leader's compaction floor that looped forever. It sets `CompactEveryOperations` to eight and
   `CompactionLiveReplicaLagBudget` to four, so a follower really falls below the leader's compaction
   floor, and it turns on `TransferFaultWeight`, which arms a hung application export at the leader.
@@ -155,7 +155,7 @@ misread without them.
   account of why (`restore incomplete`, `restore failed: …`, `partition not materialized`). A view
   read is a client-kind operation, and the executor refuses those until the partition's WAL restore
   completes — so a node that is running, acking appends and even leading can be absent from the
-  views. FINDING 5 was reported as "two followers and no leader"; the leader was the node with no
+  views. One real defect was reported as "two followers and no leader"; the leader was the node with no
   view. The idle check now fails with `idle-convergence-unobservable` before it says anything about
   roles, and a run whose `Unobservable:` line is non-empty is about that node, whatever the rest says.
 - **`library-invariant`** is the run failing on a rule the library checks itself — a node's term or a

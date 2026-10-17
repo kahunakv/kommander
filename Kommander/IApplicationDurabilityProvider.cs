@@ -11,8 +11,7 @@ namespace Kommander;
 /// therefore opens a window, as wide as the consumer's flush cadence, in which a killed node
 /// silently loses committed entries: replay starts above them and compaction may have removed
 /// them. This provider closes that window by letting Kommander widen replay down to the floor and
-/// fence compaction above it. See the "Application-durability floor for restart replay and WAL
-/// compaction" spec.
+/// fence compaction above it.
 /// </para>
 /// <para>
 /// The floor also acts as a <b>soft checkpoint</b> in the opposite direction: when it sits above
@@ -20,7 +19,7 @@ namespace Kommander;
 /// committed entries at or below the floor are not redelivered (they are already durably applied).
 /// Nothing is removed from the WAL — compaction keeps its own conservative fences — so a stalled
 /// or lagging compaction no longer makes cold-restart time proportional to the retained log
-/// length. See the "Rethink WAL replay" spec.
+/// length.
 /// </para>
 /// <para>
 /// Wire an implementation via <see cref="RaftConfiguration.ApplicationDurabilityProvider"/>. A

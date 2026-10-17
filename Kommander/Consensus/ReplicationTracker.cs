@@ -45,7 +45,7 @@ internal sealed class ReplicationTracker
     /// retention floor may use: <see cref="lastCommitIndexes"/> carries the protocol frontier, which
     /// a follower advances when an append is merely queued for its disk — a stalled follower keeps
     /// reporting a rising value there for every entry it cannot yet write, and a floor computed from
-    /// it compacted the range its backfill needed once the disk answered (CamusDB slow-disk run sd8:
+    /// it compacted the range its backfill needed once the disk answered (a CamusDB slow-disk run:
     /// a 205,000-entry gap opened in 16 s, refused, escalated to a snapshot that killed the node).
     /// </summary>
     private readonly Dictionary<string, long> durableFrontiers = [];
@@ -141,12 +141,12 @@ internal sealed class ReplicationTracker
     /// </summary>
     /// <remarks>
     /// This used to live manager-wide as an HLC timestamp compared by HLC subtraction — the one
-    /// elapsed-time gate the B3 monotonic migration missed. HLC subtraction reads the physical
+    /// elapsed-time gate the move to monotonic ticks missed. HLC subtraction reads the physical
     /// component only, and that component latches to the highest timestamp any peer has ever sent,
     /// so after one skewed message two local mints differ by ~0 ms for the whole skew and the skip
     /// silenced every heartbeat — and with it the only repair path — to every peer of every
-    /// non-system partition until the wall clock caught up (DST FINDING 4: one repair decision per
-    /// leadership, made before any frontier was reported, and never again). Like
+    /// non-system partition until the wall clock caught up (seen in the deterministic simulation:
+    /// one repair decision per leadership, made before any frontier was reported, and never again). Like
     /// <see cref="backfillPausedUntilTicks"/> this is pacing state, not Raft progress: a stale
     /// entry can at most delay one heartbeat by the window, so it is deliberately not part of the
     /// leadership resets.
@@ -219,7 +219,7 @@ internal sealed class ReplicationTracker
     /// is present but uncommittable — while its durable frontier and its contiguous presence
     /// frontier advance with every batch that lands at the hole. Judged on the commit frontier
     /// alone, four such ships read as fruitless inside ten seconds and the probe offered a
-    /// whole-partition snapshot to a follower that was converging (CamusDB fault soak rl6: three
+    /// whole-partition snapshot to a follower that was converging (a CamusDB fault soak: three
     /// installs in a row for one 30-s pause, each leaving the follower a million entries behind
     /// again). The durable frontier is trusted outright: it is the durable contiguous commit
     /// frontier, and the wedge this probe exists for pins it along with the commit frontier. The
@@ -654,7 +654,7 @@ internal sealed class ReplicationTracker
     /// backfill path prefers <c>nextIndex</c> as its anchor — so every batch re-anchored at an
     /// index the WAL could no longer serve, was refused, re-escalated to another snapshot, and the
     /// rescue looped every cooldown while the follower fell monotonically further behind (the
-    /// Caraxes <c>bank-optimistic-2h-f</c> frozen-anchor finding).</para>
+    /// Caraxes frozen-anchor wedge).</para>
     ///
     /// <para>Every advance is monotonic — a completion that raced a newer ack must not drag
     /// progress backwards. The boundary covers only committed state, so claiming it in
@@ -936,9 +936,9 @@ internal sealed class ReplicationTracker
     /// is uncommitted on the peer (<paramref name="reportedDurable"/> unknown, or at or above the
     /// anchor).
     ///
-    /// <para><b>Why the leader must count these (DST FINDING 7 backstop).</b> A follower accepts a
+    /// <para><b>Why the leader must count these (a backstop).</b> A follower accepts a
     /// <c>-1</c> anchor only inside its own committed prefix, because only there does Leader
-    /// Completeness prove the prefixes agree (FINDING 6). A rejection therefore proves the anchor is
+    /// Completeness prove the prefixes agree. A rejection therefore proves the anchor is
     /// above what the follower has committed, and the leader cannot send the anchor entry itself —
     /// it compacted it. No batch this leader can build will ever be accepted; only a snapshot at or
     /// above the anchor can repair the follower. Before this count, the rejection took the

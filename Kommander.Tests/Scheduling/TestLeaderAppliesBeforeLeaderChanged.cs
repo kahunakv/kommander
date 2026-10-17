@@ -11,15 +11,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduling;
 
 /// <summary>
-/// Covers the two correctness gaps in the leader-promotion sequence described in
-/// spec-apply-before-leader-changed.md:
+/// Covers the two correctness gaps in the leader-promotion sequence:
 ///
 /// <list type="bullet">
 ///   <item>Case A — committed-but-unapplied follower entries must be drained before
-///         <c>InvokeLeaderChanged(self)</c> fires (T1).</item>
+///         <c>InvokeLeaderChanged(self)</c> fires.</item>
 ///   <item>Case B — entries committed by the leader itself (including inherited entries
 ///         from a prior term) must reach the leader's consumer via
-///         <c>InvokeReplicationReceived</c> (T2).</item>
+///         <c>InvokeReplicationReceived</c>.</item>
 /// </list>
 /// </summary>
 public class TestLeaderAppliesBeforeLeaderChanged
@@ -156,7 +155,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
 
     /// <summary>
     /// Minimal no-op WAL for tests that drive commits manually without seeded entries.
-    /// The commit facade used for T2 needs to call back with a completion, so we use
+    /// The commit facade used for Case B needs to call back with a completion, so we use
     /// an Action-based callback instead.
     ///
     /// <para>Set <see cref="InheritedProposed"/> before promotion to simulate Proposed
@@ -276,7 +275,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
             MinLogIndex: minLogIndex, MaxLogIndex: maxLogIndex,
             WALWriteOperationType.LeaderCommit, RaftOperationStatus.Success);
 
-    // ── T1 tests ───────────────────────────────────────────────────────────────
+    // ── Case A: promotion drain tests ──────────────────────────────────────────
 
     /// <summary>
     /// A single-node partition whose WAL already contains committed entries
@@ -347,7 +346,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
     }
 
     /// <summary>
-    /// B6 regression: after a restart replays the committed log, a subsequent promotion must NOT
+    /// Regression: after a restart replays the committed log, a subsequent promotion must NOT
     /// deliver the retained committed entries to the consumer a SECOND time. WAL restore already
     /// delivered the committed prefix (via <c>InvokeLogRestored</c>) and <c>CompleteRestoreAsync</c>
     /// now seeds <c>lastAppliedIndex</c> to the commit frontier. Before the fix that cursor stayed at
@@ -406,7 +405,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
         Assert.Contains("LeaderChanged:node-a", host.EventLog);
     }
 
-    // ── T2 tests ───────────────────────────────────────────────────────────────
+    // ── Case B: leader self-apply tests ────────────────────────────────────────
 
     /// <summary>
     /// A leader that commits entries via the leader path must deliver those entries
@@ -506,7 +505,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
         Assert.Contains("Applied:1", host.EventLog);
     }
 
-    // ── T2 inherited-entry tests ───────────────────────────────────────────────
+    // ── Case B: inherited-entry tests ──────────────────────────────────────────
 
     /// <summary>
     /// A node holds Proposed entries from a prior term at promotion time (the classic
@@ -694,7 +693,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
     // CompleteLeaderCommit now delivers InvokeSystemReplicationReceived for the
     // leader's own committed system entries (new invariant). These tests confirm:
     //   (a) routing: P0 + LogType==_RaftSystem → InvokeSystemReplicationReceived
-    //   (b) T1 drain on P0 fires SystemApplied before LeaderChanged
+    //   (b) promotion drain on P0 fires SystemApplied before LeaderChanged
     //   (c) inherited P0 system entries are delivered on first current-term commit
     //   (d) non-system entries on P0 still route to InvokeReplicationReceived
     // The apply callbacks are monotonic-version-guarded in the system coordinator
@@ -732,7 +731,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
     }
 
     /// <summary>
-    /// The T1 drain on the system partition must apply committed system entries via
+    /// The promotion drain on the system partition must apply committed system entries via
     /// <c>InvokeSystemReplicationReceived</c> before <c>InvokeLeaderChanged(self)</c> fires.
     /// </summary>
     [Fact]

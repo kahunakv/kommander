@@ -18,7 +18,7 @@ namespace Kommander.Tests.Scheduling;
 /// steps, and <see cref="IRaft.HoldConsumerAppliesForTesting"/> keeps committed entries pending in
 /// the log so a tail exists above the boundary in the first place.
 ///
-/// <para>The behaviour under test is step 4 of the install: the durable WAL boundary retains the
+/// <para>The behaviour under test is the install's durable WAL boundary, which retains the
 /// suffix above the index when its stored term matches and truncates it on conflict. The
 /// consumer's post-install state plus the retained tail must produce the same result as a replica
 /// that never installed — which is what the last two tests assert directly, against a control

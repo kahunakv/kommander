@@ -332,16 +332,16 @@ public class TestTwoNodeCluster
     }
 
     /// <summary>
-    /// B4 + B2a regression (integration): a stale node forcing an election is no longer globally vetoed
-    /// (B4 removed the <c>AmIOutdatedAsync</c> veto that used to return <c>ReplicationFailed</c>), yet it
+    /// Regression (integration): a stale node forcing an election is no longer globally vetoed
+    /// (the <c>AmIOutdatedAsync</c> veto that used to return <c>ReplicationFailed</c> is gone), yet it
     /// still cannot win. node2 (empty WAL) forces an election and sends a higher-term RequestVote; node1
-    /// (complete log) steps down and adopts the term (B2a §5.1) but denies the vote on log-freshness, then
+    /// (complete log) steps down and adopts the term (Raft §5.1) but denies the vote on log-freshness, then
     /// re-wins at the next term because node2's log is behind. node2 therefore learns node1 is the leader
     /// and the force resolves to <c>LeaderAlreadyElected</c>.
     ///
-    /// <para>Before B2a this scenario livelocked: node1 denied node2 WITHOUT stepping down, so node1 kept
+    /// <para>Without the unconditional higher-term step-down this scenario livelocked: node1 denied node2 WITHOUT stepping down, so node1 kept
     /// heartbeating at its old term while node2 sat as a higher-term candidate rejecting those
-    /// heartbeats, and the force never resolved (<c>Pending</c>). B2a's step-down is what lets the cluster
+    /// heartbeats, and the force never resolved (<c>Pending</c>). The step-down is what lets the cluster
     /// converge back onto node1.</para>
     /// </summary>
     [Fact]

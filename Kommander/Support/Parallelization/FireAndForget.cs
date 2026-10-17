@@ -10,7 +10,7 @@ namespace Kommander.Support.Parallelization;
 /// by <c>TaskExceptionHolder</c> on the finalizer thread. Raising it there allocates (the
 /// <c>AggregateException</c> wrap and the event args), and under memory exhaustion that secondary
 /// allocation throws <c>OutOfMemoryException</c> out of the finalizer — which aborts the whole
-/// process with SIGABRT. The Caraxes run Q leader died exactly this way: the OOM itself was
+/// process with SIGABRT. A Caraxes leader died exactly this way: the OOM itself was
 /// survivable, the unobserved-task finalization was not. Every <c>_ = SomethingAsync()</c> in this
 /// library must route through <see cref="Observe"/> so a fault degrades into a log line instead of
 /// a process abort.</para>

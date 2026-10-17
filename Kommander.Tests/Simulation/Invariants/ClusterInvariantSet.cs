@@ -277,11 +277,11 @@ public static class ClusterInvariantSet
     ///
     /// <para>A node that says it committed up to N is asserting that N and everything under it is
     /// on its disk. Losing one of those entries while still advertising N is how a replica serves a
-    /// prefix it does not have, and it is the durable half of the applied-hole shape that
-    /// <c>9ba52729</c> produced.</para>
+    /// prefix it does not have, and it is the durable half of the applied-hole shape that a leader
+    /// applying entries out of order produced.</para>
     ///
-    /// <para><b>What it is not.</b> This is not the per-step form of DST FINDING 1, and it is worth
-    /// being exact about why. The stranded node in that defect held entry 2 with entry 1 absent and
+    /// <para><b>What it is not.</b> This is not the per-step form of the stranded-replica defect, and
+    /// it is worth being exact about why. The stranded node in that defect held entry 2 with entry 1 absent and
     /// its frontier honestly at 0 — it never claimed the missing entry, so no per-node rule was
     /// broken. Only comparing nodes at rest exposed it. A rule that appears to cover a known defect
     /// but does not is worse than no rule, because it stops anyone looking for the one that would.</para>
@@ -350,8 +350,8 @@ public static class ClusterInvariantSet
             // The tail. A node may not claim to have committed past the highest id it holds. The
             // interior rule above cannot see this: MissingIds names holes BETWEEN retained entries,
             // so a node that holds nothing at all — or nothing above its claim — reports no hole.
-            // This is the per-step shape of the nightly's committed-ids-monotonic finding (GA run
-            // 34577216505): a follower whose disk refused entry 1 published commit index 1 while its
+            // This is the per-step shape of a committed-ids-monotonic failure the nightly run
+            // reported: a follower whose disk refused entry 1 published commit index 1 while its
             // log was empty, and only the later regression to 0 was caught. A fully compacted log
             // holds nothing above the compaction mark and is entitled to claim through it.
             long highestHeld = Math.Max(store.MaxLogId, store.CoveredThrough);
@@ -530,7 +530,7 @@ public static class ClusterInvariantSet
     /// committed window, which ends at the leader's own commit index. A newly elected leader learns
     /// the commit point only when it commits its first entry, so its commit index is often behind
     /// entries the cluster already committed, and a leader that lacks one of those is never read.
-    /// That is the <c>681cf397</c> end state: a straddling follower acknowledged a deposed leader's
+    /// That is the straddling-voter end state: a straddling follower acknowledged a deposed leader's
     /// write, three of five nodes committed it, and the new leader, elected without it, sat with its
     /// commit index one below and the cluster stuck. Raft's property is about the log, so this check
     /// reads the log, and an entry held as proposed counts.</para>

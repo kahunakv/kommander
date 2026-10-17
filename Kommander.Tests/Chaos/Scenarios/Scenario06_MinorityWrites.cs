@@ -69,7 +69,7 @@ public class Scenario06_MinorityWrites
         }
         catch (TimeoutException)
         {
-            // Spec liveness oracle: on timeout, emit the standard failure report.
+            // Liveness oracle: on timeout, emit the standard failure report.
             Assert.Fail(await harness.BuildFailureReportAsync("no-single-leader-after-heal", ct));
         }
         long lastIndex = baseline;

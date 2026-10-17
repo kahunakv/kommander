@@ -10,7 +10,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.LoadReports;
 
 /// <summary>
-/// Integration tests for the leader balancer controller (Phase 4).
+/// Integration tests for the leader balancer controller.
 ///
 /// <para>These tests stand up real in-process clusters using <see cref="InMemoryCommunication"/>
 /// and drive the gossip + balancer timer paths to verify end-to-end correctness without

@@ -9,8 +9,8 @@ namespace Kommander.Tests.Simulation;
 /// A member restarted with an empty store under the same endpoint, against a real three-node
 /// cluster.
 ///
-/// <para><b>Why these exist.</b> DST-19 item 1, and the Kahuna GA flake behind <c>e618064e</c>,
-/// fixed in <c>3552ab9</c>. The roster still names the node, so no membership change resets what the
+/// <para><b>Why these exist.</b> A Kahuna GA flake: a node restarted with an empty store, fixed in
+/// commit <c>3552ab9</c>. The roster still names the node, so no membership change resets what the
 /// leader recorded about its previous life. Before the fix, the leader anchored every hole repair
 /// at the stale presence frontier of the old incarnation, the blank node rejected each batch, and
 /// the loop ran until SWIM evicted the dead incarnation minutes later. The random search could not
@@ -38,7 +38,7 @@ public sealed class TestBlankRestartScenarios
     ///
     /// <para>No write after the two that open the hole: a further live write can re-supply a short
     /// follower through the ordinary path and would hide a repair loop that never converges on its
-    /// own. That is the lesson of the idle-convergence check (DST-16, result 2).</para>
+    /// own. That is the lesson of the idle-convergence check.</para>
     /// </summary>
     [Fact]
     public async Task AFollowerRestartedWithAnEmptyStore_IsCaughtUpAfterALiveWriteOpensAHole()

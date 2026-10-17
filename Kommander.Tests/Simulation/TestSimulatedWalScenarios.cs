@@ -205,7 +205,7 @@ public sealed class TestSimulatedWalScenarios
                     // Waiting on the stored log alone is not enough, and the difference is not
                     // pedantic: a node can hold entry 2 over a hole at entry 1, which satisfies a
                     // max-log test while its committed frontier honestly stays at 0. That is the
-                    // exact state DST FINDING 1 described. The frontier is what converging means.
+                    // exact state of the stranded-replica defect. The frontier is what converging means.
                     IReadOnlyList<RaftPartitionView> views =
                         await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
 
@@ -272,7 +272,7 @@ public sealed class TestSimulatedWalScenarios
     /// A follower that misses one entry to a write failure is repaired once its disk is freed,
     /// even though the hole is smaller than <see cref="RaftConfiguration.BackfillThreshold"/>.
     ///
-    /// <para><b>History (DST FINDING 1).</b> This was the first real defect the harness found, and
+    /// <para><b>History.</b> This was the first real defect the harness found, and
     /// this test was its skipped reproduction. The starved node ended holding entry 2 and not
     /// entry 1 — a physical hole — with its committed frontier honestly stopped at 0 while the
     /// other two stood at 2, and no repair ever came: the committed gap (2) sat under

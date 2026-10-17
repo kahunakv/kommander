@@ -161,7 +161,7 @@ public sealed class RaftPartitionStateMachine
     /// <para>The max log id is deliberately NOT part of the key. Entries keep landing ABOVE an
     /// unrepaired hole — every other winner's barrier no-op is one — and none of them repairs
     /// anything. Keying on (present, max) reset the count on every such write, so it could never
-    /// reach its cap: CamusDB Caraxes fault soak fs4 logged 598 refusals, every one of them
+    /// reach its cap: a CamusDB Caraxes fault soak logged 598 refusals, every one of them
     /// <c>(1/12)</c>, over a hole whose lower edge never moved in 59 minutes.</para>
     /// </summary>
     private int presenceGateRefusals;
@@ -184,7 +184,7 @@ public sealed class RaftPartitionStateMachine
     /// <see cref="lastDrainRefusalFrontier"/>) shape). The committed-drain guard previously
     /// refused UNBOUNDED with voter peers present; when a voter majority shared the same WAL hole
     /// that refusal loop left the partition leaderless for the rest of a Jepsen run (~18k
-    /// refusals, observation 1 of run 32690955741). Mirrors the presence-gate counter: same-shape
+    /// refusals in run 32690955741). Mirrors the presence-gate counter: same-shape
     /// wins are quorum evidence that no reachable voter holds the missing range.
     /// </summary>
     private int drainGateRefusals;
@@ -571,7 +571,8 @@ public sealed class RaftPartitionStateMachine
     /// Under <see cref="Diagnostics.RaftInvariantPolicy.Throw"/> that faulted this method
     /// half-way: the partition then ran forever with <see cref="RaftPartitionCoreState.Restored"/>
     /// false — votes dropped, views refused, yet still acking appends and even winning elections
-    /// (DST FINDING 5: a restarted node that was the live leader and invisible to the harness).
+    /// (seen in the deterministic simulation: a restarted node that was the live leader and invisible
+    /// to the harness).
     /// Under <see cref="Diagnostics.RaftInvariantPolicy.Log"/> the node simply ran at a stale term.
     /// Taking the maximum at every step makes the in-memory term the one value that only ever
     /// climbs, whichever source spoke last.</para>
@@ -587,7 +588,7 @@ public sealed class RaftPartitionStateMachine
         if (tailTerm > coreState.CurrentTerm)
             coreState.CurrentTerm = tailTerm;
 
-        // B2b: seed durable Raft hard state. The term inferred from the log tail (above) can LAG the true
+        // Seed durable Raft hard state. The term inferred from the log tail (above) can LAG the true
         // term — a crash after a term bump or a granted vote but before the next log write leaves the tail
         // behind. Trusting the tail alone would let the node regress its term and re-vote for a different
         // candidate in a term it already voted in (a split-brain hazard). The persisted hard state is
@@ -686,8 +687,9 @@ public sealed class RaftPartitionStateMachine
         // itself reported. Every one of the 889 losses in that run was of this kind.
         //
         // Leaders are excluded: their mid-tenure delivery runs through CompleteLeaderCommit and the
-        // deferred-applies buffer, and a second drain racing that is how the finding-1 hole was
-        // created in the first place. This is a no-op when the frontier is already covered.
+        // deferred-applies buffer, and a second drain racing that is how the Jepsen leader-only
+        // applied hole was created in the first place. This is a no-op when the frontier is already
+        // covered.
         // A pending re-seed request holds committed applies; bound the hold so a leader that never
         // ships the snapshot (deposed, or stalled) cannot leave this replica silently behind forever.
         // A replica that came to lead meanwhile cannot be re-seeded either — its applies must run.
@@ -737,7 +739,7 @@ public sealed class RaftPartitionStateMachine
                     // bank-leader-kill churn, terms 9 through 100+) needs the cause in the line that
                     // reports the symptom, not in a stall line minutes earlier on another node.
                     // The same goes for peers that are withholding their acks over a hole in this
-                    // leader's tail: with only the stall list, 296 of the fs4 reverts read "none"
+                    // leader's tail: with only the stall list, 296 reverts in one fault soak read "none"
                     // while every peer was withholding over the same hole.
                     await RevertUnpublishedPromotionAsync(
                         $"barrier commit timed out; peers reporting a durable-write stall: {DescribePeerWalStalls()}; peers contiguous only below this leader's tail: {DescribePeerLogHoles()}").ConfigureAwait(false);
@@ -809,7 +811,7 @@ public sealed class RaftPartitionStateMachine
                     coreState.SetQuiesced(false);
                 }
 
-                // B3: heartbeat cadence measured on the monotonic clock — a heartbeat received from a
+                // Heartbeat cadence measured on the monotonic clock — a heartbeat received from a
                 // skewed peer must not inflate the interval and suppress our own heartbeats.
                 if (currentTime != HLCTimestamp.Zero && (MonotonicElapsed(coreState.LastHeartbeatTicks, nowTicks) >= host.Configuration.HeartbeatInterval))
                 {
@@ -890,7 +892,7 @@ public sealed class RaftPartitionStateMachine
             }
 
             // if node is follower and leader is not sending hearthbeats, start an election.
-            // B3: elapsed-since-last-contact is measured on the monotonic clock, so a leader whose HLC
+            // Elapsed-since-last-contact is measured on the monotonic clock, so a leader whose HLC
             // ran ahead of ours cannot freeze this gate and delay failover for the length of the skew.
             case RaftNodeState.Follower when (coreState.LastHeartbeatTicks != 0 && (MonotonicElapsed(coreState.LastHeartbeatTicks, nowTicks) < coreState.ElectionTimeout)):
                 return;
@@ -1006,7 +1008,7 @@ public sealed class RaftPartitionStateMachine
 
         // The target is behind — under a steady write load a healthy follower is behind at almost
         // every instant, by exactly the entries in flight to it. Refusing here made a transfer
-        // under load a race the caller had to keep re-running (CamusDB lt1/lt2: up to five asks over
+        // under load a race the caller had to keep re-running (CamusDB load tests: up to five asks over
         // 1.8 s). Converge instead, the standard Raft handover (§3.10): pause proposal admission so
         // the last index holds still, keep replicating, and hand over from the ack that shows the
         // target level with it. The wait is bounded by one election timeout; past it the leader
@@ -2223,7 +2225,7 @@ public sealed class RaftPartitionStateMachine
 
         election.IncreaseVotes(host.LocalEndpoint, coreState.CurrentTerm);
 
-        // B2b: durably record the new term and our self-vote before we solicit votes or become leader, so
+        // Durably record the new term and our self-vote before we solicit votes or become leader, so
         // a crash mid-election cannot restart at a stale term or let us vote for someone else this term.
         // Test-only path: a rejected write is logged and the forced promotion proceeds regardless.
         if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, host.LocalEndpoint).ConfigureAwait(false))
@@ -2263,14 +2265,14 @@ public sealed class RaftPartitionStateMachine
     /// <c>(localLastLogTerm, localMaxId)</c> — i.e. a strictly higher last-log term wins, and only on
     /// an equal last-log term does the higher index win. This is the check that stops a candidate whose
     /// larger index hides an older last term from being elected over a more current voter.
-    /// <para><b>Wire compatibility (B5 rollout):</b> a <paramref name="remoteLastLogTerm"/> ≤ 0 means the
-    /// peer predates the last-log-term field (sends 0) or genuinely has an empty log; in both cases we
-    /// cannot trust the term and fall back to index-only comparison, exactly matching the pre-B5 ordering
+    /// <para><b>Wire compatibility (last-log-term rollout):</b> a <paramref name="remoteLastLogTerm"/> ≤ 0
+    /// means the peer predates the last-log-term field (sends 0) or genuinely has an empty log; in both
+    /// cases we cannot trust the term and fall back to index-only comparison, exactly matching the older ordering
     /// so a mixed-version cluster never mis-orders. An empty-log candidate (index 0) loses that fallback
     /// against any non-empty voter anyway.</para>
     /// </summary>
     /// <summary>
-    /// B3: local elapsed time since a monotonic anchor. Returns <see cref="TimeSpan.MaxValue"/> when the
+    /// Local elapsed time since a monotonic anchor. Returns <see cref="TimeSpan.MaxValue"/> when the
     /// anchor is unset (0) so an "unset" anchor never satisfies a "&lt; timeout" freshness guard — matching
     /// the historical <c>coreState.LastHeartbeat != HLCTimestamp.Zero &amp;&amp; …</c> shape. Callers still gate on the
     /// explicit <c>anchorTicks != 0</c> where the old code gated on <c>!= Zero</c>, for symmetry.
@@ -2956,7 +2958,7 @@ public sealed class RaftPartitionStateMachine
         // waiting for the next tick would add up to a heartbeat interval to every transfer under load.
         // The demotion does not run inside this ack, though: this same operation may have just
         // released client waiters on the quorum-durable fast path and enqueued their commit writes,
-        // and a step-down in the middle of that is a moment the lt3 divergence pointed at. Post the
+        // and a step-down in the middle of that is a moment a load-test divergence pointed at. Post the
         // handover as its own control operation (a same-target TransferLeadership request, which
         // re-runs the level check and hands over) so it runs after this ack has fully completed.
         // Costs one executor hop. Without an executor (bare state-machine tests) it runs inline.

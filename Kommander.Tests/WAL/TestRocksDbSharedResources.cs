@@ -30,7 +30,7 @@ public sealed class TestRocksDbSharedResources
                 Directory.Delete(p, recursive: true);
     }
 
-    // ── T1: RocksDbSharedResources unit tests ─────────────────────────────────
+    // ── RocksDbSharedResources unit tests ─────────────────────────────────────
 
     [Fact]
     public void CreateWithUnifiedBudget_RejectsMemtableBudgetExceedingTotal()
@@ -62,7 +62,7 @@ public sealed class TestRocksDbSharedResources
         res.Dispose(); // second: must be a no-op (idempotent guard)
     }
 
-    // ── T2: RocksDbWAL backward compatibility ─────────────────────────────────
+    // ── RocksDbWAL backward compatibility ─────────────────────────────────────
 
     [Fact]
     public void RocksDbWAL_NullSharedResources_BehaviorIdenticalToDefault()
@@ -84,7 +84,7 @@ public sealed class TestRocksDbSharedResources
         finally { Cleanup(path); }
     }
 
-    // ── T2: shared resources applied — WAL still works correctly ──────────────
+    // ── Shared resources applied — WAL still works correctly ──────────────────
 
     [Fact]
     public void RocksDbWAL_WithSharedResources_RoundTripsLogsAcrossPartitions()

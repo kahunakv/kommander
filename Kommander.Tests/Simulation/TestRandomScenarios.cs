@@ -226,11 +226,11 @@ public sealed class TestRandomScenarios
     ///
     /// <para><b>Why the hung export belongs here and nowhere else.</b> It changes nothing until a
     /// rescue runs. In this sweep rescues run, and a hang during one is the shape of the Caraxes
-    /// anchor-1 wedge (vorpal <c>d11fd5f9</c>): a transfer that nothing ends, and an in-flight guard
+    /// anchor-1 wedge: a transfer that nothing ends, and an in-flight guard
     /// that silently vetoes every later rescue. The existing sweeps keep their draws unchanged,
     /// because the transfer weight is zero there.</para>
     ///
-    /// <para><b>What its first full run found.</b> DST FINDING 6: the live-replica retention hold
+    /// <para><b>What its first full run found.</b> A real defect: the live-replica retention hold
     /// compacted the entry just below a lagging follower's backfill anchor, the leader shipped the
     /// batch with a previous term of -1, the follower rejected it as divergent, and the leader
     /// re-shipped it forever. Corpus seed 20260902 reached it about one replay in twenty-four. Fixed
@@ -295,7 +295,7 @@ public sealed class TestRandomScenarios
     /// quiesced leader.
     ///
     /// <para><b>Why this family exists.</b> Production ships both safety features on, and every
-    /// other family turns quiescence off. The Kahuna lost-write bug (<c>39bf62e2</c>) was a quiesced
+    /// other family turns quiescence off. The Kahuna lost-write bug was a quiesced
     /// leader that never stepped down, so the search could not reach that class at all. The family
     /// also turns on the harness's SWIM model, because a quiesced follower relies on SWIM to notice
     /// a dead leader and the harness drives no probes.</para>
@@ -367,9 +367,9 @@ public sealed class TestRandomScenarios
     /// The blank-restart family: half the crashes come back with an empty store under the same
     /// endpoint.
     ///
-    /// <para><b>Why.</b> DST-19 item 1 and the Kahuna finding <c>e618064e</c>: the roster still names
-    /// the node, so nothing resets what the leader recorded about its previous life, and the leader
-    /// anchored every repair above what the blank node held (fixed in <c>3552ab9</c>). The other
+    /// <para><b>Why.</b> A Kahuna restart with an empty store: the roster still names the node, so
+    /// nothing resets what the leader recorded about its previous life, and the leader anchored
+    /// every repair above what the blank node held (fixed in commit <c>3552ab9</c>). The other
     /// families always restart over the old store.</para>
     ///
     /// <para><b>Read a one-leader-per-term failure here with care.</b> A wiped store loses the stored
@@ -404,9 +404,9 @@ public sealed class TestRandomScenarios
     /// The leadership-transfer family: the leader is asked to hand over to a follower that is one
     /// write behind, and the answer is judged when the cluster had no fault.
     ///
-    /// <para><b>Why.</b> DST-19 item 2 and DST-20 item 2, for <c>38a5e2b</c> (Kahuna/CamusDB,
-    /// <c>31098233</c>): a transfer to a target one entry behind answered <c>ReplicationFailed</c> at
-    /// once, and the caller dropped it. No action transferred leadership, and no rule judged the
+    /// <para><b>Why.</b> A defect seen in Kahuna and CamusDB, fixed in commit <c>38a5e2b</c>: a
+    /// transfer to a target one entry behind answered <c>ReplicationFailed</c> at once, and the
+    /// caller dropped it. No action transferred leadership, and no rule judged the
     /// answer of a call made with no fault.</para>
     /// </summary>
     [Theory]
@@ -437,9 +437,9 @@ public sealed class TestRandomScenarios
     /// The read family: clients read at random nodes through <c>ConfirmLocalApplicationAsync</c>, and
     /// read at a leader cut off from the majority after another node acknowledged a write.
     ///
-    /// <para><b>Why.</b> DST-7b's acceptance. Before this family no simulated client read, so a node
-    /// that served stale state after confirming it was current broke no rule: the Jepsen
-    /// <c>register / partition</c> violation behind <c>bf275e4a</c>. The history checker's read rules
+    /// <para><b>Why.</b> Before this family no simulated client read, so a node that served stale
+    /// state after confirming it was current broke no rule: the Jepsen <c>register / partition</c>
+    /// violation. The history checker's read rules
     /// judge every served read at the end of the run.</para>
     /// </summary>
     [Theory]
@@ -473,7 +473,7 @@ public sealed class TestRandomScenarios
     /// The ring-partition family: five nodes, and a ring partition in which one follower is in both
     /// majorities, with a write at the old leader.
     ///
-    /// <para><b>Why.</b> <c>681cf397</c>: a follower that voted in a higher term kept acknowledging the
+    /// <para><b>Why.</b> A follower that voted in a higher term kept acknowledging the
     /// old leader, which committed and acknowledged a write the new leader then overwrote (Jepsen
     /// <c>majorities-ring</c>). Every other family runs three nodes, where two majorities cannot share
     /// one node. The rule that names the end state is <c>leader-completeness</c>: the new leader holds no
@@ -511,7 +511,8 @@ public sealed class TestRandomScenarios
     /// traffic held across the commit, a wire copy taken after the leader's in-place retype, and a
     /// crash before any later synced write. The other families reach the first often and the last
     /// two never. Before the transport gave every receiver its own copy, shared objects made the
-    /// crash harmless, so this family could not have found <c>367eac9</c> or DST FINDING 7.</para>
+    /// crash harmless, so this family could not have found the defect fixed in commit
+    /// <c>367eac9</c>, or a follower that reported sync-off markers as durable.</para>
     ///
     /// <para>The check it exists for is <c>reported-durable-survives-crash</c> in the runner. It runs
     /// on every crash in every family, and this family is where it has something to find.</para>

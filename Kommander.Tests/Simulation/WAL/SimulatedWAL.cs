@@ -360,9 +360,9 @@ public sealed class SimulatedWAL : IWAL
     /// assumes an acknowledged fsync holds, so no safety claim survives this fault. What must still
     /// hold is that the cluster repairs the node. The shape it produces — a follower that reported an
     /// entry as committed and durable, and after a restart holds it only as proposed — is the state
-    /// in which the leader's backfill anchored on its compacted copy of that entry is refused. DST
-    /// FINDING 7 reached that state through a library defect; this reaches it with the defect fixed,
-    /// so the leader's answer to the refusal stays tested (the FINDING 7 backstop).</para>
+    /// in which the leader's backfill anchored on its compacted copy of that entry is refused. A
+    /// library defect once reached that state; this reaches it with the defect fixed, so the
+    /// leader's answer to the refusal stays tested.</para>
     ///
     /// <para>Armed until the next crash, which consumes it.</para>
     /// </summary>
@@ -393,7 +393,7 @@ public sealed class SimulatedWAL : IWAL
     /// empty store.
     ///
     /// <para><b>What it models.</b> A node whose data directory was lost or replaced and that comes
-    /// back under the same endpoint: the Kahuna restart behind <c>e618064e</c> and <c>3552ab9</c>.
+    /// back under the same endpoint: the Kahuna restart fixed in commit <c>3552ab9</c>.
     /// The cluster roster still names it, so nothing in membership resets what the leader recorded
     /// about its previous life.</para>
     ///

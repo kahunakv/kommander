@@ -235,7 +235,7 @@ internal sealed class ReplicationAckProcessor
             // A rejection of a batch anchored on an entry this leader compacted cannot be repaired
             // by any batch: the follower accepts such an anchor only inside its committed prefix,
             // and the leader no longer has the anchor entry to send. Without this, the note above
-            // re-sent the same batch on every heartbeat forever (DST FINDING 7). Two refusals in a
+            // re-sent the same batch on every heartbeat forever. Two refusals in a
             // row, so that one reordered stale rejection does not cost a snapshot.
             if (coreState.NodeState == RaftNodeState.Leader)
             {

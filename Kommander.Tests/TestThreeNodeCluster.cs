@@ -371,7 +371,7 @@ public sealed class TestThreeNodeCluster
         // Seed a QUORUM (node1 + node2) with committed entries, leaving node3 empty. The quorum makes
         // one of the seeded nodes deterministically win the election — node3 alone can never assemble a
         // majority. Seeding only ONE node is unsafe as a test setup now that the stale-handshake
-        // election veto has been removed (B4): the two empty nodes could grant each other votes and
+        // election veto has been removed: the two empty nodes could grant each other votes and
         // elect a data-less leader. That state is impossible in real operation (committed ⇒ replicated
         // to a quorum, so at most one node can be behind), which is exactly what the quorum seed models.
         List<RaftLog> seededCommitted =

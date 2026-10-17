@@ -10,7 +10,7 @@ namespace Kommander.Tests.Simulation;
 /// A node killed under load and restarted over its own store, against a real three-node cluster
 /// whose leader has a compaction floor.
 ///
-/// <para><b>Why these exist.</b> The Caraxes bank-leader-kill run (vorpal <c>b24b3891</c>). A
+/// <para><b>Why these exist.</b> The Caraxes bank-leader-kill run. A
 /// restarted node answers AppendEntries while Phase 1 of its restore is still reading the log, and
 /// every frontier those acks read is at its init. The restarted leader reported a contiguous
 /// frontier of 0 with a log that covered the leader's floor by millions of entries; the leader
@@ -467,21 +467,21 @@ public sealed class TestRestartUnderLoadScenarios
     /// <summary>
     /// A follower that restarts holding, as proposed, an entry it had reported as committed and
     /// durable is repaired by a snapshot, and the leader does not re-send a refused batch forever.
-    /// The DST FINDING 7 liveness backstop.
+    /// A liveness backstop for a refused <c>-1</c> anchor.
     ///
     /// <para><b>The state.</b> The leader compacts through the follower's reported durable frontier
     /// N while the follower is down (the silent-peer window holds retention at N + 1, exactly as
     /// designed). The follower's disk lied about the fsync of its last commit marker, so it restarts
     /// holding N as <c>Proposed</c>, with a commit frontier of N - 1. The leader's backfill starts at
     /// N + 1 and is anchored on N, which it compacted, so it carries <c>prevLogTerm = -1</c>. The
-    /// follower accepts such an anchor only inside its committed prefix (FINDING 6), and N is not in
+    /// follower accepts such an anchor only inside its committed prefix, and N is not in
     /// it.</para>
     ///
     /// <para><b>What went wrong before the backstop.</b> The rejection took the ordinary backtrack,
     /// the anchored-repair note re-sent the same batch on the next heartbeat, and the no-progress
     /// streak never grew because only <c>Success</c> acks feed it: 800 identical rejections in 400
-    /// steps and no snapshot. That is how FINDING 7 wedged. Its fix removed the library's own way into
-    /// this state; the lying disk is another way in, and a real one.</para>
+    /// steps and no snapshot. That is how a follower that reported sync-off markers as durable once
+    /// wedged a cluster. Its fix removed the library's own way into this state; the lying disk is another way in, and a real one.</para>
     ///
     /// <para><b>What proves the run was real.</b> The fault reverted a row, the leader compacted
     /// through that row, and the repair was a snapshot — backfill cannot repair this state.</para>

@@ -71,7 +71,7 @@ public sealed class TestGrpcMessageSizeLimits
 
     /// <summary>
     /// A host with no <see cref="IRaft"/> keeps the library default — which is the 4 MB that
-    /// equalled one default backfill batch. Pinned so the number the ticket asked for is on record.
+    /// equalled one default backfill batch. Pinned so a change to the default is a deliberate one.
     /// </summary>
     [Fact]
     public void AddKommanderGrpc_WithoutARegisteredRaft_KeepsTheLibraryDefault()

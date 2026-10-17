@@ -10,9 +10,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.MicroBenchmarks;
 
 /// <summary>
-/// Benchmarks the leadership-confirmation fast paths against the REAL state machine (spec
-/// <c>6385886f</c> task M3). Setup drives one genuine quorum confirmation so a lease is published,
-/// with a pinned monotonic clock so neither window ever expires mid-run.
+/// Benchmarks the leadership-confirmation fast paths against the REAL state machine. Setup drives
+/// one genuine quorum confirmation so a lease is published, with a pinned monotonic clock so
+/// neither window ever expires mid-run.
 ///
 /// <para>Expected signal:</para>
 /// <list type="bullet">
@@ -27,7 +27,7 @@ namespace Kommander.MicroBenchmarks;
 ///         the state-machine layer: one fresh <c>RaftResponse</c> per reply. The full production
 ///         round trip also paid the executor <c>Ask</c> (reply source + TCS + correlation-dict
 ///         insert + async boxes), so the real saving is larger than this baseline shows.</item>
-///   <item>Frontier wait (Vorpal <c>76ec8df7</c>, follow-up) — <see cref="Readers"/> readers parked
+///   <item>Frontier wait — <see cref="Readers"/> readers parked
 ///         under a fresh lease on the end of a <see cref="BatchEntries"/>-entry batch that the leader
 ///         applies one entry at a time. The signal is the <b>allocated bytes per op being flat
 ///         across <see cref="BatchEntries"/></b>: a reader is signalled once, by the covering

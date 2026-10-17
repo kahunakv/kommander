@@ -79,7 +79,7 @@ public class TestSnapshotReceiveSession
     /// <summary>
     /// While this node's own disk reports a stall at or above the threshold, no snapshot session is
     /// opened: the install could not run until the disk answers, and staging the chunks meanwhile is
-    /// the memory that killed a follower after a 30 s pause (CamusDB run sd8). The sender sees a
+    /// the memory that killed a follower after a 30 s pause (seen in CamusDB). The sender sees a
     /// chunk rejection and retries on its backoff; once the stall clears the opener is accepted.
     /// </summary>
     [Fact]
@@ -305,7 +305,7 @@ public class TestSnapshotReceiveSession
     // ── integrity ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// The H6 core case: bytes that do not match the sender's digest must never reach the install
+    /// The core integrity case: bytes that do not match the sender's digest must never reach the install
     /// path. Everything else the receiver checks is structural — term, fence, chunk order — and a
     /// tampered or corrupted payload satisfies all of it.
     /// </summary>

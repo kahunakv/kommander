@@ -163,11 +163,11 @@ internal sealed class ClusterJoinService
     /// One-line snapshot of how far cluster assembly has progressed, emitted on every join wait
     /// tick and embedded in the timeout message.
     /// <para>
-    /// Stage 2 has two very different causes that look identical from the partition count alone, so
-    /// the local P0 log frontier is reported alongside it. <c>p0MaxLog=0</c> means the entries never
-    /// arrived — the leader is heartbeating us but never shipping the committed range (a leader-side
-    /// replication/backfill problem). <c>p0MaxLog&gt;0</c> with <c>userPartitions=0</c> means they
-    /// did arrive but were never applied — they are sitting in the WAL unconverted to
+    /// A join stalled at <c>userPartitions=0</c> has two very different causes that look identical
+    /// from the partition count alone, so the local P0 log frontier is reported alongside it.
+    /// <c>p0MaxLog=0</c> means the entries never arrived — the leader is heartbeating us but never
+    /// shipping the committed range (a leader-side replication/backfill problem).
+    /// <c>p0MaxLog&gt;0</c> with <c>userPartitions=0</c> means they did arrive but were never applied — they are sitting in the WAL unconverted to
     /// <c>Committed</c>, or the coordinator never processed the resulting <c>ConfigReplicated</c>
     /// (a follower-side apply problem). Without this split, a stalled join is indistinguishable
     /// between "nothing was sent" and "everything was sent and dropped on the floor".

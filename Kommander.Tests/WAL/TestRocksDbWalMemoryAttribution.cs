@@ -10,7 +10,7 @@ namespace Kommander.Tests.WAL;
 /// <c>raft.wal.block_cache_usage</c> and <c>raft.wal.block_cache_pinned_usage</c> gauges.
 ///
 /// <para>These exist because a node's resident set is mostly native memory that neither the .NET GC
-/// nor a shared block-cache budget accounts for. CamusDB's Phase 5 fault soaks lost two nodes to
+/// nor a shared block-cache budget accounts for. CamusDB's fault soaks lost two nodes to
 /// container OOM with ~3 GB of native memory per node that a 768 MiB shared budget did not move, and
 /// nothing in the process could say where it was. Table-reader memory — per-SST index and filter
 /// blocks, held outside the block cache because <c>cache_index_and_filter_blocks</c> is left at

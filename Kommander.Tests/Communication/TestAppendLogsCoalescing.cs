@@ -5,7 +5,7 @@ using Kommander.Communication.Grpc;
 namespace Kommander.Tests.Communication;
 
 /// <summary>
-/// Tests for W2 — per-stream outbound <c>AppendLogs</c> coalescing.
+/// Tests for per-stream outbound <c>AppendLogs</c> coalescing.
 ///
 /// All behavioral tests drive <see cref="GrpcCommunication.FlushCoalesced"/> directly
 /// with an injected write delegate, so no live gRPC server is required. The injected

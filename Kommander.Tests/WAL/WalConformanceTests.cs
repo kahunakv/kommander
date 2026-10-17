@@ -83,10 +83,10 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
-    // ──────────────────────────── B2b: Raft hard state ────────────────────────────
+    // ────────────────────────────── Raft hard state ───────────────────────────────
 
     /// <summary>
-    /// B2b: <c>PersistHardState</c>/<c>TryGetHardState</c> must round-trip the (term, votedFor) pair on
+    /// <c>PersistHardState</c>/<c>TryGetHardState</c> must round-trip the (term, votedFor) pair on
     /// every backend, namespace by partition, and store the two fields atomically (one metadata value).
     /// </summary>
     [Fact]

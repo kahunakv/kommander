@@ -85,8 +85,8 @@ public class TestFollowerDeliveryStall
 
     /// <summary>
     /// Control: a drain that is still legitimately blocked must stay blocked. A tick may retry,
-    /// but retrying must not become a licence to deliver past an unresolved entry — that is the
-    /// hole finding 1 was about.
+    /// but retrying must not become a licence to deliver past an unresolved entry — that would
+    /// open an applied hole.
     /// </summary>
     [Fact]
     public async Task Follower_StillWithholds_WhileTheBlockingEntryIsUnresolved()

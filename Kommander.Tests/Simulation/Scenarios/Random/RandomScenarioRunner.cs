@@ -333,7 +333,7 @@ public sealed class RandomScenarioRunner
             .ConfigureAwait(false);
 
         // The application's view, after the log's: a converged log with an application that never
-        // received part of it is the install that imported nothing (DST-20).
+        // received part of it is the install that imported nothing.
         await AppliedStateRule.CheckAsync(cluster, options.PartitionId, options.AdvanceMillisecondsPerStep, cancellationToken)
             .ConfigureAwait(false);
 
@@ -365,8 +365,8 @@ public sealed class RandomScenarioRunner
     /// <para><b>Why this runs before the recovery write, and why it exists at all.</b> The recovery
     /// write repairs a follower that is short of the leader, so a check placed only after it can
     /// never see a follower that would have stayed short forever. That is not a hypothetical: a
-    /// validation run over a reintroduced defect (`32348e83`, a voter with a sub-threshold gap on an
-    /// idle range) passed every seed, because this runner healed the very state it was looking
+    /// validation run over a reintroduced defect (a voter with a sub-threshold gap on an idle
+    /// range) passed every seed, because this runner healed the very state it was looking
     /// for.</para>
     ///
     /// <para><b>Why nodes at frontier zero are exempt, and why that is not a loophole.</b> A leader
@@ -481,8 +481,8 @@ public sealed class RandomScenarioRunner
         // A live node that answered no view is neither a follower nor absent, and the two verdicts
         // below both assume the views are the whole cluster. A view read is a client-kind operation
         // the executor refuses until the partition's restore completes, so the node this hides is
-        // typically a restarted one — and FINDING 5 was exactly that: the unobservable node was the
-        // leader, and the run was reported as leaderless. Name the node and its restore state, and
+        // typically a restarted one — and a real defect was exactly that: the unobservable node was
+        // the leader, and the run was reported as leaderless. Name the node and its restore state, and
         // stop; what the visible nodes look like is not the finding.
         string unobservable = DescribeUnobservableNodes(views);
 
@@ -1130,10 +1130,10 @@ public sealed class RandomScenarioRunner
     /// Starts a client write at the leader and, while it is in flight, asks the leader to hand over
     /// to <paramref name="target"/>. Both are driven to completion and recorded.
     ///
-    /// <para>Rule <c>transfer-definite-when-healthy</c> (DST-20 item 2): when the cluster had no fault
-    /// at the moment of the call, the answer must be one of <see cref="DefiniteTransferAnswers"/>.
-    /// A transient failure such as <c>ReplicationFailed</c> breaks no other rule, so without this
-    /// one the defect of <c>38a5e2b</c> — a target one entry behind refused at once, and the move
+    /// <para>Rule <c>transfer-definite-when-healthy</c>: when the cluster had no fault at the moment
+    /// of the call, the answer must be one of <see cref="DefiniteTransferAnswers"/>. A transient
+    /// failure such as <c>ReplicationFailed</c> breaks no other rule, so without this one the defect
+    /// fixed in commit <c>38a5e2b</c> — a target one entry behind refused at once, and the move
     /// silently dropped — passed every check.</para>
     ///
     /// <para>When the node is no longer the leader, or the target is not running, the action only
@@ -1315,7 +1315,7 @@ public sealed class RandomScenarioRunner
     /// lost can therefore be gone from both logs, and the only repair left is a snapshot. The report
     /// also has to name a resolved row, not only a present one: a restarted follower holding the id as
     /// <c>Proposed</c> is above its own commit frontier, and it refuses the leader's backfill anchored
-    /// on the compacted id (DST FINDING 7).</para>
+    /// on the compacted id.</para>
     ///
     /// <para><b>Why the rule is sound across a stale record.</b> The leader keeps a follower's last
     /// report until it steps down, so the record can be older than the crash. A true report stays

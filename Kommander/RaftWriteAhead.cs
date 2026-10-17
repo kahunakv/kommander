@@ -239,8 +239,8 @@ public sealed class RaftWriteAhead
     // leader then compacted through that id (retention holds at the report + 1), and after the
     // crash the node held the id as Proposed above its restored commit frontier. The leader's
     // backfill anchored on the compacted id carries prevLogTerm = -1, which the follower accepts
-    // only inside its committed prefix, so the batch was rejected and re-shipped forever (DST
-    // FINDING 7, found when the simulation stopped sharing RaftLog objects between nodes).
+    // only inside its committed prefix, so the batch was rejected and re-shipped forever (found
+    // when the simulation stopped sharing RaftLog objects between nodes).
     //
     // durableResolvedIndex is the exclusive frontier of resolutions known to be on disk: advanced
     // by a synced write that carried resolved rows, and by any synced write for the resolutions
@@ -1166,8 +1166,8 @@ public sealed class RaftWriteAhead
                 // unresolved id below N — on a node whose log has a hole (the poisoned-quorum
                 // shape), a promotion-barrier no-op commit then poisoned the commit frontier past
                 // the hole, and every later promotion refused forever on a committed drain that
-                // could never reach it (the Jepsen majority-hole leaderless wedge, observation 1
-                // of run 32690955741). AdvanceCommitFrontier keeps the two properties the old
+                // could never reach it (the Jepsen majority-hole leaderless wedge, run
+                // 32690955741). AdvanceCommitFrontier keeps the two properties the old
                 // comment wanted — a lower id never drags the frontier backwards (below-frontier
                 // ids are ignored, so the inherited-tail re-commit stays a no-op) — while an
                 // over-gap id is buffered until the gap resolves instead of certifying it away.
@@ -1740,7 +1740,7 @@ public sealed class RaftWriteAhead
     /// advances when an append is accepted into the WAL queue, so a follower whose disk has stopped
     /// answering keeps advertising every entry it has queued — the leader's retention floor then
     /// followed a position the follower did not hold and compaction removed the range its backfill
-    /// needed (CamusDB slow-disk run sd8). The published index is monotone for observers, so it would
+    /// needed (a CamusDB slow-disk run). The published index is monotone for observers, so it would
     /// hide the failed-write regression the leader's re-ship must see. Executor thread only.
     /// </summary>
     public long GetDurableCommitFrontier() =>
@@ -2148,7 +2148,7 @@ public sealed class RaftWriteAhead
     /// on the caller's thread: the metadata write is "fast" only while the storage engine answers, and on a
     /// stalled disk the synchronous form held the partition executor for the length of the stall — a node
     /// that had just stepped down for that stall could not vote for, or even learn, its successor until its
-    /// disk healed (CamusDB run sd4: <c>RequestVote took 10807ms</c>). The completion arrives through the
+    /// disk healed (a CamusDB slow-disk run: <c>RequestVote took 10807ms</c>). The completion arrives through the
     /// ordinary WAL completion path with the operation's term, so it is term-fenced like any other write.
     /// Throws <see cref="WAL.IO.BackpressureExceededException"/> when the partition's queue is full.
     /// </summary>
@@ -2920,7 +2920,7 @@ public sealed class RaftWriteAhead
             // responsive replica forces it into snapshot dependence, and a leader that does so on
             // its ordinary cadence re-creates the below-floor condition faster than any snapshot
             // rescue can repair it — the rescue then loops forever (the Caraxes
-            // bank-optimistic-45m-p finding). The budget bounds the retention: a follower more
+            // rescue loop). The budget bounds the retention: a follower more
             // than lagBudget entries behind is beyond what backfill catch-up can plausibly close
             // before the next pass and is left to the snapshot path, so a slow-forever replica
             // cannot grow the WAL without bound. The staleness window bounds trust in the

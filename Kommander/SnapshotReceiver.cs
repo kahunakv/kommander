@@ -141,7 +141,7 @@ internal sealed class SnapshotReceiver
     /// Age, in ms, of a partition's oldest WAL write the local storage engine has not answered, and
     /// the age at which a new snapshot session is refused. A snapshot cannot be installed until the
     /// disk answers, so accepting one during a stall only buffers it here for the stall's length —
-    /// the memory that OOM-killed a follower six seconds after its heal (CamusDB run sd8). The
+    /// the memory that OOM-killed a follower six seconds after its heal (a CamusDB slow-disk run). The
     /// leader defers on the peer's own report first; this is the receiver's guard for a leader that
     /// has not heard it (a fresh leader, a report lost in transit).
     /// </summary>

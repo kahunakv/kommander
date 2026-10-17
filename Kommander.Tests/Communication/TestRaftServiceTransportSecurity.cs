@@ -62,7 +62,7 @@ public sealed class TestRaftServiceTransportSecurity
     }
 
     /// <summary>
-    /// The H1 regression test: a signature must not survive a rewritten payload.
+    /// Regression test: a signature must not survive a rewritten payload.
     /// </summary>
     /// <remarks>
     /// The signature is computed over one request and the call is then made with a different one —

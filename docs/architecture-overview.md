@@ -433,7 +433,7 @@ discovers. Three seams let you swap implementations:
 | `RocksDbWAL` | higher-throughput durable storage |
 
 All three honour the same conformance contract (the tests in `Kommander.Tests/WAL/`). If you write a
-new backend, that contract is your spec.
+new backend, it must pass that contract too.
 
 **Transport — `ICommunication`**
 

@@ -31,7 +31,7 @@ namespace Kommander.Consensus;
 /// the one entry the leader compacted. When that anchor lies at or below this node's committed
 /// frontier, Leader Completeness makes the prefixes agree, so the batch is accepted. Rejecting it as
 /// divergence looped forever: the leader's read had succeeded, so it recorded no refusal, started
-/// no snapshot, and re-shipped the same batch on every heartbeat (DST FINDING 6). Above the committed
+/// no snapshot, and re-shipped the same batch on every heartbeat. Above the committed
 /// frontier a <c>-1</c> anchor proves nothing and is still rejected.</para>
 ///
 /// <para><b>A heartbeat ack re-raises the hole report until the hole is repaired.</b> The
@@ -39,7 +39,7 @@ namespace Kommander.Consensus;
 /// signal dies with the leadership that heard it. The heartbeat branch therefore sends a second,
 /// LogMismatch-status response — alongside the normal Success ack, never instead of it — while
 /// durable entries sit buffered above the contiguous presence frontier, so a standing hole
-/// reaches whichever node leads now regardless of elections in between (DST FINDING 1).</para>
+/// reaches whichever node leads now regardless of elections in between.</para>
 ///
 /// <para><b>The report is debounced to holes whose repair anchor is STUCK.</b> Under load a
 /// presence gap is routinely transient: appends ride multiple in-flight paths, so entries can
@@ -177,7 +177,7 @@ internal sealed class FollowerAppendHandler
         // announcement — and adopting the sender would abdicate real leadership and orphan the
         // term's in-flight replication. The observed source is a zombie broadcast: a deposed peer
         // whose queued WAL commit completion fanned out AppendLogs stamped with a term it adopted
-        // but never won (the Caraxes run-J split-brain: the resumed node adopted the new term from
+        // but never won (a Caraxes split-brain: the resumed node adopted the new term from
         // the elected leader's own traffic, then re-broadcast under it, and the elected leader
         // stepped down inside its own term). The fence deliberately covers ONLY the Leader state:
         // a follower's host.Leader legitimately lags one term behind (the vote path adopts a higher
@@ -215,7 +215,7 @@ internal sealed class FollowerAppendHandler
         }
 
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
-        // B3: a received AppendLogs (heartbeat or real batch) is the primary "we heard from the leader"
+        // A received AppendLogs (heartbeat or real batch) is the primary "we heard from the leader"
         // signal. Anchor the monotonic shadow to local now so the follower election gate measures the
         // silence interval on the local clock — this is the exact site whose HLC subtraction used to
         // freeze the timeout for the length of a leader's clock skew.
@@ -329,7 +329,7 @@ internal sealed class FollowerAppendHandler
             // would misread that -1 boundary term as a hole and truncate the just-shipped anchored backfill,
             // which the leader re-ships and the follower re-truncates forever — a live-lock that strands the
             // follower exactly one entry below the boundary (and its consumer's applied prefix with it).
-            // Leader-compacted anchor inside this follower's committed prefix (DST FINDING 6). The
+            // Leader-compacted anchor inside this follower's committed prefix. The
             // leader ships prevLogTerm = -1 when the anchor entry is below its own compaction floor:
             // a backfill batch that starts at the leader's first retained entry is anchored on the
             // one entry it no longer holds. The live-replica retention hold produces exactly that
@@ -581,7 +581,7 @@ internal sealed class FollowerAppendHandler
             FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.Success, reportedCommittedIndex)
         ));
 
-        // Level-triggered hole report (DST FINDING 1: a hole smaller than BackfillThreshold was
+        // Level-triggered hole report (without it, a hole smaller than BackfillThreshold was
         // never repaired). The over-gap ack gate and the duplicate re-ack both report LogMismatch
         // only at the moment an entry-carrying batch lands over the gap — an EDGE signal, and it
         // dies with the leadership that heard it: the reproduction lost three leaders right after

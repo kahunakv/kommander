@@ -23,7 +23,7 @@ public sealed class RequestVotesRequest
     /// could be elected over a more up-to-date voter, a Leader-Completeness violation.
     /// <para><b>Wire compatibility:</b> a peer predating this field sends <c>0</c>. Voters treat a
     /// non-positive last-log term as "unknown" and fall back to index-only comparison, so a
-    /// mixed-version cluster degrades to the pre-B5 ordering rather than mis-ordering.</para>
+    /// mixed-version cluster degrades to index-only ordering rather than mis-ordering.</para>
     /// </summary>
     public long LastLogTerm { get; set; }
 

@@ -156,7 +156,7 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
     }
 
     /// <summary>
-    /// The regression guard the spec asks for: sustained commits with checkpoints and a low
+    /// Regression guard: sustained commits with checkpoints and a low
     /// <c>CompactEveryOperations</c> must reach <c>LogInfoCompactionStarted</c> and actually truncate,
     /// so a return to "silently does nothing" is caught here rather than by a downstream harness.
     /// </summary>

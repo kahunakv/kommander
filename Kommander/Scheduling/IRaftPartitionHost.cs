@@ -74,7 +74,7 @@ public interface IRaftPartitionHost
     /// <summary>
     /// A monotonically non-decreasing local timestamp in <see cref="global::System.Diagnostics.Stopwatch"/> ticks,
     /// used <b>only</b> to measure elapsed local durations for the election / heartbeat / voting / quiesce
-    /// timers (B3). Unlike <see cref="HybridLogicalClock"/> it is never advanced by a remote peer's
+    /// timers. Unlike <see cref="HybridLogicalClock"/> it is never advanced by a remote peer's
     /// timestamp, so a follower's election timeout cannot be frozen for the duration of a leader's clock
     /// skew — the liveness bug that HLC subtraction caused. It is <b>not</b> comparable across nodes and
     /// must never be used for event ordering or log identity; HLC remains the authority there.

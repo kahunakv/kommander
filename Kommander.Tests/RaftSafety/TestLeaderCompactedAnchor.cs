@@ -8,7 +8,7 @@ namespace Kommander.Tests.RaftSafety;
 
 /// <summary>
 /// The follower's Log Matching check for a backfill anchored on an entry the leader compacted
-/// (<c>FollowerAppendHandler</c>, DST FINDING 6).
+/// (<c>FollowerAppendHandler</c>).
 ///
 /// <para>A leader ships <c>prevLogTerm = -1</c> when the anchor entry is below its own compaction
 /// floor. The follower used to compare its real term with -1, call it divergence, and reject the
@@ -90,7 +90,7 @@ public sealed class TestLeaderCompactedAnchor
             response.Item2.CompleteAppendLogsRequest?.Status == RaftOperationStatus.LogMismatch);
 
     /// <summary>
-    /// The FINDING 6 shape: the follower committed through 4, holds entry 4 in term 3, and the
+    /// The wedge shape: the follower committed through 4, holds entry 4 in term 3, and the
     /// leader anchors a batch from 5 on its compacted entry 4. The batch must go to the write path.
     /// </summary>
     [Fact]

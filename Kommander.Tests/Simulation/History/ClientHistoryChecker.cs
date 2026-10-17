@@ -19,8 +19,7 @@ namespace Kommander.Tests.Simulation.History;
 /// that was refused, and a read holds everything an earlier read held. Together these are
 /// linearizability for reads of a log whose committed prefixes agree, which the run-level rules
 /// establish separately (<c>committed-entries-agree</c>, <c>applied-state-agrees</c>). The first rule is
-/// the one a deposed leader breaks when it answers a read without a quorum round
-/// (<c>bf275e4a</c>).</para>
+/// the one a deposed leader breaks when it answers a read without a quorum round.</para>
 ///
 /// <para><b>What the checks are read against.</b> One node's committed entries. This is sound only
 /// because the run-level convergence invariant separately establishes that live nodes hold identical
@@ -44,7 +43,8 @@ public static class ClientHistoryChecker
     /// <para>Two entries carrying one client's single append means the log applied it twice, which
     /// for a non-idempotent consumer is a different kind of corruption from losing it. Two
     /// acknowledgements naming one index means the log promised one slot to two clients, which is
-    /// the shape <c>6e659a78</c> produced.</para>
+    /// the shape a leader whose propose index regressed produced: it reissued indices it had
+    /// already committed.</para>
     /// </summary>
     public const string AcknowledgedAppendUnique = "acknowledged-append-unique";
 
@@ -73,7 +73,7 @@ public static class ClientHistoryChecker
     ///
     /// <para>The promise of a confirmed read. A node that confirmed it is current and then served
     /// state without an acknowledged write is serving stale state as an authoritative answer: the
-    /// Jepsen <c>register / partition</c> violation behind <c>bf275e4a</c>, where a leader cut off from
+    /// Jepsen <c>register / partition</c> violation, where a leader cut off from
     /// the majority answered reads for eleven seconds.</para>
     /// </summary>
     public const string ReadObservesAcknowledgedAppends = "read-observes-acknowledged-appends";

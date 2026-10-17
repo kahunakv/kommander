@@ -55,7 +55,7 @@ public class TestPreVoteWireRoundTrip
         Assert.False(parsed.PreVote);
     }
 
-    // ── B5: the §5.4.1 last-log term must survive the wire, and an un-upgraded peer that never
+    // ── The §5.4.1 last-log term must survive the wire, and an un-upgraded peer that never
     //        writes field 9 must deserialize as 0 (→ voter falls back to index-only comparison). ──
 
     [Fact]

@@ -13,7 +13,7 @@ namespace Kommander.Tests.Simulation.Invariants;
 /// frontiers are right, and every log check passes. Only the state the application holds shows the
 /// hole. The simulated application (<see cref="SimulatedPartitionStateTransfer.Apply"/>) records
 /// every entry the library hands it, and a snapshot carries that state, so a skipped import leaves
-/// the receiver without the entries below the boundary (<c>14b564a</c> item 6, DST-20).</para>
+/// the receiver without the entries below the boundary.</para>
 ///
 /// <para><b>What a node is owed.</b> Every entry the library delivers: type <c>Committed</c>, not the
 /// leadership-barrier no-op (the two filters in <c>LogApplicator</c>). A node is owed such an entry

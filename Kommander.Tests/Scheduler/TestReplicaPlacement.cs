@@ -636,7 +636,7 @@ public sealed class TestReplicaPlacement
     [Fact]
     public async Task InitialPlacement_SixNodesFourRangesRf3_AssignsEvenSpread()
     {
-        // The spec's canonical example, end to end: the P0 leader bootstraps 4 ranges over a
+        // The canonical example, end to end: the P0 leader bootstraps 4 ranges over a
         // 6-node discovery set at RF=3 — each range gets 3 distinct replicas, each node 2 ranges.
         List<RaftNode> peers = [.. Enumerable.Range(1, 5).Select(i => new RaftNode($"peer{i}:1"))];
         RaftManager manager = Build(replicationFactor: 3, peers: peers, initialPartitions: 4);

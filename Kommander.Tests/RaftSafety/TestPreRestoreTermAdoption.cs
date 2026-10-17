@@ -10,7 +10,7 @@ namespace Kommander.Tests.RaftSafety;
 
 /// <summary>
 /// Regression tests for what a partition does with a term it learned <em>before</em> its WAL
-/// restore completed (DST FINDING 5).
+/// restore completed.
 ///
 /// <para>The executor lets AppendEntries through while the restore is still running, so a restarting
 /// follower adopts the live leader's term in memory before <c>CompleteRestoreAsync</c> has read the
@@ -103,7 +103,7 @@ public sealed class TestPreRestoreTermAdoption : IDisposable
     }
 
     /// <summary>
-    /// The FINDING 5 shape at the state-machine level. The live leader's heartbeat teaches the node
+    /// The pre-restore term regression at the state-machine level. The live leader's heartbeat teaches the node
     /// term 5 before the restore runs; the log tail and the hard state both say 3. The restore must
     /// complete, and the term must still be 5 afterwards.
     ///

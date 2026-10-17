@@ -32,7 +32,7 @@ public sealed class TestServerCertificateValidation
     }
 
     /// <summary>
-    /// The M2 fix: a pinned certificate that has expired must be refused, not accepted on the
+    /// A pinned certificate that has expired must be refused, not accepted on the
     /// strength of its thumbprint.
     /// </summary>
     [Fact]

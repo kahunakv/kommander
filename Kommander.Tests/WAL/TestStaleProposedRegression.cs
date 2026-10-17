@@ -186,7 +186,7 @@ public sealed class TestStaleProposedRegression
     }
 
     /// <summary>
-    /// The exact last-non-skipped-id-wins shape from the ticket: with the allocator at 9
+    /// The exact last-non-skipped-id-wins shape: with the allocator at 9
     /// (Proposed 6 and 8 held), a late unresolved Proposed 7 arrives. Before the fix it dragged
     /// the allocator to 8, and the next client write was stamped 8 — reissuing the id the durable
     /// Proposed row 8 already occupies.

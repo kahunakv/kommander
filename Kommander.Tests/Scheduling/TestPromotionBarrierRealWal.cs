@@ -273,8 +273,8 @@ public class TestPromotionBarrierRealWal
     }
 
     /// <summary>
-    /// The restart-convergence payoff of the inherited-re-commit work (spec: "converge the
-    /// persistent WAL commit frontier over inherited entries on the leader", T3): after a
+    /// The restart-convergence payoff of durably re-committing inherited entries (the leader's
+    /// persistent WAL commit frontier must converge over inherited entries): after a
     /// promotion commits an inherited prior-term Proposed band, the band's rows must be durably
     /// re-marked Committed — so a RESTART recomputes the commit frontier at the promoted value
     /// instead of regressing below the band, and the next promotion finds nothing inherited (the
@@ -288,7 +288,7 @@ public class TestPromotionBarrierRealWal
     /// <para>Runs on <see cref="RocksDbWAL"/> deliberately: <see cref="InMemoryWAL"/> returns its
     /// STORED instances from reads, so <c>EnqueueCommit</c>'s in-place type flip mutates the
     /// backend directly and masks a re-commit whose physical write never happens — the exact
-    /// masking that let the empty-payload bug (feature 25016232 round 4) through every in-memory
+    /// masking that once let an empty-payload bug through every in-memory
     /// test. A serializing backend is the only honest witness for the row flip.</para>
     /// </summary>
     [Fact]

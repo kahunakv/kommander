@@ -116,7 +116,7 @@ public sealed record RocksDbWalTuning
     /// </summary>
     public int MaxTotalWalSizeFlushUnits { get; init; } = 2;
 
-    // ── Layout knobs (probe-driven; see the write-amp feature's w3 analysis) ─────────────────────
+    // ── Layout knobs (driven by write-amplification probes) ──────────────────────────────────────
     //
     // Superseded by the floor layout — files leave L0 by trivial move and are dropped whole, so no
     // level cascade remains to avoid — but kept so a probe can still compare a different base-level
@@ -133,7 +133,7 @@ public sealed record RocksDbWalTuning
     /// <summary>
     /// When true, the shard CFs use universal compaction instead of leveled. Universal keeps the
     /// log in few large sorted runs and lets a range tombstone drop covered data without the
-    /// leveled L0→Lmax cascade — the spec's alternative when whole-file drops alone underperform.
+    /// leveled L0→Lmax cascade — the alternative when whole-file drops alone underperform.
     /// The retention bound stays the durability floor (compaction handles it); this only changes
     /// the physical layout. Default false (leveled, as shipped).
     /// </summary>

@@ -191,7 +191,7 @@ public sealed class TestClientHistoryChecker
     // ── Reads ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// The stale read of <c>bf275e4a</c>: a write was acknowledged, and a read that began afterwards
+    /// The stale read a deposed leader serves without a quorum round: a write was acknowledged, and a read that began afterwards
     /// returned state without it.
     /// </summary>
     [Fact]

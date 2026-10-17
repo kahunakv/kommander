@@ -176,7 +176,7 @@ public enum RandomScenarioActionKind
     ///
     /// <para><b>What it models.</b> A leader's responder serializes a message when it takes it off
     /// its queue, not when the leader decides to send it. A responder that runs late therefore sends
-    /// an entry typed <c>Committed</c> that the follower never saw as proposed (<c>367eac9</c>).
+    /// an entry typed <c>Committed</c> that the follower never saw as proposed (commit <c>367eac9</c>).
     /// Before the transport gave every receiver its own copy, shared objects produced this state by
     /// accident on every run and a crash could never lose what it depended on.</para>
     ///
@@ -196,7 +196,7 @@ public enum RandomScenarioActionKind
     /// that is heartbeating, so its followers notice at once. A quiesced leader sends nothing, its
     /// followers hear nothing either way, and only two mechanisms end its term: SWIM on the
     /// followers, and check-quorum on the leader, which must not count a quiesced silence as contact.
-    /// The Kahuna lost-write bug (<c>39bf62e2</c>, fixed in <c>14b564a</c>) was the second one
+    /// The Kahuna lost-write bug (fixed in commit <c>14b564a</c>) was the second one
     /// failing: the leader refreshed its contact clock while quiesced, never stepped down, and kept
     /// accepting writes a new leader could not see.</para>
     ///
@@ -211,10 +211,10 @@ public enum RandomScenarioActionKind
     /// gone, and the roster still names it.
     ///
     /// <para>The heal of a crash, chosen instead of <see cref="RestartNode"/> in
-    /// <c>BlankRestartPercent</c> of the crash draws. The Kahuna restart behind <c>e618064e</c>: the
+    /// <c>BlankRestartPercent</c> of the crash draws. It models a Kahuna restart in which the
     /// leader kept the progress it recorded for the old incarnation, anchored every repair above
-    /// what the blank node held, and the node never caught up (<c>3552ab9</c>). The stored vote goes
-    /// too; see <c>SimulatedWAL.Wipe</c> for what Raft does not promise about that.</para>
+    /// what the blank node held, and the node never caught up (fixed in commit <c>3552ab9</c>). The
+    /// stored vote goes too; see <c>SimulatedWAL.Wipe</c> for what Raft does not promise about that.</para>
     /// </summary>
     RestartNodeBlank,
 
@@ -223,8 +223,8 @@ public enum RandomScenarioActionKind
     /// follower, which is then behind by the entry in flight. <c>Target</c> is the leader,
     /// <c>Secondary</c> the follower.
     ///
-    /// <para><b>Why.</b> <c>38a5e2b</c>: a transfer whose target was one entry behind answered
-    /// <c>ReplicationFailed</c> at once, and the balancer dropped the answer, so leadership never
+    /// <para><b>Why.</b> Fixed in commit <c>38a5e2b</c>: a transfer whose target was one entry
+    /// behind answered <c>ReplicationFailed</c> at once, and the balancer dropped the answer, so leadership never
     /// moved. The vocabulary had no transfer at all, and no rule judged the answer of a call made
     /// under no fault. The runner's rule <c>transfer-definite-when-healthy</c> does now.</para>
     /// </summary>
@@ -236,7 +236,7 @@ public enum RandomScenarioActionKind
     ///
     /// <para><b>Why.</b> Until this action, no simulated client read. A node that served stale state
     /// after confirming it was current broke no rule the harness had, because every rule read node
-    /// state or the final log. The history checker judges each served read (DST-7b).</para>
+    /// state or the final log. The history checker judges each served read.</para>
     /// </summary>
     ReadAtNode,
 
@@ -246,7 +246,7 @@ public enum RandomScenarioActionKind
     /// <c>Target</c> is the leader. The first read leaves a fresh confirmation behind, so a leader
     /// that reuses a confirmation for too long is also in scope.
     ///
-    /// <para><b>Why.</b> The Jepsen shape behind <c>bf275e4a</c>: a leader cut off from the majority
+    /// <para><b>Why.</b> A Jepsen-found shape: a leader cut off from the majority
     /// still believes it leads, and a read gated on that belief returns state without the writes the
     /// new leader acknowledged. A correct node refuses the read, because it cannot confirm with a
     /// quorum. A random read lands in this window almost never, so the action builds it.</para>
@@ -258,7 +258,7 @@ public enum RandomScenarioActionKind
     /// new leader on the far side with the straddler's vote, and then write at the old leader.
     /// <c>Target</c> is the old leader, <c>Secondary</c> the straddler. Needs five running nodes.
     ///
-    /// <para><b>Why.</b> <c>681cf397</c>, from a Jepsen <c>majorities-ring</c> run: a follower that voted in
+    /// <para><b>Why.</b> A Jepsen <c>majorities-ring</c> run: a follower that voted in
     /// a higher term kept its old term in memory and went on acknowledging the old leader, which then
     /// committed and acknowledged a write that the new leader overwrote. The state needs two majorities
     /// that share one node, so three nodes cannot reach it.</para>

@@ -8,8 +8,8 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests.Simulation;
 
 /// <summary>
-/// A five-node ring partition in which one follower is in both majorities: the Jepsen shape of
-/// <c>681cf397</c>.
+/// A five-node ring partition in which one follower is in both majorities: the shape of a Jepsen
+/// <c>majorities-ring</c> violation.
 ///
 /// <para><b>The defect.</b> A follower that granted a vote in term T+1 kept its in-memory term at T.
 /// The append fence compares the follower's term with the leader's, so the follower went on
@@ -57,15 +57,15 @@ public sealed class TestStraddlingVoterScenarios
     /// A deposed leader cannot commit through a follower that voted in a higher term.
     ///
     /// <para>On a correct build the straddler adopts the higher term when it votes, refuses the old
-    /// leader's append, and the old leader's write is not acknowledged. On the <c>681cf397</c> build
-    /// the straddler accepts it, and the old leader acknowledges the write through {old leader, its
+    /// leader's append, and the old leader's write is not acknowledged. On the defective build the
+    /// straddler accepts it, and the old leader acknowledges the write through {old leader, its
     /// follower, straddler}. Three of five nodes then hold the write as committed, and the new leader
     /// holds nothing at its index. The per-step rule <c>leader-completeness</c> fails on that state,
     /// through its check of the current leader's whole log. Measured: before that check existed, the
     /// defect showed only as a cluster that never converged, because the new leader's commit index
     /// stayed below the write and the committed-window check never read it.</para>
     ///
-    /// <para><b>How Control A rebuilds the defect.</b> Two changes in <c>ElectionCoordinator.VoteAsync</c>:
+    /// <para><b>How the negative control rebuilds the defect.</b> Two changes in <c>ElectionCoordinator.VoteAsync</c>:
     /// the follower does not adopt the vote's term in memory, and the vote is written synchronously.
     /// The second is needed because the queued vote write sends its grant only when the node's term
     /// equals the vote's term, and the completion router discards a completion from another term, so

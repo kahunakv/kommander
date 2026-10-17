@@ -1016,8 +1016,8 @@ public class TestHoleyLogElection
     /// a gap is routinely a batch that enqueued ahead of its predecessor and closes on its own,
     /// and reporting it makes the leader regress this peer's nextIndex and ship a redundant
     /// anchored backfill. Only an anchor that stands across two consecutive beats reports — and
-    /// from then on it re-reports every beat until the hole closes (the level-triggered repair
-    /// DST FINDING 1 requires).
+    /// from then on it re-reports every beat until the hole closes (the repair must be
+    /// level-triggered: an edge-triggered report dies with election churn and the hole persists).
     /// </summary>
     [Fact]
     public async Task HeartbeatHoleReport_FiresOnlyOnceTheAnchorIsStuck()

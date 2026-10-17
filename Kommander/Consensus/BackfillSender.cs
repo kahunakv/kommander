@@ -246,7 +246,7 @@ internal sealed class BackfillSender
         // an entry-carrying batch shipped now can only sit in its WAL queue (or be refused as
         // saturated), and the refusal path below must not be reached at all — a snapshot cannot
         // land on a stalled disk either, and buffering one is what killed a follower six seconds
-        // after its heal (CamusDB run sd8). Wait, as for a saturated peer: the retention floor holds
+        // after its heal (a CamusDB slow-disk run). Wait, as for a saturated peer: the retention floor holds
         // its durable position, so once the disk answers the same batch ships from the log. The
         // anchored repair paths wait too — they are also entry-carrying, and the peer's next
         // rejection re-records the note once it is writing again.
@@ -433,7 +433,7 @@ internal sealed class BackfillSender
         // -1 when the anchor is below this leader's compaction floor: the batch starts at the first
         // retained entry, and the entry under it is the one compaction removed. That is not a refusal —
         // every entry the follower needs is still here. The follower accepts a -1 anchor inside its
-        // own committed prefix (FollowerAppendHandler, DST FINDING 6). An anchor above the follower's
+        // own committed prefix (see FollowerAppendHandler). An anchor above the follower's
         // committed frontier is still rejected there; the anchor fallback then re-anchors at the
         // frontier the follower reported, and a frontier below the floor takes the NonContiguous
         // refusal above into the snapshot rescue.
@@ -500,7 +500,7 @@ internal sealed class BackfillSender
     /// a hole under a live stream that keeps landing above the hole reports a pinned commit frontier
     /// for as long as the hole is open; judged on that frontier alone, the probe escalated a
     /// converging follower four ships after it resumed and re-seeded it three times for one 30-s
-    /// pause (CamusDB fault soak rl6).</para>
+    /// pause (a CamusDB fault soak).</para>
     ///
     /// <para><b>A freshly seeded follower gets a grace.</b> An install hands the follower the lag
     /// the leader accrued while exporting, sending and importing it; a second install inside the
@@ -709,9 +709,9 @@ internal sealed class BackfillSender
 
         // Never ship a snapshot to a peer whose disk is reporting a stall: the transfer cannot be
         // installed until the disk answers, so every chunk is buffered on the follower for the
-        // length of the stall — the memory that OOM-killed camus3 in CamusDB run sd8, six seconds
-        // after its heal, with the install still unwritten. The refusal is not lost: the peer is
-        // below the floor, and the next refused heartbeat after its stall clears escalates. Also
+        // length of the stall — the memory that OOM-killed a CamusDB follower in a slow-disk run, six
+        // seconds after its heal, with the install still unwritten. The refusal is not lost: the
+        // peer is below the floor, and the next refused heartbeat after its stall clears escalates. Also
         // reached from the memoized round batch, hence checked here rather than by the caller.
         if (tracker.IsReportingWalStall(node.Endpoint, out long stallAgeMs, out TimeSpan stalledFor))
         {

@@ -39,7 +39,7 @@ internal sealed class NonContiguousBackfillTracker
     /// <summary>
     /// Window inside which a re-open of an already-warned (endpoint, from, firstId) condition logs
     /// at Debug rather than Warning. Episode identity alone did not bound the log volume in the
-    /// Caraxes soak (feature d11fd5f9): a wedged peer produced 24,253 Warnings from 4 distinct
+    /// Caraxes soak: a wedged peer produced 24,253 Warnings from 4 distinct
     /// conditions, because episode churn (clears, replacements, overlapped reports) re-opened the
     /// same condition thousands of times. The cooldown slides on every open, so a condition that
     /// keeps re-opening warns exactly once, and a condition that stays quiet for the window warns
@@ -224,7 +224,7 @@ internal sealed class NonContiguousBackfillTracker
     /// frontier anchor below the compaction floor — the refusal condition still holds, the peer is
     /// still pinned, and closing the episode on that ship makes the status flap and re-opens the
     /// episode (with a fresh Warning) on the very next frontier-anchored attempt. The Caraxes soak
-    /// (feature d11fd5f9) showed this shape sustained for hours.</para>
+    /// showed this shape sustained for hours.</para>
     /// </summary>
     public void ClearIfCovered(string endpoint, long shippedFrom, string reason)
     {

@@ -151,7 +151,7 @@ public class RaftConfiguration
     /// <see cref="CheckLeaderInterval"/> fires more frequently than
     /// <see cref="HeartbeatInterval"/>. Measured on the monotonic tick source, like every
     /// other elapsed-time gate — never by HLC subtraction, which a skewed peer's timestamp
-    /// freezes (that shape silenced heartbeats and the repair path entirely; DST FINDING 4).
+    /// freezes (that shape silenced heartbeats and the repair path entirely).
     /// Must stay below <see cref="HeartbeatInterval"/>, or every timer-driven heartbeat
     /// round is skipped and only forced rounds (promotion, read-index) ever reach peers.
     /// <see cref="TimeSpan.Zero"/> disables the window (the skip is strictly-less-than).
@@ -462,7 +462,7 @@ public class RaftConfiguration
     /// <c>Errored</c>, which means partitions that committed successfully will
     /// receive a spurious error completion and their proposers will retry.  The
     /// upsert is idempotent (<c>ON CONFLICT DO UPDATE</c>) so retries are safe, but
-    /// cross-partition failure propagation is wider than it was pre-D1.  RocksDB is
+    /// cross-partition failure propagation is wider than with per-partition writes.  RocksDB is
     /// not affected (atomic <c>WriteBatch</c>).</para>
     ///
     /// Defaults to <see cref="WAL.IO.FairWalScheduler.DefaultMaxGroupBatchPartitions"/> (64).
@@ -748,7 +748,7 @@ public class RaftConfiguration
     /// The per-peer outbound queue is the only unbounded structure between the Raft state
     /// machine and the wire. A follower that stops draining (SIGSTOP pause, network stall)
     /// previously made its queue absorb the leader's entire write load plus a fresh backfill
-    /// batch per heartbeat, indefinitely: the Caraxes run Q leader retained ~830 MiB of live
+    /// batch per heartbeat, indefinitely: a Caraxes leader retained ~830 MiB of live
     /// gen2 batches this way and aborted on memory exhaustion. Dropping is safe — an
     /// <c>AppendLogs</c> is fire-and-forget and every dropped entry is re-shipped by the
     /// heartbeat/backfill retry path once the queue drains. Default 64 MiB.
@@ -1101,7 +1101,7 @@ public class RaftConfiguration
     /// <para>
     /// An entry count alone does not bound the allocation: under a large-payload workload,
     /// 128 entries is tens of megabytes materialized on the heartbeat path per follower per
-    /// round. The Caraxes run Q leader died of memory exhaustion with this read as the
+    /// round. A Caraxes leader died of memory exhaustion with this read as the
     /// tipping allocation. The default (4 MiB) also keeps a batch under the gRPC receiver's
     /// default 4 MB message cap. Default 4 MiB.
     /// </para>
@@ -1158,7 +1158,7 @@ public class RaftConfiguration
     /// <para>
     /// An install hands the follower a lag the leader created: everything committed while the
     /// snapshot was exported, sent and imported (0.5–1 M entries for a 60–100 s install at
-    /// 5,000–17,000 entries/s, CamusDB fault soak rl6). The follower closes it from the log at the
+    /// 5,000–17,000 entries/s, in a CamusDB fault soak). The follower closes it from the log at the
     /// rate its disk has left over after the live stream; its reported frontiers can stand still
     /// for several ships while it does, and a second install inside that window can only repeat
     /// the first, at the same cost (a whole-partition export, every chunk on the wire, 90%+ of the
@@ -1284,7 +1284,7 @@ public class RaftConfiguration
     /// loop reports success, so the failure backoff never fires — without this bound a follower
     /// that returns below the compaction floor after every install drove an unbounded
     /// whole-partition export every cooldown until the leader died of memory exhaustion (the
-    /// Caraxes <c>bank-optimistic-45m-p</c> OOM/SIGSEGV). A tripped breaker is surfaced as
+    /// Caraxes rescue-loop OOM/SIGSEGV). A tripped breaker is surfaced as
     /// <see cref="Data.RaftSnapshotStatus.RescueNotConverging"/> on
     /// <see cref="IRaft.GetSnapshotStatuses"/> and logged once at Warning; recovery probes are
     /// paced by <see cref="SnapshotRescueProbeInterval"/>. Values &lt;= 0 disable the breaker
@@ -1866,7 +1866,7 @@ public class RaftConfiguration
     /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
     /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
     /// below-floor condition the snapshot rescue had just repaired, so the rescue could never
-    /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). The floor is computed on the
+    /// converge (the Caraxes rescue loop). The floor is computed on the
     /// leader from its replication tracker and sent to the followers with every AppendLogs; each
     /// follower holds its own compaction at it, within this budget, so the log a lagging replica
     /// needs is still there on whichever node leads next. It has no effect on a node's own restart
@@ -1874,7 +1874,7 @@ public class RaftConfiguration
     /// <para>
     /// Default 1,000,000. The budget must cover the entries a live follower can miss during a device
     /// pause and still be served from the log: at the 100,000 entries the earlier default held, a
-    /// 30-second pause on a follower under ~7,000 ops/s (CamusDB run sd4, ~300,000 entries) was
+    /// 30-second pause on a follower under ~7,000 ops/s (CamusDB, ~300,000 entries) was
     /// compacted past within the pause itself, the follower was seeded by a ~10 M-entry snapshot on
     /// heal, and the install pushed it out of memory. A million entries is roughly a minute at that
     /// rate; the retained rows cost WAL disk only while a live replica actually lags, and a replica

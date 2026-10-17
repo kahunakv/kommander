@@ -503,7 +503,7 @@ public sealed class RaftPartition : IDisposable
     /// Upper bound on how long a deferred-reply operation (propose, commit, rollback, checkpoint)
     /// may wait for its executor reply. These replies resolve through the WAL completion router,
     /// not inline in the executor, so a dropped completion would otherwise hang the caller with no
-    /// response and no timeout — the Caraxes run-H shape, where callers orphaned by a term-fenced
+    /// response and no timeout — the Caraxes shape where callers orphaned by a term-fenced
     /// propose completion starved a closed-loop workload cluster-wide while health stayed green.
     /// The router no longer orphans replies (every fence answers before discarding); this bound is
     /// defense in depth so no future drop path can ever wedge callers permanently. Mirrors the
@@ -604,8 +604,7 @@ public sealed class RaftPartition : IDisposable
     /// Replicates a caller-built, heterogeneous <see cref="RaftLog"/> batch as a single proposal
     /// (the <see cref="IRaft.ReplicateEntries"/> path). <paramref name="autoCommit"/> selects the commit
     /// group: <see langword="true"/> for the auto-commit portion (commits with the batch),
-    /// <see langword="false"/> for a trailing manual group whose ticket the caller commits or rolls back later
-    /// (slice 2).
+    /// <see langword="false"/> for a trailing manual group whose ticket the caller commits or rolls back later.
     /// <para>
     /// Unlike the single-type overloads, the caller owns <paramref name="logs"/> and passes the same
     /// <see cref="RaftLog"/> instances that flow into the state machine's propose. <see cref="RaftWriteAhead"/>

@@ -20,7 +20,7 @@ namespace Kommander.Tests.RaftSafety;
 /// above the batch min. The router used to require equality and discarded such completions: no ack
 /// reached the leader, the fast-path apply was skipped, and the peer stayed in backfill. Observed in
 /// the Caraxes <c>bank-rebase</c> soaks as dozens of <c>min-log-index mismatch</c> discards per
-/// minute on every follower (CamusDB feature 80af367a).</para>
+/// minute on every follower.</para>
 ///
 /// <para>The check must still reject a real mix-up: an envelope whose min is below anything the
 /// batch carried, or names an id the batch never held.</para>

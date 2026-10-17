@@ -109,7 +109,7 @@ public sealed class SimulatedTransport : ICommunication
     /// Limits the kinds of message this link carries. <see cref="LinkTraffic.All"/> restores it.
     ///
     /// <para><b>Why a filter by message kind.</b> Some states need an exact order of election events
-    /// that timers alone do not give. The <c>681cf397</c> state needs a follower that votes for a new
+    /// that timers alone do not give. The straddling-voter state needs a follower that votes for a new
     /// candidate and then keeps hearing the old leader and not the new one. A link that carries
     /// only election traffic delivers the vote and holds back the new leader's appends. A link that
     /// carries everything except vote requests stops a node from starting its own election, so the
@@ -531,7 +531,7 @@ public sealed class SimulatedTransport : ICommunication
     ///
     /// <para>The in-memory transport has no size limit, and production does: gRPC refuses a frame
     /// above <see cref="RaftConfiguration.GrpcMaxMessageBytes"/>, and every entry on the refused frame
-    /// goes back to the retry path (<c>2ec4f92</c>). A simulation with no limit can never reach that
+    /// goes back to the retry path (commit <c>2ec4f92</c>). A simulation with no limit can never reach that
     /// path. Set this to the same value as the nodes' <c>GrpcMaxMessageBytes</c>. A message over the
     /// limit is dropped and counted in <see cref="OversizedCount"/>.</para>
     ///
@@ -564,7 +564,7 @@ public sealed class SimulatedTransport : ICommunication
     /// decides to send it. The responder serializes it later, when it takes the message off its
     /// queue. The leader's commit path changes <c>log.Type</c> in place on the same objects, so a
     /// responder that runs late sends an entry typed <c>Committed</c> that the follower never saw
-    /// as proposed (<c>367eac9</c>). A held message with a late copy is that responder delay: the
+    /// as proposed (commit <c>367eac9</c>). A held message with a late copy is that responder delay: the
     /// message waits with its references, and the copy happens when it leaves.</para>
     ///
     /// <para>Off by default, because the ordinary copy at send is the ordinary case. It changes
@@ -589,8 +589,8 @@ public sealed class SimulatedTransport : ICommunication
     /// sender does later can reach them. The in-memory transport passes references, so the leader's
     /// in-place <c>log.Type = Committed</c> reached every follower's store directly, and a follower
     /// seemed to hold a committed marker it never wrote. A crash could then never lose a marker,
-    /// and the random search could not find <c>367eac9</c>. A node must never hold an object that
-    /// another node can change.</para>
+    /// and the random search could not find the defect fixed in commit <c>367eac9</c>. A node must
+    /// never hold an object that another node can change.</para>
     ///
     /// <para><b>Why a copy for each delivery.</b> A duplicated message is deserialized once for each
     /// copy in production. The receivers must not share one object, because a receiver can change

@@ -125,7 +125,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B4 regression: a peer advertising a higher (possibly uncommitted) handshake max must NOT
+    /// Regression: a peer advertising a higher (possibly uncommitted) handshake max must NOT
     /// suppress this node's election. The old global <c>AmIOutdatedAsync</c> veto compared the local
     /// WAL max against the maximum ever recorded in the never-pruned <c>startCommitIndexes</c>, so a
     /// peer that once handshook at index 42 and then failed/left permanently blocked every election —
@@ -157,7 +157,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// S5 regression: <c>CompleteAppendLogsAsync</c> must fence a follower ACK on
+    /// Regression: <c>CompleteAppendLogsAsync</c> must fence a follower ACK on
     /// (nodeState == Leader &amp;&amp; responseTerm == currentTerm) BEFORE any mutation. A delayed old-term
     /// ACK must be dropped so it cannot repopulate follower progress / backfill cursors (which could,
     /// e.g., make an outdated follower look transfer-eligible). We observe the fence through
@@ -166,7 +166,7 @@ public class TestRaftPartitionStateMachine
     /// behaviour.
     /// </summary>
     /// <summary>
-    /// B2b regression: durable hard state prevents a double-vote across a restart. A follower grants its
+    /// Regression: durable hard state prevents a double-vote across a restart. A follower grants its
     /// vote to node-b in term 3 (persisted via the WAL). A fresh state machine constructed on the SAME
     /// WAL (simulating a restart) restores that vote and must DENY a different candidate (node-c) in term
     /// 3, while still granting the SAME candidate (node-b) idempotently. Without persisted votedFor, the
@@ -209,7 +209,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B2a regression: a RequestVote carrying a term higher than ours (Raft §5.1) must make a Leader
+    /// Regression: a RequestVote carrying a term higher than ours (Raft §5.1) must make a Leader
     /// step down to Follower and adopt the new term BEFORE granting. Before the fix, the non-follower
     /// guard only rejected the SAME term, so a higher-term vote fell through and was granted while the
     /// node stayed a stale Leader at the old term. Here the candidate's log is fresh, so the vote is
@@ -246,7 +246,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B2a: the higher-term step-down is UNCONDITIONAL (Raft §5.1) — it happens even when we then deny
+    /// The higher-term step-down is UNCONDITIONAL (Raft §5.1) — it happens even when we then deny
     /// the vote on log-freshness grounds. A stale leader must adopt the newer term and become a follower
     /// regardless of whether it votes for that particular candidate.
     /// </summary>
@@ -1106,7 +1106,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B1 regression: a follower that just processed a leader heartbeat must DENY a challenger's
+    /// Regression: a follower that just processed a leader heartbeat must DENY a challenger's
     /// pre-vote, because it still considers that leader fresh. Before the fix the freshness guard read
     /// the leader-side <c>lastActivity</c> table, which a follower never populates (it is written only
     /// when a leader receives a follower ack), so the lookup was always Zero, the guard never fired,
@@ -1148,7 +1148,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B1 (quiesced branch): a quiesced follower suppresses heartbeats by design, so
+    /// Pre-vote freshness, quiesced branch: a quiesced follower suppresses heartbeats by design, so
     /// <c>lastHeartbeat</c> is not a valid freshness signal. It must defer to SWIM — deny a
     /// challenger's pre-vote while the expected leader is Alive, and allow it once the leader becomes
     /// Suspect/Dead. Mirrors the quiesced Follower case of the election trigger.
@@ -1237,7 +1237,7 @@ public class TestRaftPartitionStateMachine
     // ── ElectionTimeoutSeed tests ────────────────────────────────────────────
 
     /// <summary>
-    /// S4: two nodes in the SAME partition with the SAME seed but DIFFERENT node ids must receive
+    /// Two nodes in the SAME partition with the SAME seed but DIFFERENT node ids must receive
     /// DIFFERENT initial election timeouts. Folding the node id into the seed is what breaks a symmetric
     /// split vote — the previous <c>seed ^ partitionId</c> seed gave every node in a partition the
     /// identical sequence, so they would keep retrying in lockstep and never converge (the bug this
@@ -1258,7 +1258,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// S4: reproducibility is preserved per node — same seed + same partition + same node id yields the
+    /// Reproducibility is preserved per node — same seed + same partition + same node id yields the
     /// identical timeout across constructions. The derivation is deterministic (a fixed hash-combine, not
     /// the process-randomised <c>HashCode.Combine</c>), so seeded runs stay repeatable.
     /// </summary>
@@ -1471,14 +1471,14 @@ public class TestRaftPartitionStateMachine
             r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
     }
 
-    // ── B5: lexicographic (lastLogTerm, lastLogIndex) freshness — Raft §5.4.1 ─────────────
+    // ── Lexicographic (lastLogTerm, lastLogIndex) freshness — Raft §5.4.1 ─────────────────
 
     private static List<RaftLog> Tail(params (long Id, long Term)[] entries) =>
         [.. entries.Select(e => new RaftLog { Id = e.Id, Term = e.Term, Type = RaftLogType.Committed })];
 
     /// <summary>
-    /// B5: a real-vote candidate advertising a HIGHER last-log index but an OLDER last-log term must be
-    /// denied — §5.4.1 compares term first, then index. The pre-B5 index-only check granted this, which
+    /// A real-vote candidate advertising a HIGHER last-log index but an OLDER last-log term must be
+    /// denied — §5.4.1 compares term first, then index. The old index-only check granted this, which
     /// could elect a leader missing committed entries (a Leader-Completeness violation).
     /// </summary>
     [Fact]
@@ -1506,7 +1506,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B5: with an EQUAL last-log term the higher index wins the freshness tie, so the candidate is
+    /// With an EQUAL last-log term the higher index wins the freshness tie, so the candidate is
     /// granted. The grant reply advertises our own last-log term for wire symmetry.
     /// </summary>
     [Fact]
@@ -1536,8 +1536,8 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B5 wire compatibility: a candidate that omits the last-log term (peer predating the field →
-    /// <c>remoteLastLogTerm == 0</c>) is compared index-only, exactly the pre-B5 behavior. Here the
+    /// Freshness wire compatibility: a candidate that omits the last-log term (peer predating the field →
+    /// <c>remoteLastLogTerm == 0</c>) is compared index-only, exactly the legacy behavior. Here the
     /// legacy candidate is ahead on index and is granted.
     /// </summary>
     [Fact]
@@ -1564,7 +1564,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B5 wire compatibility: a legacy candidate (omitted last-log term) that is BEHIND on index is still
+    /// Freshness wire compatibility: a legacy candidate (omitted last-log term) that is BEHIND on index is still
     /// denied under the index-only fallback — the fallback must not blindly grant.
     /// </summary>
     [Fact]
@@ -1591,7 +1591,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B5: the same lexicographic rule governs the pre-vote probe — a candidate with a higher index but a
+    /// The same lexicographic rule governs the pre-vote probe — a candidate with a higher index but a
     /// stale last term is not electable, so its pre-vote is denied (no grant reply).
     /// </summary>
     [Fact]
@@ -1616,10 +1616,10 @@ public class TestRaftPartitionStateMachine
         Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
     }
 
-    // ── B3: elapsed-time gates measured on a monotonic clock, not HLC subtraction ─────────
+    // ── Elapsed-time gates measured on a monotonic clock, not HLC subtraction ─────────────
 
     /// <summary>
-    /// B3 repro: a follower whose leader sends a heartbeat stamped ONE HOUR in the future (its clock is
+    /// Repro: a follower whose leader sends a heartbeat stamped ONE HOUR in the future (its clock is
     /// skewed ahead) used to have its election timeout frozen — <c>currentTime - lastHeartbeat</c> read
     /// ≈0 for the whole hour because the local HLC absorbed the future physical time. With the monotonic
     /// clock the follower measures true local elapsed silence and fails over on time, even while the HLC
@@ -1659,14 +1659,14 @@ public class TestRaftPartitionStateMachine
 
         await sm.CheckPartitionLeadershipAsync();
 
-        // The follower timed out on true local elapsed time and launched a pre-vote. Pre-B3 the gate
+        // The follower timed out on true local elapsed time and launched a pre-vote. Under HLC subtraction the gate
         // stayed frozen for the length of the skew and no election ever started.
         Assert.Contains(host.EnqueuedRequests,
             e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.RequestVotes);
     }
 
     /// <summary>
-    /// B3 converse: while real local elapsed time is still under the election timeout the follower must
+    /// Converse: while real local elapsed time is still under the election timeout the follower must
     /// NOT start an election — even if the leader's heartbeat HLC was in the future. Guards against a
     /// monotonic gate that fires too eagerly.
     /// </summary>
@@ -1699,7 +1699,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B3, leader side (DST FINDING 4): the per-peer heartbeat de-dup window must be measured on the
+    /// Leader side: the per-peer heartbeat de-dup window must be measured on the
     /// monotonic clock, never by HLC subtraction. Once a remote message latches the local HLC ahead,
     /// every later local mint keeps the same physical component, so the HLC delta between two rounds
     /// reads ~0 ms for the whole skew. The old skip compared that delta against
@@ -1756,7 +1756,7 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
-    /// B3 converse, leader side: the de-dup window still de-dups. A timer round that fires within
+    /// Converse, leader side: the de-dup window still de-dups. A timer round that fires within
     /// <see cref="RaftConfiguration.RecentHeartbeat"/> of the last send to a peer (possible when
     /// the check-leader tick outpaces <see cref="RaftConfiguration.HeartbeatInterval"/>) skips that
     /// peer, and the round after the window has elapsed reaches it again. Guards against a monotonic
@@ -1961,7 +1961,7 @@ public class TestRaftPartitionStateMachine
         public HybridLogicalClock HybridLogicalClock { get; } = new();
 
         /// <summary>
-        /// B3: injectable monotonic clock. When null the real <see cref="Stopwatch"/> is used (existing
+        /// Injectable monotonic clock. When null the real <see cref="Stopwatch"/> is used (existing
         /// tests behave unchanged). Set it to drive elapsed-time gates deterministically — e.g. to prove a
         /// follower still times out after real local elapsed time even when its HLC was frozen by a
         /// leader's far-future heartbeat.
@@ -2038,7 +2038,7 @@ public class TestRaftPartitionStateMachine
 
         /// <summary>
         /// Optional custom log tail seeded by restore. When null a single (Id=1, Term=1) entry is
-        /// seeded (the historical default). B5 freshness tests set this to control the local node's
+        /// seeded (the historical default). The freshness tests set this to control the local node's
         /// last-log (Id, Term) pair independently — e.g. a short high-term tail versus a long low-term
         /// tail — to exercise the lexicographic §5.4.1 comparison.
         /// </summary>
@@ -2064,7 +2064,7 @@ public class TestRaftPartitionStateMachine
         /// </summary>
         public bool RejectHardStateWrites { get; set; }
 
-        // B2b: route hard state through the inner FakeWAL's metadata store so it survives across
+        // Route hard state through the inner FakeWAL's metadata store so it survives across
         // state-machine instances constructed on the SAME facade (simulating a restart).
         public ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) =>
             ValueTask.FromResult(!RejectHardStateWrites && ((Kommander.WAL.IWAL)wal).PersistHardState(partitionId: 1, currentTerm, votedFor));

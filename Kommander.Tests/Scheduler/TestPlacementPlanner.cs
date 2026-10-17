@@ -29,7 +29,7 @@ public sealed class TestPlacementPlanner
     [Fact]
     public void AssignInitial_SixNodesFourRangesRf3_EvenSpread()
     {
-        // The spec's canonical example: 6 nodes, 4 ranges, RF=3 — each range gets three distinct
+        // The canonical example: 6 nodes, 4 ranges, RF=3 — each range gets three distinct
         // replicas, each node hosts exactly two ranges (12 replicas / 6 nodes), no node hosts all.
         List<CandidateNode> nodes = [.. Enumerable.Range(1, 6).Select(i => Node($"n{i}:1"))];
 

@@ -9,7 +9,7 @@ namespace Kommander.Tests.Simulation;
 /// Snapshot rescue against a real three-node cluster: a follower below the leader's compaction floor
 /// must come back, whatever the application's export does on the first attempt.
 ///
-/// <para><b>Why these exist.</b> Family 12 of the simulation plan. Below the floor, backfill cannot
+/// <para><b>Why these exist.</b> Below the floor, backfill cannot
 /// repair a follower, because the entries it needs are gone, so a snapshot install is the only path
 /// back. That path has its own failure habitat — the transfer is a background task that waits on the
 /// application and on the wire — and a wedge there looks exactly like a healthy cluster with one
@@ -47,8 +47,8 @@ public sealed class TestSnapshotRescueScenarios
     /// <summary>
     /// A hung application export does not strand a follower below the compaction floor.
     ///
-    /// <para><b>The defect this pins.</b> The Caraxes anchor-1 wedge, round 2 (vorpal
-    /// <c>d11fd5f9</c>). The leader escalated correctly and started a transfer. The application's
+    /// <para><b>The defect this pins.</b> The Caraxes anchor-1 wedge, in the form that survived the
+    /// first fix. The leader escalated correctly and started a transfer. The application's
     /// export then never returned, and it ignored cancellation. The transfer task parked forever,
     /// its in-flight guard never released, and every later escalation for that follower was vetoed
     /// in silence. The cluster stayed wedged with one replica below the floor.
@@ -57,9 +57,8 @@ public sealed class TestSnapshotRescueScenarios
     ///
     /// <para><b>Why this is a cluster-level control and not a unit test.</b> A unit test already
     /// asserts that a hung export times out. This scenario asserts the consequence a user sees: the
-    /// follower converges. The simulation plan requires that distinction for a corpus control — a
-    /// control that observes a deleted line instead of a behaviour proves nothing about a running
-    /// cluster.</para>
+    /// follower converges. A corpus control needs that distinction — a control that observes a
+    /// deleted line instead of a behaviour proves nothing about a running cluster.</para>
     ///
     /// <para><b>The shape.</b> The leader's next export is armed to hang, and the victim crashes after
     /// it holds a committed prefix. The survivors write and checkpoint until the leader has compacted
@@ -76,12 +75,12 @@ public sealed class TestSnapshotRescueScenarios
     }
 
     /// <summary>
-    /// The permanent Control A of DST-20: the same rescue, with a receiver that reads the snapshot,
+    /// The permanent negative control for <c>applied-state-agrees</c>: the same rescue, with a receiver that reads the snapshot,
     /// reports success, and imports nothing. Every log check still passes, because the receiver's WAL
     /// boundary moves as it should. Only the application state shows the hole, and the rule
     /// <c>applied-state-agrees</c> must report it.
     ///
-    /// <para>This is the shape of <c>14b564a</c> item 6 (the Kahuna run of Sept 20): the sender logged
+    /// <para>This is the shape a Kahuna run showed: the sender logged
     /// "seeded" and the receiver never imported. Before the simulated snapshot carried real state,
     /// this scenario passed.</para>
     /// </summary>

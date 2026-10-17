@@ -66,8 +66,8 @@ public sealed class SimulationCluster : IAsyncDisposable
     /// <para><b>Why the harness listens to these at all.</b> The library asserts the rules a node
     /// can check on its own — its term never regresses, its frontiers never move backwards — at the
     /// place each value is written, and reacts with a log line and, in a debug build, an exception
-    /// the partition executor catches. Neither reaches a run's verdict. FINDING 5 was such a
-    /// violation: a restarting node's term regressed inside its restore, the executor logged it and
+    /// the partition executor catches. Neither reaches a run's verdict. A real defect once hid this
+    /// way: a restarting node's term regressed inside its restore, the executor logged it and
     /// carried on, and the run failed three hundred steps later with a message about a missing
     /// leader. Recording the reports here lets the invariant runner fail the run on the rule that
     /// actually broke, at the step it broke.</para>

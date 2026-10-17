@@ -422,7 +422,7 @@ internal sealed class ReplicaPlacementService
     }
 
     /// <summary>
-    /// Removes a replica from the range with the two-commit discipline of the spec: first the
+    /// Removes a replica from the range with a two-commit discipline: first the
     /// replica is marked <see cref="RaftReplicaRole.Removing"/> (its vote leaves the quorum
     /// denominator while it still serves), then a second commit drops it from the set entirely —
     /// the departing node observes that final map, drains the partition, and reclaims its WAL.

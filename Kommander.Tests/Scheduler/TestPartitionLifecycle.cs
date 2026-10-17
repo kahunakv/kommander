@@ -12,7 +12,7 @@ using Google.Protobuf;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Deterministic lifecycle tests for CreatePartition / RemovePartition (Tasks 2.5 / 2.6).
+/// Deterministic lifecycle tests for CreatePartition / RemovePartition.
 ///
 /// Abstract base runs against all three WAL backends (InMemory, SQLite, RocksDB) via
 /// concrete subclasses at the bottom of the file.

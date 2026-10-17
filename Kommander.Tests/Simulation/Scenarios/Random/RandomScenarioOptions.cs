@@ -110,10 +110,10 @@ public sealed record RandomScenarioOptions
     ///
     /// <para><b>Why the sweeping runs do not lower it.</b> At a cadence of eight, roughly one run in
     /// eight ends with a follower holding durable entries above a presence gap and a committed
-    /// frontier of zero, unrepaired after forty-five seconds of simulated time. That is recorded as
-    /// an open finding rather than absorbed here: leaving the aggressive cadence on would leave the
-    /// standing test set red, and raising it hides the state. The finding carries the exact setting
-    /// that reproduces it.</para>
+    /// frontier of zero, unrepaired after forty-five seconds of simulated time. That is left as
+    /// an open question rather than absorbed here: leaving the aggressive cadence on would leave the
+    /// standing test set red, and raising it hides the state. A cadence of eight reproduces
+    /// it.</para>
     /// </summary>
     public int CompactEveryOperations { get; init; } = 10_000;
 
@@ -152,7 +152,7 @@ public sealed record RandomScenarioOptions
     /// Turns quiescence on for every node, with <see cref="QuiesceAfterMs"/> as its idle window, and
     /// turns on the harness's SWIM model (<c>SimulationClusterOptions.ModelSwimLiveness</c>) with it.
     ///
-    /// <para>Production ships quiescence on, and the Kahuna lost-write bug (<c>39bf62e2</c>) was a
+    /// <para>Production ships quiescence on, and the Kahuna lost-write bug was a
     /// quiesced leader that never stepped down. The other families run with it off, so that whole
     /// class was outside the search. A quiesced follower relies on SWIM to notice a dead leader, and
     /// the harness drives no SWIM probes, so quiescence without the model would report the missing

@@ -52,7 +52,7 @@ public sealed class TestKommanderServerBindingPolicy
             KommanderServerBindingPolicy.ResolveBindAddress("172.20.0.2"));
     }
 
-    // ---- C1: unauthenticated network exposure -------------------------------------------------
+    // ---- Unauthenticated network exposure -----------------------------------------------------
 
     /// <summary>
     /// The finding itself: stock flags (auth Disabled) plus a wildcard bind exposed every Raft
@@ -127,7 +127,7 @@ public sealed class TestKommanderServerBindingPolicy
             RaftNodeAuthenticationMode.SharedSecret, IPAddress.Any));
     }
 
-    // ---- H3: mTLS trust anchors ---------------------------------------------------------------
+    // ---- mTLS trust anchors -------------------------------------------------------------------
 
     /// <summary>
     /// With no allow-list, the TLS layer accepts every certificate (by design, so self-signed
@@ -190,7 +190,7 @@ public sealed class TestKommanderServerBindingPolicy
         KommanderServerBindingPolicy.ValidateMutualTlsTrustAnchors(mode, []);
     }
 
-    // ---- H4: cleartext listener ---------------------------------------------------------------
+    // ---- Cleartext listener -------------------------------------------------------------------
 
     /// <summary>
     /// A plaintext port has no handshake and therefore no peer certificate, so pairing one with mTLS
@@ -225,7 +225,7 @@ public sealed class TestKommanderServerBindingPolicy
     }
 
     /// <summary>
-    /// The core of H4: TLS configured must not imply a cleartext port as well.
+    /// The core of the cleartext-listener rule: TLS configured must not imply a cleartext port as well.
     /// </summary>
     [Fact]
     public void ShouldBindPlaintextListener_IsFalse_WhenTlsConfiguredWithoutOptIn()

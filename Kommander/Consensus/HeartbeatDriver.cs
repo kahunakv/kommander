@@ -164,7 +164,7 @@ internal sealed class HeartbeatDriver
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
-            // B3: the per-peer de-dup window is measured on the monotonic clock, like every other
+            // The per-peer de-dup window is measured on the monotonic clock, like every other
             // elapsed-time gate. It used to subtract HLC timestamps, and HLC subtraction reads
             // only the physical component — which latches to the highest timestamp any peer has
             // ever sent. After one skewed message, two local mints differ by ~0 ms for the whole
@@ -172,7 +172,7 @@ internal sealed class HeartbeatDriver
             // sending heartbeats (and with them the ONLY repair path — see the class summary) to
             // every peer of every non-system partition until the wall clock caught up. Followers
             // meanwhile starved on their (monotonic) election timers, so the same latch produced
-            // both a stranded-hole leader and gratuitous elections (DST FINDING 4).
+            // both a stranded-hole leader and gratuitous elections.
             // Strictly-less: a zero window disables the de-dup entirely (elapsed is never
             // negative), which is what harnesses that drive rounds back-to-back rely on.
             if (host.PartitionId != RaftSystemConfig.SystemPartition && !force
@@ -274,8 +274,7 @@ internal sealed class HeartbeatDriver
                 && (coreState.LocalCommittedIndex >= 0 || mismatchNote)
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed || mismatchNote);
 
-            // DIAGNOSTIC (the numbered findings live in the Jepsen harness
-            // repository at ~/kommander-jepsen/FINDINGS.md, not in this one): records every input to
+            // DIAGNOSTIC: records every input to
             // the decision above, so a run in which replicas stop advancing can be read for *why*
             // the leader sent nothing rather than inferred from its silence. `followerMaxLog` is the
             // interesting one — it is the leader's belief about the peer, and every trigger here is
@@ -349,7 +348,7 @@ internal sealed class HeartbeatDriver
     /// tail: the barrier that would commit it cannot gather quorum while the peers withhold their
     /// acks over the hole. Anchoring at the commit frontier then re-ships the same
     /// <see cref="RaftConfiguration.MaxBackfillEntriesPerRound"/> entries above it on every beat,
-    /// which the peer already holds, and never reaches the hole. CamusDB Caraxes fault soak fs4 did
+    /// which the peer already holds, and never reaches the hole. A CamusDB Caraxes fault soak did
     /// exactly this: the frontier was pinned at 48,266,275, the peers were contiguous through
     /// 48,266,403, and the leader re-shipped 48,266,276..48,266,403 627 times. Every barrier timed
     /// out, and the partition had no leader for 59 minutes.</para>
@@ -422,7 +421,7 @@ internal sealed class HeartbeatDriver
     ///   lowered to this leader's own durable commit frontier + 1 when that is the lower of the two.
     ///   Followers hold their compaction there, so the log a lagging replica needs survives a leader
     ///   change: only the leader held it before, and a successor that had been a follower had
-    ///   compacted to its checkpoint (CamusDB fault soak rl5 — a replica 100,000 entries behind,
+    ///   compacted to its checkpoint (a CamusDB fault soak — a replica 100,000 entries behind,
     ///   served by backfill until the leader stepped down on a disk stall, then re-seeded by
     ///   snapshot by a successor whose log began at the checkpoint). The leader's own frontier is in
     ///   it because the leader is the replica a kill or a stall takes out, and its disk can be
@@ -495,13 +494,13 @@ internal sealed class HeartbeatDriver
             // Two things are deliberately NOT used. The "known remote max": rejection acks (a
             // saturated WAL, a LogMismatch) report the peer's RAW max log id, above any hole the
             // rejections left, and a floor computed from it compacted exactly the range the peer's
-            // backfill needed (CamusDB runs sd4/sd5: anchored at 5551997, first available 5738747).
+            // backfill needed (CamusDB slow-disk runs: anchored at 5551997, first available 5738747).
             // And, when a durable report exists, the protocol frontier: a follower advances it when an
             // append is merely QUEUED for its storage engine, so a follower whose disk had stopped
             // answering kept reporting a frontier at the leader's commit for every entry it could not
             // yet write; the floor followed, compaction ran to the checkpoint, and 16 s into the pause
             // the follower's real position was 205,000 entries below the first retained entry — refused,
-            // escalated to a snapshot, OOM-killed on the install (CamusDB run sd8, camus3).
+            // escalated to a snapshot, OOM-killed on the install (a CamusDB slow-disk run).
             long position;
             if (!tracker.TryGetDurableFrontier(node.Endpoint, out position) || position <= 0)
             {
@@ -697,7 +696,7 @@ internal sealed class HeartbeatDriver
         }
     }
 
-    // B3: monotonic local-clock shadows of the HLC duration anchors above. Every elapsed-time GATE
+    // Monotonic local-clock shadows of the HLC duration anchors above. Every elapsed-time GATE
     // (follower election timeout, leader heartbeat interval, voting timeout, quiesce-after, votation
     // back-off, the pre-vote "is our leader still fresh" check) measures against these ticks instead of
     // subtracting HLC timestamps — HLC subtraction is frozen by a remote peer's clock skew and stalls

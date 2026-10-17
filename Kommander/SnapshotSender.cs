@@ -34,7 +34,7 @@ namespace Kommander;
 /// <para><b>Convergence breaker:</b> the failure controls above only fire on FAILING transfers. A
 /// rescue loop in which every install succeeds but the follower returns below the compaction
 /// floor before the next heartbeat is invisible to all of them, and it re-runs an unbounded-cost
-/// export on a fixed cadence forever — the Caraxes <c>bank-optimistic-45m-p</c> leader ran 29
+/// export on a fixed cadence forever — a Caraxes leader ran 29
 /// such exports in 15 minutes and died of memory exhaustion. Consecutive install→re-escalation
 /// cycles are therefore counted per follower (<see cref="RescueCycleState"/>); after
 /// <see cref="RaftConfiguration.SnapshotRescueMaxConsecutiveCycles"/> of them the breaker trips:
@@ -59,7 +59,7 @@ namespace Kommander;
 /// partition on a busy disk missed the deadline every time: the attempt was recorded as a rejected
 /// last chunk, and the retry exported the partition again at a newer index while the follower was
 /// still importing the first one — six exports in four minutes, and a follower that ran out of
-/// memory under the copies (CamusDB fault soak rl5).</para>
+/// memory under the copies (a CamusDB fault soak).</para>
 ///
 /// <para><b>A retry resumes.</b> Every attempt asks the follower, before exporting anything, whether
 /// an install of the partition is already queued or running there — this leader's earlier attempt,

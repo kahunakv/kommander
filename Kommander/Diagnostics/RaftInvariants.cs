@@ -64,7 +64,7 @@ public static class RaftInvariants
     /// without parsing its own logger. The simulation harness learned this the hard way: a
     /// <see cref="TermMonotonic"/> violation on a restarting node was logged at Error, swallowed by
     /// the executor, and the run went on to fail hundreds of steps later with a message about a
-    /// missing leader (DST FINDING 5). Subscribers see the report before the policy throws, so a
+    /// missing leader. Subscribers see the report before the policy throws, so a
     /// run fails on the rule that broke rather than on its distant consequence.</para>
     ///
     /// <para>Process-wide, like <see cref="Policy"/>. A subscriber that hosts several clusters

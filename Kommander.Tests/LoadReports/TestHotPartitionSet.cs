@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.LoadReports;
 
 /// <summary>
-/// Manager-level tests for the Phase 2 hot-partition set: verifies that
+/// Manager-level tests for the hot-partition set: verifies that
 /// <list type="bullet">
 ///   <item>a newly created partition enters the hot set,</item>
 ///   <item>a quiesced partition leaves the hot set (quiesce callback → MarkPartitionCool),</item>
@@ -34,7 +34,7 @@ public sealed class TestHotPartitionSet
             Host = "localhost",
             Port = 9100,
             InitialPartitions = 0,
-            EnableSharedExecutorPool = true,   // Phase 2 hot-set is gated on this
+            EnableSharedExecutorPool = true,   // the hot set is gated on this
             EnableQuiescence = false,           // not needed; we drive quiesce directly
             CheckLeaderInterval = TimeSpan.FromMilliseconds(250),
             UpdateNodesInterval = TimeSpan.FromMilliseconds(5000),
@@ -153,7 +153,7 @@ public sealed class TestHotPartitionSet
     /// <summary>
     /// Remove eviction path: RemovePartition clears the entry from both manager.Partitions
     /// and _hotPartitions atomically so no stale reference remains.
-    /// This is the regression test for Finding 1: before the fix, manager.Partitions.TryRemove
+    /// Regression: before the fix, manager.Partitions.TryRemove
     /// was called without touching _hotPartitions, leaving a stopped executor in the hot set.
     /// </summary>
     [Fact]
@@ -182,7 +182,7 @@ public sealed class TestHotPartitionSet
 
     /// <summary>
     /// End-to-end: after a partition is removed via RemovePartition, TriggerCheckLeader
-    /// on the next normal-interval tick must not throw.  Before the Finding 1 fix, a stopped
+    /// on the next normal-interval tick must not throw.  Before the remove-eviction fix, a stopped
     /// executor still in _hotPartitions would have caused an InvalidOperationException inside
     /// the foreach, silently aborting the sweep for all survivors that follow it.
     /// </summary>

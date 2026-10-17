@@ -129,7 +129,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
     // ── Persisted compaction floor (logical deletion of the compacted prefix) ────────────────────
     //
-    // Field finding (2026-09-10 write probes w2–w4 and the eight tuning arms): after the commit
+    // Field finding (2026-09-10 write probes and tuning experiments): after the commit
     // frontier removed the second full-payload write, the Raft log still paid one full compaction
     // rewrite per flushed byte, and no memtable/L0 sizing changed it. The cause is the range
     // tombstone itself. A tombstone written by the compaction pass covers keys that live in OLDER
@@ -369,7 +369,7 @@ public class RocksDbWAL : IWAL, IDisposable
         // readers. RocksDB's default (cache_index_and_filter_blocks = false) keeps them outside every
         // budget, resident per open SST, so they grow with the engine's live SST bytes and no cache
         // size bounds them: measured at ~8.9% of live SST bytes on this WAL's shape (3.0 MB of table
-        // readers per 33.5 MB of SST), which at soak scale is gigabytes. CamusDB's Phase 5 fault soaks
+        // readers per 33.5 MB of SST), which at soak scale is gigabytes. CamusDB's fault soaks
         // lost two nodes to container OOM with ~3 GB of native memory per node that a 768 MiB shared
         // budget did not touch; this is the allocation that was missing from the budget.
         //
@@ -846,7 +846,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>
     /// Total SST files in the bottom level (L6) across the shard CFs, fed to
     /// <c>raft.wal.shard_l6_files</c>. On the append-then-delete log this is the count that stayed
-    /// flat at ~12 files / 844 MB through write probe w3 while the data below the floor was dead —
+    /// flat at ~12 files / 844 MB through a write probe while the data below the floor was dead —
     /// the signal that whole-file drops were not landing.
     /// </summary>
     internal long GetShardLevel6FileCount() => SumShardProperty("rocksdb.num-files-at-level6");
@@ -871,8 +871,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// so index and filter blocks are charged to the shared block cache and this figure stays small.
     /// Without one the CFs keep RocksDB's default of false: the blocks are pinned in the table
     /// readers for every open SST, bounded by nothing, and grow with live SST bytes — measured at
-    /// ~8.9% of them on this WAL's shape. That is how it was found (CamusDB Phase 5 fault soaks
-    /// fs1/fs2: ~3 GB of native memory per node that a 768 MiB shared budget did not move, because
+    /// ~8.9% of them on this WAL's shape. That is how it was found (CamusDB fault soaks:
+    /// ~3 GB of native memory per node that a 768 MiB shared budget did not move, because
     /// at the time this allocation was outside the budget on both paths).</para>
     ///
     /// <para>Read it next to <see cref="GetBlockCacheUsageBytes"/> and
@@ -2516,8 +2516,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// Reads the persisted last-checkpoint id for <paramref name="partitionId"/> as an O(1) point lookup
     /// in the metadata CF. Returns <c>-1</c> when no checkpoint has ever been recorded for the partition
     /// (fresh partition, or one whose recorded checkpoint was truncated away). This is the authoritative
-    /// source — there is no reverse-scan fallback (see the feature spec: backwards compatibility is out of
-    /// scope, the key is maintained atomically with every checkpoint mutation).
+    /// source — there is no reverse-scan fallback (backwards compatibility with stores that predate the
+    /// key is out of scope, and the key is maintained atomically with every checkpoint mutation).
     /// </summary>
     private long GetLastCheckpointFromMeta(int partitionId)
     {
@@ -4113,7 +4113,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// larger) background pool headroom before a slowdown. The write-buffer sizing widens the
     /// flush unit so an entry and the range tombstone that kills it co-reside and are dropped at
     /// flush — the CF-sizing lever against the compaction rewrite of floor-held entries measured
-    /// in probe w2 (compaction wrote 3.7x the flushed bytes). All values come from
+    /// in a write probe (compaction wrote 3.7x the flushed bytes). All values come from
     /// <see cref="RocksDbWalTuning"/>, which documents the reasoning and the memory envelope.
     /// </summary>
     private static ColumnFamilyOptions ApplyShardCfOptions(

@@ -459,7 +459,7 @@ public sealed class TestNodeLifecycleScenarios
     ///
     /// <para>The committed frontier is the condition, not the stored log. A node can hold an entry
     /// over a hole below it, which satisfies a max-log test while its frontier honestly stays where
-    /// the hole starts — the exact state DST FINDING 1 described. Waiting on the log would let a
+    /// the hole starts — the exact state of the stranded-replica defect. Waiting on the log would let a
     /// scenario declare convergence and then fail its own convergence check.</para>
     /// </summary>
     private static async Task ConvergeAsync(

@@ -162,7 +162,7 @@ public class TestBackfillRefusalEscalation
     // ── A no-report ack must not fabricate progress ──────────────────────────
 
     /// <summary>
-    /// The "anchored at 1" producer, minimized (Caraxes run E, task 1). The legacy two-fsync
+    /// The "anchored at 1" producer seen in Caraxes, minimized. The legacy two-fsync
     /// heartbeat ack reports committedIndex = -1: "no frontier report", not a position. Right
     /// after an election win the optimistic seed holds matchIndex = 0; feeding the -1 through the
     /// progress math left newMatchIndex at 0, set nextIndex to 1, and the eager fast path shipped

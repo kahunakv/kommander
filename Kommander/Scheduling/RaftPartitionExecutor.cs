@@ -1497,7 +1497,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             // votes are dropped and client reads are refused, while appends are still acked and the
             // election path still runs on a term and a vote record that were never loaded. That is
             // worse than a stopped partition in every way that matters — it looks alive to its
-            // peers and is invisible to whoever asks it for its state (DST FINDING 5). Stopping
+            // peers and is invisible to whoever asks it for its state. Stopping
             // makes every later post fail loudly instead.
             if (request.Type == RaftRequestType.RestoreLogsLoaded)
             {

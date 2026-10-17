@@ -160,8 +160,8 @@ internal sealed class LogReplicator
         // proposals so the leader's last index holds still and the target can reach it. The
         // proposal is PARKED, not refused: this node still publishes itself as leader, so a
         // NodeIsNotLeader answer here would be a contradiction its callers act on immediately (a
-        // re-drive that lands right back here, for the whole wait — the lt3 retry storm). Parked
-        // proposals are answered NodeIsNotLeader only once the handover has published the leader
+        // re-drive that lands right back here, for the whole wait — a retry storm seen under load).
+        // Parked proposals are answered NodeIsNotLeader only once the handover has published the leader
         // change, or re-admitted in arrival order if the wait expires with this node still leading.
         // The executor's client-queue cap bounds what can be parked; past it, ProposalQueueFull is
         // the truthful admission-control answer.
@@ -178,7 +178,7 @@ internal sealed class LogReplicator
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.LastProposalAt = currentTime;
-        coreState.LastProposalAtTicks = nowTicks; // B3: quiesce-after measured on monotonic clock
+        coreState.LastProposalAtTicks = nowTicks; // quiesce-after measured on monotonic clock
         coreState.SetQuiesced(false); // un-quiesce on new proposal: resume normal heartbeating
 
         // Try to clear and reuse settled proposals. Only worth scanning once a few have accumulated;

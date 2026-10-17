@@ -346,8 +346,8 @@ internal sealed class ElectionCoordinator
     /// ago AND no leader has been heard since.
     /// <para><b>Why the leader-contact release.</b> The cooldown covers one window: between a grant
     /// and the elected leader's first append, when the voter's timer alone would let it campaign
-    /// against the candidate it just backed (the vote's fsync on a loaded disk spans several ticks —
-    /// feature b4176e8e). Once a leader has been heard, that window is closed and the standard Raft
+    /// against the candidate it just backed (the vote's fsync on a loaded disk spans several
+    /// ticks). Once a leader has been heard, that window is closed and the standard Raft
     /// rule applies: one election timeout of silence since the last heartbeat. Keeping the cooldown
     /// in force past the first contact made elections unfair. A leader that won, sent its barrier
     /// and stepped down inside its voters' cooldown (check-quorum, ~125 ms) had its own, shorter
@@ -358,7 +358,7 @@ internal sealed class ElectionCoordinator
     /// the short-lived leader campaigns one timeout after its last append — before the deposed
     /// leader's 2 × timeout cooldown ends — and the fs11 anchoring (no leader heard between grants)
     /// keeps working unchanged, because it is exactly the no-contact case.</para>
-    /// <para>Measured on the monotonic clock (B3): both anchors are local ticks. The contact tick
+    /// <para>Measured on the monotonic clock: both anchors are local ticks. The contact tick
     /// must be strictly later than the anchor — a step-down stamps the anchor after any contact it
     /// had, and a grant precedes the append it produces.</para>
     /// </summary>
@@ -493,7 +493,7 @@ internal sealed class ElectionCoordinator
 
         await host.InvokeLeaderChanged(host.PartitionId, "");
 
-        // B2b: durably record the new term and our self-vote BEFORE adopting either in memory and before
+        // Durably record the new term and our self-vote BEFORE adopting either in memory and before
         // soliciting votes (see the same call in ForceLeaderForTestingAsync for rationale). Persisted
         // first so a rejected write leaves nothing to undo. On a full disk (field incident 2026-09-01)
         // the write fails on every attempt; a term bumped in memory without a durable self-vote could
@@ -782,7 +782,7 @@ internal sealed class ElectionCoordinator
                 else if (coreState.LastHeartbeatTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastHeartbeatTicks, host.GetMonotonicTimestamp()) < coreState.ElectionTimeout))
                 {
                     // Not quiesced: a recent heartbeat from our leader means it is still live to us.
-                    // B3: measured as local elapsed time since we last heard from the leader (monotonic),
+                    // Measured as local elapsed time since we last heard from the leader (monotonic),
                     // NOT `incomingRequest.timestamp - coreState.LastHeartbeat` — that subtracted a remote HLC from a
                     // local one and inherited the challenger's clock skew, which could make a stale
                     // heartbeat look fresh (or vice-versa). "How long we've been without a heartbeat" is a
@@ -846,7 +846,7 @@ internal sealed class ElectionCoordinator
         // Raft §5.1: a RequestVote carrying a term higher than ours makes us adopt that term
         // REGARDLESS of our current state. The adoption is what arms the `coreState.CurrentTerm > leaderTerm`
         // fence in AppendLogsCoreAsync against a deposed leader still replicating at its old term.
-        // Gating adoption on `coreState.NodeState != Follower` (the original B2a scope) left a hole: a FOLLOWER
+        // Gating adoption on `coreState.NodeState != Follower` (an earlier version) left a hole: a FOLLOWER
         // that granted a higher-term vote kept its in-memory term at the old value and went on ACKing
         // the deposed leader's appends — handing it a phantom quorum that kept committing acknowledged
         // writes the new leader then overwrote (observed as a Jepsen linearizability violation; the
@@ -885,7 +885,7 @@ internal sealed class ElectionCoordinator
             if (stepDown)
                 await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
-            // B2b: the higher term is adopted here even if we go on to DENY this candidate below (on
+            // The higher term is adopted here even if we go on to DENY this candidate below (on
             // log-freshness), so persist it now with no vote yet — otherwise a crash after step-down but
             // before any log write would regress the term on restart. A grant below overwrites votedFor.
             // A rejected write is tolerated: the term stays adopted in memory, and a crash may regress it,
@@ -920,7 +920,7 @@ internal sealed class ElectionCoordinator
             return;
         }
         
-        // B2b: durably record who we voted for in this term BEFORE replying, so a crash right after the
+        // Durably record who we voted for in this term BEFORE replying, so a crash right after the
         // reply cannot let us grant a different candidate in the same term after restart (the double-vote
         // that would let two leaders be elected for one term). The term persisted is voteTerm — the term we
         // are voting in, which is >= coreState.CurrentTerm here. Persisted before any in-memory grant
@@ -1039,7 +1039,7 @@ internal sealed class ElectionCoordinator
 
         RandomizeElectionTimeout();
 
-        // B3: both duration shadows are local elapsed intervals → monotonic.
+        // Both duration shadows are local elapsed intervals → monotonic.
         long grantTicks = host.GetMonotonicTimestamp();
         bool previousGrantProducedNoLeader = lastGrantTicks != 0 && coreState.LastHeartbeatTicks <= lastGrantTicks;
 

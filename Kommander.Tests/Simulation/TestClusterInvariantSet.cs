@@ -312,7 +312,7 @@ public sealed class TestClusterInvariantSet
     }
 
     /// <summary>
-    /// The <c>681cf397</c> end state: the leader of the highest term lacks an entry the cluster
+    /// The straddling-voter end state: the leader of the highest term lacks an entry the cluster
     /// committed, at an index above its own commit index. The committed-window check cannot see it.
     /// </summary>
     [Fact]
@@ -519,8 +519,8 @@ public sealed class TestClusterInvariantSet
     // ── Committed prefix present ──────────────────────────────────────────
 
     /// <summary>
-    /// A node committed past an id it does not hold. This is the per-step form of the state DST
-    /// FINDING 1 reached, which until now only the run-level convergence check could see.
+    /// A node committed past an id it does not hold. This is the per-step form of the state the
+    /// stranded-replica defect reached, which until now only the run-level convergence check could see.
     /// </summary>
     [Fact]
     public void CommittedPrefixPresent_FiresOnAHoleBelowTheFrontier()
@@ -660,7 +660,7 @@ public sealed class TestClusterInvariantSet
 
     /// <summary>
     /// A node whose head is absent but whose frontier stays below it is legal, and this is the state
-    /// DST FINDING 1 reached. It is a stranded replica, not a lying one — which is exactly why no
+    /// the stranded-replica defect reached. It is a stranded replica, not a lying one — which is exactly why no
     /// per-node rule caught that defect and the run-level convergence check did.
     /// </summary>
     [Fact]

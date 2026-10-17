@@ -15,7 +15,7 @@ namespace Kommander.Tests.Scheduling;
 /// <see cref="SnapshotReceiver"/>: a leader state machine whose host delivers every chunk and every
 /// status question to the receiver, and an install callback the test holds open.
 ///
-/// <para>The loop these pin shut (CamusDB fault soaks rl4b and rl5): the terminal chunk's call was
+/// <para>The loop these pin shut (seen in CamusDB fault soaks): the terminal chunk's call was
 /// held open for the install and expired after <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>;
 /// the sender recorded a rejected last chunk; the next refused backfill escalated at the leader's
 /// newer checkpoint, exported the partition again and opened a new session on a follower that was

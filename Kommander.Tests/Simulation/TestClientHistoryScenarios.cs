@@ -168,10 +168,10 @@ public sealed class TestClientHistoryScenarios
     /// A leader cut off from the majority refuses a read after another node led and acknowledged a
     /// write.
     ///
-    /// <para><b>Why.</b> The Jepsen <c>register / partition</c> violation behind <c>bf275e4a</c>: the cut
-    /// leader still believes it leads, and a read gated on that belief returns state without the new
-    /// write. The read index makes the node prove its leadership with a quorum round, which it cannot
-    /// do while cut off, so the correct answer is a refusal. The read rules run before the outcome is
+    /// <para><b>Why.</b> The Jepsen <c>register / partition</c> violation: the cut leader still
+    /// believes it leads, and a read gated on that belief returns state without the new write. The
+    /// read index makes the node prove its leadership with a quorum round, which it cannot do while
+    /// cut off, so the correct answer is a refusal. The read rules run before the outcome is
     /// asserted, so a build that serves the read fails on the rule that names the stale read.</para>
     ///
     /// <para>The leader serves one read before the cut. Measured: without it, a leader whose

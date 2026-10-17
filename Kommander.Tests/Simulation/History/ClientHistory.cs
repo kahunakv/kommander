@@ -8,8 +8,8 @@ namespace Kommander.Tests.Simulation.History;
 ///
 /// <para><b>Why this exists at all.</b> Every per-step invariant reads node state. None of them can
 /// see what a client was told, and a node whose own state is perfectly consistent can still have
-/// answered a client wrongly. DST FINDING 1 made the point from the other side: the stranded replica
-/// broke no per-node rule because it never claimed the entry it was missing. A node that is honest
+/// answered a client wrongly. The first defect the harness found made the point from the other
+/// side: a stranded replica broke no per-node rule because it never claimed the entry it was missing. A node that is honest
 /// about being behind is invisible to state checks, and a node that is dishonest to a client is
 /// invisible to them too.</para>
 ///
@@ -92,8 +92,8 @@ public sealed class ClientHistory
     /// returned true.
     ///
     /// <para><b>Why one call for the leader and the follower.</b> On the leader the call is the
-    /// read-index confirmation (<c>bf275e4a</c>); on any other node it fetches a confirmed read index
-    /// from the leader and waits for the local applied frontier (<c>d2914727</c>). Both promise the
+    /// read-index confirmation; on any other node it fetches a confirmed read index from the leader
+    /// and waits for the local applied frontier. Both promise the
     /// same thing: the state read afterwards holds every write acknowledged before the call.</para>
     ///
     /// <para><b>The state is copied in the continuation of the confirmation.</b> That is the closest

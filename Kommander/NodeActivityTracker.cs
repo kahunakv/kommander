@@ -30,7 +30,7 @@ namespace Kommander;
 /// <para>The last-heartbeat-sent table that used to live beside this one moved to the
 /// per-partition <c>ReplicationTracker</c> as monotonic ticks: its only reader was the
 /// heartbeat de-dup skip, and comparing HLC timestamps against a wall-clock window there
-/// silenced heartbeats for the length of any received clock skew (DST FINDING 4).</para>
+/// silenced heartbeats for the length of any received clock skew.</para>
 /// </summary>
 internal sealed class NodeActivityTracker
 {

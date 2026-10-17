@@ -5,9 +5,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.MicroBenchmarks;
 
 /// <summary>
-/// Benchmarks bytes/read for <see cref="FairReadScheduler"/> enqueues (spec <c>6385886f</c> task
-/// M3). The two "new" benchmarks run through the REAL scheduler (workers, per-partition queue,
-/// fairness dispatch), so their bytes include amortized queue costs.
+/// Benchmarks bytes/read for <see cref="FairReadScheduler"/> enqueues. The two "new" benchmarks
+/// run through the REAL scheduler (workers, per-partition queue, fairness dispatch), so their
+/// bytes include amortized queue costs.
 ///
 /// <para>Expected signal per read:</para>
 /// <list type="bullet">

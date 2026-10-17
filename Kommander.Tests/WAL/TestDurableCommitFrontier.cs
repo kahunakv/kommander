@@ -25,7 +25,7 @@ namespace Kommander.Tests.WAL;
 public sealed class TestDurableCommitFrontier
 {
     /// <summary>
-    /// The core case from the finding: a resolved entry the disk never took is never published,
+    /// The core case: a resolved entry the disk never took is never published,
     /// and the failed-write repair that lowers the protocol frontier leaves the published one alone.
     /// </summary>
     [Fact]

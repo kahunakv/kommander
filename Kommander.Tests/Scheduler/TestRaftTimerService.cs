@@ -288,7 +288,7 @@ public sealed class TestRaftTimerService
         Assert.Equal(2, callCount);
     }
 
-    // ── Phase 2 hot-set tests ──────────────────────────────────────────────
+    // ── Hot-set tests ──────────────────────────────────────────────────────
 
     /// <summary>
     /// Minimal IRaftTimerHost that counts how many times GetUserPartitions (full sweep)

@@ -280,7 +280,7 @@ public sealed class ClusterInvariantRunner
     /// <para><b>Why this rule and not a lost write.</b> One leader per term is never broken by a
     /// stale leader, and the stale leader cannot commit, so no log check sees it. The harm is
     /// outside the log: a consumer that acts on the belief of leadership (Kahuna's actor-only
-    /// mutations, <c>39bf62e2</c>) acts twice. Check-quorum exists to bound that belief, and the
+    /// mutations) acts twice. Check-quorum exists to bound that belief, and the
     /// bound is time, so the rule measures time. The quiesced-leader defect fixed in
     /// <c>14b564a</c> kept the belief for the whole length of a network cut.</para>
     ///

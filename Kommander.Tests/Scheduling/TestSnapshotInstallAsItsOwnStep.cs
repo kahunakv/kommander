@@ -16,7 +16,7 @@ namespace Kommander.Tests.Scheduling;
 /// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>, and a large partition on a busy disk
 /// missed that deadline every time. The sender read the expired call as a rejected last chunk and
 /// exported the partition again at a newer index, and the receiver staged that second snapshot beside
-/// the first while the first was still being imported (CamusDB fault soaks rl4b and rl5).</para>
+/// the first while the first was still being imported (seen in CamusDB fault soaks).</para>
 ///
 /// <para>The receiver is built in isolation with an install callback the test holds open, so "an
 /// install is running" is a state the test controls, not a race it hopes to hit.</para>

@@ -8,8 +8,7 @@ namespace Kommander.Tests.Simulation;
 /// <summary>
 /// Backfill at the leader's compaction floor, against a real three-node cluster.
 ///
-/// <para><b>Why these exist.</b> Family 11 of the simulation plan, and DST FINDING 6 (vorpal
-/// <c>8176b8e2</c>). A follower whose committed frontier is exactly one below the leader's first
+/// <para><b>Why these exist.</b> The random search found a real defect here. A follower whose committed frontier is exactly one below the leader's first
 /// retained entry is not below the floor: the leader still holds every entry the follower needs, so
 /// ordinary backfill must repair it and no snapshot is involved. But the entry the batch is anchored
 /// on — the follower's frontier — is the one entry the leader compacted. The leader cannot read its
@@ -38,7 +37,7 @@ public sealed class TestCompactionFloorBackfillScenarios
     /// A live follower held by the retention floor is repaired by backfill once its disk recovers,
     /// with no client write.
     ///
-    /// <para><b>The defect this pins (FINDING 6).</b> The live-replica retention hold keeps entries
+    /// <para><b>The defect this pins.</b> The live-replica retention hold keeps entries
     /// from the follower's position + 1, so compaction deletes the entry at the position itself.
     /// The backfill batch starts at position + 1 and is anchored on the position, whose term the
     /// leader can no longer read, so it ships a previous term of -1. The follower holds that entry
@@ -81,7 +80,7 @@ public sealed class TestCompactionFloorBackfillScenarios
         // A checkpoint last, so the follower's newest resolution is on disk. Its commit row is a
         // CommittedCheckpoint, which the scheduler always writes with an fsync, and that fsync also
         // carries the markers before it. Without it the last Committed marker can still ride
-        // sync-off, the follower then reports one entry less than it has committed (DST FINDING 7),
+        // sync-off, the follower then reports one entry less than it has committed,
         // the leader keeps that entry, and the backfill is anchored on a retained entry instead of
         // a compacted one — the shape below is never reached.
         await CheckpointAsync(cluster, leader, cancellationToken);
@@ -156,11 +155,11 @@ public sealed class TestCompactionFloorBackfillScenarios
     /// commits it. The new leader commits a different entry at N and compacts past N while the old
     /// leader is away. After the heal, the old leader holds N in its old term, above its commit
     /// frontier of N - 1. The new leader's first retained entry is above N, so its backfill is
-    /// anchored on N with a previous term of -1, and the FINDING 6 rule accepts such an anchor only
-    /// inside the follower's committed prefix. N is not in it, so the follower refuses.</para>
+    /// anchored on N with a previous term of -1, and a follower accepts such an anchor only inside
+    /// its committed prefix. N is not in it, so the follower refuses.</para>
     ///
-    /// <para><b>Why this is the FINDING 7 liveness backstop.</b> FINDING 7 was one way to reach a
-    /// refused -1 anchor; its fix removed that producer. This is another one, and it needs no
+    /// <para><b>Why this is a liveness backstop.</b> A follower that reported sync-off markers as
+    /// durable was once a way to reach a refused -1 anchor; its fix removed that producer. This is another one, and it needs no
     /// defect at all: a deposed leader's uncommitted tail is normal Raft. What must not happen is
     /// the leader's answer to it — re-sending the same batch on every heartbeat, with no snapshot,
     /// because the batch read itself succeeded.</para>
