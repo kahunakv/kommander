@@ -365,13 +365,18 @@ of `AddReplica` / `RemoveReplica` moves. Priorities, highest first:
    evicted) gets a new replica on the least-loaded live node. Repairs bypass the deadband — restoring
    durability always wins.
 2. **Trim over-replication.** A range with more voters than RF (after a merge union, an RF decrease,
-   or a completed move) sheds the replica on the most-loaded node, preferring a non-leader victim.
-   A replica stranded on a node that left the roster is shed as soon as the healthy voters alone
-   satisfy RF.
+   or a completed move) sheds the replica on the most-loaded node — a voter in a zone the range
+   doubles up on first, when zones are known. The current leader is spared only among equally
+   loaded candidates: the controller hands leadership off before it marks a leader replica
+   `Removing`, so load always outranks leadership. A replica stranded on a node that left the
+   roster is shed as soon as the healthy voters alone satisfy RF.
 3. **Balance skew.** A node carrying more replicas than the even-spread ceiling plus the deadband
    donates one range to the least-loaded node that lacks it. The donation is expressed as an *add*;
    the matching trim emerges naturally on a later pass as over-replication once the learner promotes.
-   That trick keeps every individual step quorum-safe without any multi-step move bookkeeping.
+   That trick keeps every individual step quorum-safe without any multi-step move bookkeeping. The
+   add is emitted only when that trim, predicted with the trim's own victim order, would shed a node
+   strictly more loaded than the filled target; otherwise the trim would remove the replica just
+   added and the pass would loop, so the planner holds still instead.
 
 Stability rules: one move per range per plan, never touch a range that is mid-transition, prefer the
 current placement on ties (churn costs more than perfection), spread across distinct zones when zone

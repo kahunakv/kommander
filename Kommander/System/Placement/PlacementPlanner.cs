@@ -11,8 +11,10 @@ namespace Kommander.System.Placement;
 ///   <item><b>Repair under-replication</b> — a range with fewer healthy replicas than its RF is
 ///   a durability risk; repairs bypass the deadband.</item>
 ///   <item><b>Trim over-replication</b> — a range with more voters than RF (e.g. after a merge
-///   union, an RF decrease, or a completed zone-spread repair) sheds a replica, preferring a
-///   victim whose zone is duplicated inside the range, then the most-loaded node.</item>
+///   union, an RF decrease, a completed zone-spread repair, or a promoted skew-balance add) sheds
+///   a replica, preferring a victim whose zone is duplicated inside the range, then the
+///   most-loaded node; the leader is spared only among equally loaded candidates (see
+///   <see cref="PickTrimVictim"/>).</item>
 ///   <item><b>Repair zone-spread violations</b> — a range that doubles up voters in one known
 ///   zone while an alive node in an uncovered known zone exists loses quorum when that one zone
 ///   fails, even though RF is satisfied. Bootstrap produces exactly this: remote zones travel on
@@ -23,7 +25,10 @@ namespace Kommander.System.Placement;
 ///   <item><b>Balance replica-count skew</b> — nodes above the even-spread ceiling plus
 ///   <see cref="PlacementView.ReplicaCountDeadband"/> donate a range to the least-loaded node,
 ///   expressed as an add; the trim emerges on a later pass as over-replication once the learner
-///   promotes, which keeps every step quorum-safe without a move saga.</item>
+///   promotes, which keeps every step quorum-safe without a move saga. The add is emitted only
+///   when that trim, predicted with the trim's own victim order, would shed a node strictly more
+///   loaded than the filled target — otherwise the trim would undo the add and the planner would
+///   loop, so it holds still instead.</item>
 /// </list>
 /// Stability rules: never more than one move per range per plan (single mover), never a move for
 /// a range that already has a transitional replica, prefer the current placement on ties (churn
@@ -146,31 +151,10 @@ public static class PlacementPlanner
             if (!BalanceAllowed())
                 continue;
 
-            // Victim preference: a voter whose known zone another healthy voter of this range
-            // also occupies goes first — removing it keeps every covered zone covered, which is
-            // what lets a zone-spread repair (add in the uncovered zone, then this trim)
-            // converge instead of shedding the replica that was just added. Then the historical
-            // order: non-leader victims, most-loaded node, endpoint.
-            HashSet<string> duplicatedZones = range.VoterEndpoints
-                .Where(aliveEndpoints.Contains)
-                .Select(e => zoneOf.GetValueOrDefault(e))
-                .Where(z => !string.IsNullOrEmpty(z))
-                .GroupBy(z => z!, StringComparer.Ordinal)
-                .Where(g => g.Count() > 1)
-                .Select(g => g.Key)
-                .ToHashSet(StringComparer.Ordinal);
-
-            string? victim = range.VoterEndpoints
-                .Where(aliveEndpoints.Contains)
-                .OrderBy(e =>
-                {
-                    string? zone = zoneOf.GetValueOrDefault(e);
-                    return !string.IsNullOrEmpty(zone) && duplicatedZones.Contains(zone) ? 0 : 1;
-                })
-                .ThenBy(e => e == range.LeaderEndpoint ? 1 : 0)
-                .ThenByDescending(e => replicaCount.GetValueOrDefault(e))
-                .ThenBy(e => e, StringComparer.Ordinal)
-                .FirstOrDefault();
+            // Victim order lives in PickTrimVictim, shared with the priority-4 prediction so a
+            // skew-balance add is only ever emitted when this trim will relieve a heavier node.
+            string? victim = PickTrimVictim(
+                range.VoterEndpoints.Where(aliveEndpoints.Contains), range.LeaderEndpoint, replicaCount, zoneOf);
 
             if (victim is null)
                 continue;
@@ -262,11 +246,31 @@ public static class PlacementPlanner
                     continue; // range must live everywhere; nothing to spread
 
                 string? target = PickAddTarget(range, alive, replicaCount, zoneOf);
-                if (target is null || replicaCount.GetValueOrDefault(target) + 1 >= replicaCount.GetValueOrDefault(donor.Endpoint))
-                    continue; // move would not improve the spread
+                if (target is null)
+                    continue;
+
+                // The add only pays off through the trim that follows once the learner promotes.
+                // Predict that trim with the trim's own victim order, on the range as it will look
+                // after the promotion (target counted), and require the victim to be strictly
+                // more loaded than the target will be — exactly when moving one replica from the
+                // victim to the target lowers the spread. Checking the donor instead assumed the
+                // donor would be the victim; it was not when the donor led the range (leader-last
+                // order) or sat in a zone the range covers once, so the trim shed the replica just
+                // added and the pass repeated forever. When no range on the donor passes, the
+                // donor cannot be relieved without a self-undoing move: hold still, do not churn.
+                replicaCount[target]++;
+
+                string? victim = PickTrimVictim(
+                    range.VoterEndpoints.Where(aliveEndpoints.Contains).Append(target),
+                    range.LeaderEndpoint, replicaCount, zoneOf);
+
+                if (victim is null || replicaCount.GetValueOrDefault(victim) <= replicaCount[target])
+                {
+                    replicaCount[target]--;
+                    continue; // the follow-up trim would not improve the spread
+                }
 
                 moves.Add(new PlacementMove(range.PartitionId, PlacementMoveKind.AddReplica, target));
-                replicaCount[target]++;
                 touched.Add(range.PartitionId);
                 break;
             }
@@ -302,6 +306,56 @@ public static class PlacementPlanner
             .ThenBy(n => replicaCount.GetValueOrDefault(n.Endpoint))
             .ThenBy(n => n.Endpoint, StringComparer.Ordinal)
             .Select(n => n.Endpoint)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// The voter a trim of <paramref name="healthyVoters"/> sheds, or null when the list is empty.
+    /// Victim order, in priority:
+    /// <list type="number">
+    ///   <item>A voter whose known zone another healthy voter of the range also occupies —
+    ///   removing it keeps every covered zone covered, which is what lets a zone-spread repair
+    ///   (add in the uncovered zone, then this trim) converge instead of shedding the replica
+    ///   that was just added.</item>
+    ///   <item>The most-loaded node — so a trim always relieves the heaviest host of the range,
+    ///   and the trim that follows a skew-balance add (priority 4) lands on the donor, not on the
+    ///   node the add just filled.</item>
+    ///   <item>A non-leader — purely to spare the controller a leadership transfer when loads
+    ///   tie. This must stay BELOW load: with the leader spared ahead of load, a node that led
+    ///   every range it was over-filled on escaped every trim, each trim removed the replica the
+    ///   skew add had just placed, and the rebalancer looped forever. Removing a leader is safe —
+    ///   <c>ReplicaPlacementService.TryRemoveReplica</c> hands leadership to another voter before
+    ///   it marks the replica Removing.</item>
+    ///   <item>Endpoint order, for determinism.</item>
+    /// </list>
+    /// Shared by the priority-2 trim and the priority-4 prediction so the two can never disagree
+    /// about who leaves.
+    /// </summary>
+    private static string? PickTrimVictim(
+        IEnumerable<string> healthyVoters,
+        string? leaderEndpoint,
+        Dictionary<string, int> replicaCount,
+        Dictionary<string, string?> zoneOf)
+    {
+        List<string> voters = healthyVoters.ToList();
+
+        HashSet<string> duplicatedZones = voters
+            .Select(e => zoneOf.GetValueOrDefault(e))
+            .Where(z => !string.IsNullOrEmpty(z))
+            .GroupBy(z => z!, StringComparer.Ordinal)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)
+            .ToHashSet(StringComparer.Ordinal);
+
+        return voters
+            .OrderBy(e =>
+            {
+                string? zone = zoneOf.GetValueOrDefault(e);
+                return !string.IsNullOrEmpty(zone) && duplicatedZones.Contains(zone) ? 0 : 1;
+            })
+            .ThenByDescending(e => replicaCount.GetValueOrDefault(e))
+            .ThenBy(e => e == leaderEndpoint ? 1 : 0)
+            .ThenBy(e => e, StringComparer.Ordinal)
             .FirstOrDefault();
     }
 

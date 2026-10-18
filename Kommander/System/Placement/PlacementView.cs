@@ -66,8 +66,11 @@ public sealed class RangePlacement
     public bool HasTransitionalReplica { get; init; }
 
     /// <summary>
-    /// Endpoint currently leading the range, when known. Used only as a tiebreak: trims prefer
-    /// a non-leader victim so the controller rarely needs a leadership transfer first.
+    /// Endpoint currently leading the range, when known. Used only as a late tiebreak: among
+    /// equally loaded trim candidates a non-leader goes first so the controller rarely needs a
+    /// leadership transfer. It never outranks load — a leader that is the most-loaded host of
+    /// the range is trimmed (the controller hands leadership off first). Sparing the leader
+    /// ahead of load let a node that led every range it was over-filled on escape every trim.
     /// </summary>
     public string? LeaderEndpoint { get; init; }
 }

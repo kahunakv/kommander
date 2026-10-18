@@ -233,12 +233,40 @@ public sealed class TestPlacementPlanner
 
         List<PlacementMove> moves = PlacementPlanner.Plan(view);
 
-        // d:1 is the most loaded (3 ranges) but leads range 1 — the trim prefers a non-leader
-        // victim, so the next-loaded of {b,c} goes.
+        // b:1, c:1 and d:1 all carry 3 ranges; d:1 leads range 1, so among the tied candidates
+        // the leader is spared and the lowest endpoint of {b,c} goes.
         PlacementMove trim = Assert.Single(moves);
         Assert.Equal(1, trim.PartitionId);
         Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
         Assert.Equal("b:1", trim.Endpoint);
+    }
+
+    [Fact]
+    public void Plan_OverReplicatedRange_RemovesOverFilledLeader()
+    {
+        // The leader tiebreak never outranks load. d:1 leads range 1 AND is its most-loaded host
+        // (4 ranges against 3 for b:1 and c:1), so d:1 goes: the controller hands leadership off
+        // before it marks the replica Removing. Sparing the leader ahead of load is what let a
+        // node that led every range it was over-filled on escape every trim and loop the
+        // rebalancer.
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1", "c:1", "d:1"], leader: "d:1"), // 4 voters > RF 3
+                Range(2, 3, ["d:1", "b:1", "c:1"]),
+                Range(3, 3, ["d:1", "b:1", "c:1"]),
+                Range(4, 3, ["d:1", "a:1", "e:1"])
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1"), Node("e:1")],
+            MaxMoves = 2,
+            TransferBudget = 2
+        };
+
+        PlacementMove trim = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(1, trim.PartitionId);
+        Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
+        Assert.Equal("d:1", trim.Endpoint);
     }
 
     // ── Plan: stability and caps ──────────────────────────────────────────────
@@ -646,5 +674,177 @@ public sealed class TestPlacementPlanner
 
         foreach (string endpoint in endpoints)
             Assert.Equal(3, voters.Values.Count(v => v.Contains(endpoint)));
+    }
+
+    // ── Plan: skew balance converges ──────────────────────────────────────────
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Plan_OverFilledNodeAfterScaleUp_ConvergesWithDeadbandZero(bool overFilledNodeLeadsEveryRange)
+    {
+        // The k8s-operator incident: a scale from 3 to 4 nodes, 6 ranges at RF 3, deadband 0.
+        // Two donations had landed on n0:1; n2:1 — which hosted AND led every range — sat at 6
+        // against a ceiling of 5. The trim's leader-last victim order spared n2:1 on every range,
+        // so each trim removed the replica the skew add had just placed and the rebalancer ran
+        // 505 moves in 25 minutes without converging. Iterating plan→apply must now reach a fixed
+        // point in a few passes, with every range at RF and no node above the ceiling, whether or
+        // not the over-filled node leads.
+        string[] endpoints = ["n0:1", "n1:1", "n2:1", "n3:1"];
+        Dictionary<int, List<string>> voters = new()
+        {
+            [1] = ["n1:1", "n2:1", "n3:1"],
+            [2] = ["n0:1", "n2:1", "n3:1"],
+            [3] = ["n1:1", "n2:1", "n3:1"],
+            [4] = ["n1:1", "n2:1", "n3:1"],
+            [5] = ["n1:1", "n2:1", "n3:1"],
+            [6] = ["n0:1", "n1:1", "n2:1"],
+        };
+
+        List<CandidateNode> nodes = [.. endpoints.Select(e => Node(e))];
+        Dictionary<int, string> lastAdded = [];
+
+        int passes = 0;
+        while (true)
+        {
+            Assert.True(++passes <= 12, "planner failed to converge within 12 passes");
+
+            PlacementView view = new()
+            {
+                // The controller hands leadership to another voter when it removes a leader, so
+                // the model keeps n2:1 leading wherever it is still a voter.
+                Ranges = [.. voters.Select(kv => Range(kv.Key, 3, [.. kv.Value],
+                    leader: overFilledNodeLeadsEveryRange
+                        ? (kv.Value.Contains("n2:1") ? "n2:1" : kv.Value[0])
+                        : null))],
+                Nodes = nodes,
+                ReplicaCountDeadband = 0,
+                MaxMoves = 2,
+                TransferBudget = 1,
+                RepairBudget = 3
+            };
+
+            List<PlacementMove> moves = PlacementPlanner.Plan(view);
+            if (moves.Count == 0)
+                break;
+
+            foreach (PlacementMove move in moves)
+            {
+                if (move.Kind == PlacementMoveKind.AddReplica)
+                {
+                    voters[move.PartitionId].Add(move.Endpoint);
+                    lastAdded[move.PartitionId] = move.Endpoint;
+                }
+                else
+                {
+                    // The loop's signature: the trim shed the replica the balance add just placed.
+                    Assert.False(
+                        lastAdded.TryGetValue(move.PartitionId, out string? added) && added == move.Endpoint,
+                        $"trim of range {move.PartitionId} removed {move.Endpoint}, the replica the balance add just placed");
+                    voters[move.PartitionId].Remove(move.Endpoint);
+                }
+
+                Assert.True(voters[move.PartitionId].Count >= 3,
+                    $"range {move.PartitionId} dropped below RF during rebalancing");
+            }
+        }
+
+        foreach ((int _, List<string> replicas) in voters)
+            Assert.Equal(3, replicas.Count);
+
+        int ceiling = (18 + endpoints.Length - 1) / endpoints.Length; // 5
+        foreach (string endpoint in endpoints)
+            Assert.True(voters.Values.Count(v => v.Contains(endpoint)) <= ceiling,
+                $"{endpoint} is still above the even-spread ceiling after convergence");
+    }
+
+    [Fact]
+    public void Plan_SkewAddTheZoneTrimWouldUndo_HoldsStill()
+    {
+        // n1:1 is the only z-a node and hosts everything (4 of 8 replicas, ceiling 3, deadband 0).
+        // Any add lands on a z-b node and doubles z-b, so the trim that follows sheds a z-b voter
+        // — never n1:1 — and n1:1 stays at 4: the add/trim loop in its zoned form. The planner
+        // must predict that trim and emit nothing rather than churn.
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 2, ["n1:1", "n2:1"]),
+                Range(2, 2, ["n1:1", "n2:1"]),
+                Range(3, 2, ["n1:1", "n3:1"]),
+                Range(4, 2, ["n1:1", "n3:1"])
+            ],
+            Nodes = [Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-b"), Node("n3:1", zone: "z-b")],
+            ReplicaCountDeadband = 0,
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_ZonedScaleUpBoundedByZoneSpread_ConvergesInsteadOfLooping()
+    {
+        // Three zones with one node each, 6 ranges at RF 3 — every node hosts every range. A
+        // fourth node joins in z-a. Zone spread bounds the spread: n2:1 and n3:1 are the only z-b
+        // and z-c nodes, so every range keeps both and only the z-a replica can move. Before the
+        // trim prediction the planner added n4:1, the zone-first trim shed the doubled-zone voter
+        // with the higher load — n4:1 itself once n1:1 had given its share — and the pair
+        // repeated forever. Iterating plan→apply must reach a fixed point with the z-a share
+        // split between n1:1 and n4:1 and every range still on three zones.
+        string[] endpoints = ["n1:1", "n2:1", "n3:1", "n4:1"];
+        Dictionary<string, string> zones = new(StringComparer.Ordinal)
+        {
+            ["n1:1"] = "z-a", ["n2:1"] = "z-b", ["n3:1"] = "z-c", ["n4:1"] = "z-a",
+        };
+
+        Dictionary<int, List<string>> voters = Enumerable.Range(1, 6)
+            .ToDictionary(id => id, _ => new List<string> { "n1:1", "n2:1", "n3:1" });
+
+        List<CandidateNode> nodes = [.. endpoints.Select(e => Node(e, zone: zones[e]))];
+
+        int passes = 0;
+        while (true)
+        {
+            Assert.True(++passes <= 20, "planner failed to converge within 20 passes");
+
+            PlacementView view = new()
+            {
+                Ranges = [.. voters.Select(kv => Range(kv.Key, 3, [.. kv.Value]))],
+                Nodes = nodes,
+                ReplicaCountDeadband = 0,
+                MaxMoves = 2,
+                TransferBudget = 1,
+                RepairBudget = 3
+            };
+
+            List<PlacementMove> moves = PlacementPlanner.Plan(view);
+            if (moves.Count == 0)
+                break;
+
+            foreach (PlacementMove move in moves)
+            {
+                if (move.Kind == PlacementMoveKind.AddReplica)
+                    voters[move.PartitionId].Add(move.Endpoint);
+                else
+                    voters[move.PartitionId].Remove(move.Endpoint);
+
+                Assert.True(voters[move.PartitionId].Count >= 3,
+                    $"range {move.PartitionId} dropped below RF during rebalancing");
+            }
+        }
+
+        foreach ((int _, List<string> replicas) in voters)
+        {
+            Assert.Equal(3, replicas.Count);
+            Assert.Equal(3, replicas.Select(e => zones[e]).Distinct().Count());
+        }
+
+        int Load(string endpoint) => voters.Values.Count(v => v.Contains(endpoint));
+        Assert.Equal(6, Load("n2:1"));
+        Assert.Equal(6, Load("n3:1"));
+        Assert.Equal(3, Load("n1:1"));
+        Assert.Equal(3, Load("n4:1"));
     }
 }
