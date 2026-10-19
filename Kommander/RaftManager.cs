@@ -1202,6 +1202,19 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
                 partition.RoutingMode = range.RoutingMode;
                 partition.Generation = range.Generation;
                 partition.State = range.State;
+
+                // The committed replica set may have just dropped the node this replica believes
+                // leads the range (a RemoveReplica of the leader). A quiesced follower is ticked
+                // only by the coarse safety sweep (UpdateNodesInterval), so put the partition back
+                // in the hot set: its next CheckLeader tick, one CheckLeaderInterval away, sees the
+                // vacancy (ElectionCoordinator.ExpectedLeaderLeftTheRange) and campaigns within an
+                // election timeout instead of a sweep period.
+                string knownLeader = partition.Leader;
+                if (range.Replicas.Count > 0
+                    && !string.IsNullOrEmpty(knownLeader)
+                    && knownLeader != LocalEndpoint
+                    && !range.Replicas.Any(r => r.Endpoint == knownLeader))
+                    MarkPartitionHot(range.PartitionId);
             }
             else
             {
@@ -1580,6 +1593,13 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         partitions.TryRemove(partitionId, out _);
         _hotPartitions.TryRemove(partitionId, out _);
     }
+
+    /// <summary>
+    /// True when this node hosts <paramref name="partitionId"/> and its replica is quiesced. A
+    /// test and diagnostics seam (cross-thread read of a flag that may be one transition stale).
+    /// </summary>
+    internal bool IsPartitionQuiesced(int partitionId) =>
+        partitions.TryGetValue(partitionId, out RaftPartition? partition) && partition.IsQuiesced;
 
     // ── Node activity / heartbeat — bodies live in NodeActivityTracker ────────
 

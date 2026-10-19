@@ -156,9 +156,19 @@ SWIM one question: *is the node I believe leads this partition still `Alive`?*
 ```
    quiesced follower tick:
      leaderNode = expectedLeaders[currentTerm]
+     if leaderNode is no longer a peer of this partition → un-quiesce and start a pre-vote election
      if SWIM.GetState(leaderNode) == Alive  → do nothing (stay calm)
      else (Suspect or Dead)                 → un-quiesce and start a pre-vote election
 ```
+
+The peer check comes first because SWIM answers *is the node up?*, not *does it still host this
+range?* A leader whose replica was removed from the range (a placement trim of the leader) keeps
+answering pings; on liveness alone every quiesced follower stayed calm and denied every pre-vote, and
+the range had no leader until a write woke it — which never came, because every read was redirected
+to the departed leader (Kahuna 1.12.7, 2026-10-18). The same peer check exempts the pre-vote deny
+gate. The map application that drops a partition's known leader from its replica set also puts the
+partition back in the hot set, so the tick that notices the vacancy runs within `CheckLeaderInterval`
+rather than at the next safety sweep (`UpdateNodesInterval`).
 
 So a quiesced follower will sit silently through any amount of per-partition silence, as long as SWIM
 says the leader's node is up. It only challenges leadership when the **node** actually looks gone. This
@@ -309,6 +319,9 @@ detection (at the cost of more SWIM probe traffic). The defaults are valid out o
   state — that would couple safety to a local optimization.
 - **A quiesced follower must still fail over.** It gates elections on SWIM `Suspect` (≠ `Alive`), not on
   `Dead`. Keep `PingInterval < StartElectionTimeout` so this is no slower than a normal election.
+- **Liveness is not hosting.** A leader that left the partition's replica set is vacated even while its
+  node is `Alive`. Both quiesced gates (the follower tick and the pre-vote deny) check peer membership
+  before SWIM; keep that order.
 - **Quiescence requires SWIM.** `EnableQuiescence = true` with `PingInterval <= 0` is rejected at
   startup. Don't weaken that guard.
 - **Any normal append wakes a follower.** `AppendLogsCoreAsync` mirrors the message's `Quiesce` flag, so

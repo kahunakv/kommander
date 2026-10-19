@@ -119,6 +119,15 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal Func<int, CancellationToken, Task<string?>>? ResolvePartitionLeaderOverride;
 
     /// <summary>
+    /// Test hook for <see cref="HandOffPartitionLeadershipAsync"/>, the confirmed leadership
+    /// hand-off a leader replica's removal performs first. When set, replaces the transfer and its
+    /// confirmation; a hook that answers Success without moving anything reproduces the pre-fix
+    /// removal of a leader that is still leading. <see cref="HandOffPartitionLeadershipCoreAsync"/>
+    /// stays reachable so a hook can observe the real outcome.
+    /// </summary>
+    internal Func<int, string, string, CancellationToken, Task<RaftOperationStatus>>? HandOffPartitionLeadershipOverride;
+
+    /// <summary>
     /// Test hook called when a <see cref="RaftSystemRequestType.LeaderChanged"/> request is
     /// dispatched, with the leader it names and <see cref="appliedSystemLogIndex"/> at that
     /// moment. Pins the ordering the stale-base fence relies on: a new P0 leader has installed
@@ -264,7 +273,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             (node, partitionId, endpoint) => manager.Communication.GetRemoteFollowerLag(manager, node, partitionId, endpoint),
             endpoint => manager.Liveness.GetState(endpoint),
             GetNodeZone,
-            async (partitionId, target, ct) => await manager.TransferLeadershipAsync(partitionId, target, ct).ConfigureAwait(false),
+            HandOffPartitionLeadershipAsync,
             ConfirmPartitionLeadershipAsync,
             ResolvePartitionLeaderAsync,
             manager.Configuration,
@@ -822,6 +831,79 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 "[RaftSystemCoordinator] No candidate confirmed leadership of partition {PartitionId} within {Timeout} ({Candidates})",
                 partitionId, manager.Configuration.RemoteProbeTimeout, string.Join(", ", candidates));
         return null;
+    }
+
+    private static readonly TimeSpan HandOffPollDelay = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Moves the leadership of <paramref name="partitionId"/> off <paramref name="leaderEndpoint"/>
+    /// toward <paramref name="targetEndpoint"/> and waits, bounded, for the move to be confirmed.
+    /// Used by the leader-replica removal in <see cref="ReplicaPlacementService"/>; Success means a
+    /// quorum-confirmed leader other than <paramref name="leaderEndpoint"/> now leads the range.
+    /// <para>Two paths. When this node leads the range, the local converging transfer runs
+    /// (<see cref="RaftManager.TransferLeadershipAsync"/>, which already waits for the target to
+    /// take over). When another node leads it, the only cross-node transfer primitive is the
+    /// leader balancer's advisory suggestion — delivered to the leader, executed and logged there,
+    /// fire-and-forget on the wire — so the outcome is observed here: the leader hint is polled
+    /// until it names someone else and the quorum-confirmed resolution agrees, inside the bound.
+    /// Pending means the bound elapsed with the old leader still confirmed.</para>
+    /// <para>Before this existed the removal ran the local transfer on whichever replica this node
+    /// held and discarded the status: a P0 leader that did not itself lead the range got
+    /// NodeIsNotLeader, nothing moved, and the leader replica was removed while leading.</para>
+    /// </summary>
+    internal async Task<RaftOperationStatus> HandOffPartitionLeadershipAsync(
+        int partitionId, string leaderEndpoint, string targetEndpoint, CancellationToken ct)
+    {
+        if (HandOffPartitionLeadershipOverride is { } fn)
+            return await fn(partitionId, leaderEndpoint, targetEndpoint, ct).ConfigureAwait(false);
+
+        return await HandOffPartitionLeadershipCoreAsync(partitionId, leaderEndpoint, targetEndpoint, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>The real hand-off behind <see cref="HandOffPartitionLeadershipAsync"/>, reachable past the test override.</summary>
+    internal async Task<RaftOperationStatus> HandOffPartitionLeadershipCoreAsync(
+        int partitionId, string leaderEndpoint, string targetEndpoint, CancellationToken ct)
+    {
+        if (string.Equals(leaderEndpoint, manager.LocalEndpoint, StringComparison.Ordinal))
+            return await manager.TransferLeadershipAsync(partitionId, targetEndpoint, ct).ConfigureAwait(false);
+
+        TransferLeadershipSuggestionRequest suggestion = new(
+            partitionId,
+            manager.WalAdapter.GetCurrentTerm(RaftSystemConfig.SystemPartition),
+            manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId),
+            manager.LocalEndpoint,
+            targetEndpoint);
+
+        manager.SendTransferLeadershipSuggestion(leaderEndpoint, suggestion);
+
+        // The transfer converges within one election timeout on the leader, the target's election
+        // takes up to another, and the hint (local belief for a hosted range, a gossiped load
+        // report otherwise) lags the election by a heartbeat or a report interval: three election
+        // timeouts, floored at two seconds, capped at the local transfer's own ten-second wait.
+        double boundMs = Math.Clamp(manager.Configuration.EndElectionTimeout * 3, 2_000, 10_000);
+        global::Kommander.Diagnostics.ValueStopwatch stopwatch = global::Kommander.Diagnostics.ValueStopwatch.StartNew();
+        int polls = 0;
+
+        while (stopwatch.GetElapsedMilliseconds() < boundMs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            string? hint = manager.GetPartitionLeaderHint(partitionId);
+            bool hintMoved = !string.IsNullOrEmpty(hint) && !string.Equals(hint, leaderEndpoint, StringComparison.Ordinal);
+
+            // Confirm on the hint flip, and periodically regardless: a range this node does not
+            // host updates its hint only when the new leader's load report arrives.
+            if (hintMoved || ++polls % 10 == 0)
+            {
+                string? confirmed = await ResolvePartitionLeaderAsync(partitionId, ct).ConfigureAwait(false);
+                if (confirmed is not null && !string.Equals(confirmed, leaderEndpoint, StringComparison.Ordinal))
+                    return RaftOperationStatus.Success;
+            }
+
+            await Task.Delay(HandOffPollDelay, ct).ConfigureAwait(false);
+        }
+
+        return RaftOperationStatus.Pending;
     }
 
     /// <summary>

@@ -164,6 +164,10 @@ public enum RaftOperationStatus
     /// the target partition's voters are unreachable would take effect on a leader that cannot
     /// commit through those voters — the two-leader window behind lost acknowledged writes. The
     /// caller may retry once the partition has a reachable, confirmed leader.
+    /// <para>Also the answer when the replica to remove leads the partition and its leadership
+    /// could not be handed to another voter first: that hand-off is mandatory and confirmed, so a
+    /// removal never leaves a range led by a node that no longer hosts it. Retry on the next
+    /// placement pass.</para>
     /// </summary>
     LeadershipNotConfirmed = 26,
 

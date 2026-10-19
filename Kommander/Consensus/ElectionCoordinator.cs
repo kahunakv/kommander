@@ -400,6 +400,40 @@ internal sealed class ElectionCoordinator
         return true;
     }
 
+    /// <summary>
+    /// True when <paramref name="expectedLeader"/> is no longer a peer of this partition: the
+    /// committed replica set dropped it (a <c>RemoveReplica</c> of the leader completed), so the
+    /// leadership this follower remembers is vacated no matter what SWIM says about the node —
+    /// the node lives on and answers pings, it just stopped hosting this range.
+    /// <para>Both quiesced gates defer to SWIM liveness: the follower election trigger
+    /// (<c>CheckPartitionLeadershipAsync</c>) and the pre-vote deny in <see cref="VoteAsync"/>.
+    /// Liveness is the right signal for a leader that died and a permanent false "still leading"
+    /// for one that left: no follower campaigns, every pre-vote is denied, and the range stays
+    /// leaderless until a write wakes it — which never comes, because every read is redirected to
+    /// the departed leader (Kahuna 1.12.7 k8s-operator e2e, 2026-10-18: partition 3 unavailable
+    /// for minutes after a placement trim removed its leader). Both gates consult this first.</para>
+    /// <para>The local endpoint is never "gone": a follower that still remembers itself as the
+    /// leader of the term (a step-down that kept the record) is handled by the ordinary
+    /// heartbeat and cooldown rules, not by this vacancy signal. Legacy ranges and the system
+    /// partition use the roster projection as their peer set, so a leader evicted from the roster
+    /// reads as vacated too, which is equally correct.</para>
+    /// </summary>
+    public bool ExpectedLeaderLeftTheRange(string expectedLeader)
+    {
+        if (string.IsNullOrEmpty(expectedLeader) || expectedLeader == host.LocalEndpoint)
+            return false;
+
+        IReadOnlyList<RaftNode> peers = host.Nodes;
+
+        for (int i = 0; i < peers.Count; i++)
+        {
+            if (string.Equals(peers[i].Endpoint, expectedLeader, StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
     public async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
         // Two gates: the roster role (a cluster Learner/Leaving node never campaigns anywhere)
@@ -771,9 +805,12 @@ internal sealed class ElectionCoordinator
                 {
                     // Quiesced: the leader suppresses heartbeats by design, so `coreState.LastHeartbeat` goes
                     // stale and is not a valid freshness signal. Defer to SWIM exactly as the quiesced
-                    // Follower election case does — while the expected leader is Alive, don't help a
-                    // challenger unseat it.
-                    if (host.GetNodeLiveness(preVoteExpectedLeader) == MemberLivenessState.Alive)
+                    // Follower election case does — while the expected leader is Alive AND still a peer
+                    // of this range, don't help a challenger unseat it. A leader the committed replica
+                    // set dropped is vacated whatever SWIM says (ExpectedLeaderLeftTheRange); denying
+                    // here on liveness alone is what kept a trimmed leader's range leaderless.
+                    if (host.GetNodeLiveness(preVoteExpectedLeader) == MemberLivenessState.Alive
+                        && !ExpectedLeaderLeftTheRange(preVoteExpectedLeader))
                     {
                         logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
                         return;

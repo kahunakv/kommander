@@ -49,7 +49,7 @@ internal sealed class ReplicaPlacementService
     private readonly Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag;
     private readonly Func<string, MemberLivenessState> getNodeLiveness;
     private readonly Func<string, string?> getNodeZone;
-    private readonly Func<int, string, CancellationToken, Task> transferLeadership;
+    private readonly Func<int, string, string, CancellationToken, Task<RaftOperationStatus>> handOffLeadership;
 
     /// <summary>
     /// Quorum-confirmed leadership of ONE data partition, asked before any replica-set mutation of
@@ -98,7 +98,7 @@ internal sealed class ReplicaPlacementService
         Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag,
         Func<string, MemberLivenessState> getNodeLiveness,
         Func<string, string?> getNodeZone,
-        Func<int, string, CancellationToken, Task> transferLeadership,
+        Func<int, string, string, CancellationToken, Task<RaftOperationStatus>> handOffLeadership,
         Func<int, CancellationToken, Task<bool>> confirmPartitionLeadership,
         Func<int, CancellationToken, Task<string?>> resolvePartitionLeader,
         RaftConfiguration configuration,
@@ -120,7 +120,7 @@ internal sealed class ReplicaPlacementService
         this.getRemoteFollowerLag = getRemoteFollowerLag;
         this.getNodeLiveness = getNodeLiveness;
         this.getNodeZone = getNodeZone;
-        this.transferLeadership = transferLeadership;
+        this.handOffLeadership = handOffLeadership;
         this.confirmPartitionLeadership = confirmPartitionLeadership;
         this.configuration = configuration;
         this.localEndpoint = localEndpoint;
@@ -491,41 +491,33 @@ internal sealed class ReplicaPlacementService
         // interrupted removal is deliberately exempt: its replica already left the quorum
         // denominator at the first commit, so the final drop changes no quorum, and gating it
         // would leave a Removing replica stranded whenever the range has no confirmable leader.
-        if (replica.Role != RaftReplicaRole.Removing
-            && !await ConfirmPartitionLeadershipAsync(message.PartitionId, "TryRemoveReplica", endpoint, cancellationToken).ConfigureAwait(false))
+        if (replica.Role != RaftReplicaRole.Removing)
         {
-            completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
-            return;
+            // A leader replica hands its leadership to another voter BEFORE the fence and before
+            // its vote is discounted. Mandatory and confirmed, not best-effort: a removal that
+            // goes ahead with the leader still leading ends, two commits later, with a range led
+            // by a node that no longer hosts it, and quiesced followers that trust SWIM liveness
+            // never notice (Kahuna 1.12.7 k8s-operator e2e: partition 3 unavailable for minutes
+            // after its leader was trimmed). The old transfer ran on THIS node's replica and
+            // discarded the status, so whenever the P0 leader did not itself lead the range it
+            // answered NodeIsNotLeader and nothing moved, silently. The fence below then confirms
+            // the leadership the range has after the hand-off.
+            if (!await HandOffLeadershipIfLeaderAsync(range, endpoint, cancellationToken).ConfigureAwait(false))
+            {
+                completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
+                return;
+            }
+
+            if (!await ConfirmPartitionLeadershipAsync(message.PartitionId, "TryRemoveReplica", endpoint, cancellationToken).ConfigureAwait(false))
+            {
+                completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
+                return;
+            }
         }
 
         // Phase 1: mark Removing (skipped when re-driving an interrupted removal).
         if (replica.Role != RaftReplicaRole.Removing)
         {
-            // A leader replica must hand off leadership before its vote is discounted, otherwise
-            // the range is led by a node outside its own quorum denominator. Best-effort: the
-            // election path recovers on failure, this just avoids an availability blip.
-            if (string.Equals(getPartitionLeader(message.PartitionId), endpoint, StringComparison.Ordinal))
-            {
-                string? successor = range.Replicas
-                    .Where(r => r.Role == RaftReplicaRole.Voter && r.Endpoint != endpoint)
-                    .Select(r => r.Endpoint)
-                    .FirstOrDefault();
-
-                if (successor is not null)
-                {
-                    try
-                    {
-                        await transferLeadership(message.PartitionId, successor, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(
-                            "TryRemoveReplica: leadership transfer of partition {Id} away from {Endpoint} failed: {Message}",
-                            message.PartitionId, endpoint, ex.Message);
-                    }
-                }
-            }
-
             range.Generation++;
             replica.Role = RaftReplicaRole.Removing;
             replica.SinceGeneration = range.Generation;
@@ -547,6 +539,98 @@ internal sealed class ReplicaPlacementService
 
         if (await ReplicateMapAsync(map, completion, cancellationToken).ConfigureAwait(false))
             completion?.TrySetResult((RaftOperationStatus.Success, range.Generation));
+    }
+
+    /// <summary>
+    /// Moves the leadership of <paramref name="range"/> off <paramref name="endpoint"/> when that
+    /// replica leads it, and waits for the move to be confirmed. Returns true when the replica may
+    /// be marked Removing: it did not lead, or it no longer does. Returns false — the caller then
+    /// refuses the removal for this pass and the planner retries on the next — when no successor
+    /// exists or the hand-off did not complete inside its bound.
+    /// <para>Who leads is read from the hint first (the local belief for a hosted range, the
+    /// gossiped load-report claim otherwise) and from the quorum-confirmed resolution when the
+    /// hint is empty, so a missing hint cannot let a leader slip through unhanded. A hand-off that
+    /// answers anything but Success is re-checked against the confirmed leader before it is called
+    /// a failure: LeaderAlreadyElected and NodeIsNotLeader both mean the leadership already moved.</para>
+    /// <para>The successor is the first voter SWIM considers alive, in endpoint order; the
+    /// transfer itself validates the target further (a voter, caught up within one election
+    /// timeout) and the leader balancer may move leadership again later.</para>
+    /// </summary>
+    private async Task<bool> HandOffLeadershipIfLeaderAsync(RaftPartitionRange range, string endpoint, CancellationToken cancellationToken)
+    {
+        int partitionId = range.PartitionId;
+
+        string? leader = getPartitionLeader(partitionId);
+        if (string.IsNullOrEmpty(leader))
+            leader = await resolvePartitionLeader(partitionId, cancellationToken).ConfigureAwait(false);
+
+        if (!string.Equals(leader, endpoint, StringComparison.Ordinal))
+            return true;
+
+        string? successor = range.Replicas
+            .Where(r => r.Role == RaftReplicaRole.Voter && r.Endpoint != endpoint)
+            .OrderBy(r => getNodeLiveness(r.Endpoint) == MemberLivenessState.Alive ? 0 : 1)
+            .ThenBy(r => r.Endpoint, StringComparer.Ordinal)
+            .Select(r => r.Endpoint)
+            .FirstOrDefault();
+
+        if (successor is null)
+        {
+            logger.LogWarning(
+                "TryRemoveReplica: refusing to remove {Endpoint}, the leader of partition {Id}: no other voter can take the leadership",
+                endpoint, partitionId);
+            return false;
+        }
+
+        logger.LogInfoRemoveReplicaHandOff(localEndpoint, partitionId, endpoint, successor);
+
+        global::Kommander.Diagnostics.ValueStopwatch stopwatch = global::Kommander.Diagnostics.ValueStopwatch.StartNew();
+        RaftOperationStatus status;
+
+        try
+        {
+            status = await handOffLeadership(partitionId, endpoint, successor, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "TryRemoveReplica: leadership hand-off of partition {Id} from {Endpoint} to {Successor} threw: {Message}",
+                partitionId, endpoint, successor, ex.Message);
+            status = RaftOperationStatus.Errored;
+        }
+
+        if (status != RaftOperationStatus.Success)
+        {
+            string? confirmed = null;
+
+            try
+            {
+                confirmed = await resolvePartitionLeader(partitionId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                // Unresolvable counts as not moved.
+            }
+
+            if (confirmed is null || string.Equals(confirmed, endpoint, StringComparison.Ordinal))
+            {
+                long failedAfterMs = stopwatch.GetElapsedMilliseconds();
+                logger.LogWarningRemoveReplicaHandOffFailed(localEndpoint, partitionId, endpoint, successor, status, failedAfterMs);
+                return false;
+            }
+        }
+
+        long handedOffAfterMs = stopwatch.GetElapsedMilliseconds();
+        logger.LogInfoRemoveReplicaHandOffDone(localEndpoint, partitionId, endpoint, successor, status, handedOffAfterMs);
+        return true;
     }
 
     /// <summary>
@@ -954,9 +1038,28 @@ internal sealed class ReplicaPlacementService
 
                 if (successor is not null)
                 {
+                    // Best-effort here, unlike the leader-replica removal: the conversion commits
+                    // the full voter set either way, and a leader outside that set is then no peer
+                    // of the range — its followers treat that as a vacancy and elect (see
+                    // ElectionCoordinator.ExpectedLeaderLeftTheRange). The attempt is capped so a
+                    // leader that cannot hand off does not hold the coordinator loop for the full
+                    // hand-off bound on every converted range. The outcome is logged either way.
+                    using CancellationTokenSource capped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    capped.CancelAfter(TimeSpan.FromMilliseconds(Math.Clamp(configuration.EndElectionTimeout * 2, 1_000, 3_000)));
+
                     try
                     {
-                        await transferLeadership(range.PartitionId, successor, cancellationToken).ConfigureAwait(false);
+                        RaftOperationStatus status = await handOffLeadership(range.PartitionId, leader, successor, capped.Token).ConfigureAwait(false);
+                        if (status != RaftOperationStatus.Success)
+                            logger.LogWarning(
+                                "RunPlacementPass: leadership transfer of partition {Id} away from non-voter {Endpoint} to {Successor} before initial placement answered {Status}",
+                                range.PartitionId, leader, successor, status);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        logger.LogWarning(
+                            "RunPlacementPass: leadership transfer of partition {Id} away from non-voter {Endpoint} to {Successor} before initial placement did not complete within its cap",
+                            range.PartitionId, leader, successor);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {

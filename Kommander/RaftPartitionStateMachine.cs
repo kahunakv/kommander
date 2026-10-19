@@ -250,6 +250,13 @@ public sealed class RaftPartitionStateMachine
         coreState.NodeState == RaftNodeState.Leader && host.Leader != host.LocalEndpoint
             ? RaftNodeState.Candidate
             : coreState.NodeState;
+
+    /// <summary>
+    /// Whether this replica is quiesced (see <see cref="RaftConfiguration.EnableQuiescence"/>).
+    /// A cross-thread read of scheduling state, for tests and diagnostics: it may be one
+    /// transition stale, never torn.
+    /// </summary>
+    internal bool Quiesced => coreState.Quiesced;
     public long CurrentTerm => coreState.CurrentTerm;
 
     /// <summary>Off-thread view of the current term — see <see cref="RaftPartitionCoreState.PublishedTerm"/>.</summary>
@@ -633,7 +640,10 @@ public sealed class RaftPartitionStateMachine
     /// and <see cref="RaftPartitionCoreState.Quiesced"/> is <see langword="true"/>): the per-partition heartbeat timer
     /// is ignored.  Instead, an election is triggered only when the SWIM failure detector marks
     /// the expected leader's node as <see cref="MemberLivenessState.Suspect"/> or
-    /// <see cref="MemberLivenessState.Dead"/> — i.e. <c>GetNodeLiveness(leader) != Alive</c>.
+    /// <see cref="MemberLivenessState.Dead"/> — i.e. <c>GetNodeLiveness(leader) != Alive</c> —
+    /// or when the committed replica set no longer names the expected leader at all (its replica
+    /// was removed; see <see cref="ElectionCoordinator.ExpectedLeaderLeftTheRange"/>): that node
+    /// stays Alive, so liveness alone would keep every follower calm forever.
     /// This relies on the invariant <c>PingInterval &lt; StartElectionTimeout</c>
     /// (validated at startup by <see cref="RaftConfiguration.Validate"/>): a SWIM Suspect fires
     /// after approximately one <c>PingInterval</c>, comfortably under <c>StartElectionTimeout</c>,
@@ -882,10 +892,21 @@ public sealed class RaftPartitionStateMachine
             case RaftNodeState.Follower when coreState.Quiesced && host.Configuration.EnableQuiescence:
             {
                 string expectedLeaderNode = election.GetExpectedLeader(coreState.CurrentTerm);
-                if (string.IsNullOrEmpty(expectedLeaderNode) ||
-                    host.GetNodeLiveness(expectedLeaderNode) == MemberLivenessState.Alive)
-                    return; // leader's node is Alive per SWIM — stay calm
-                // Leader node is Suspect or Dead — un-quiesce and challenge leadership.
+                if (string.IsNullOrEmpty(expectedLeaderNode))
+                    return;
+
+                // SWIM answers "is the NODE up?", not "does it still host this range?". A leader
+                // whose replica was removed from the range (a placement trim of the leader) keeps
+                // answering pings, so on liveness alone every quiesced follower stayed calm, every
+                // pre-vote was denied, and the range had no leader until the next write — which
+                // never came, because every read was redirected to the departed leader (Kahuna
+                // 1.12.7 k8s-operator e2e: partition 3 unavailable for minutes). A leader that is
+                // no longer a peer of this range is vacated regardless of SWIM.
+                if (host.GetNodeLiveness(expectedLeaderNode) == MemberLivenessState.Alive
+                    && !election.ExpectedLeaderLeftTheRange(expectedLeaderNode))
+                    return; // leader's node is Alive per SWIM and still a peer — stay calm
+
+                // Leader node is Suspect or Dead, or it left the range — un-quiesce and challenge.
                 coreState.SetQuiesced(false);
                 await election.StartPreVoteAsync(currentTime).ConfigureAwait(false);
                 break;

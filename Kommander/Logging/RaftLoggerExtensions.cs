@@ -379,6 +379,15 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] RemoveReplica: partition {Id} -= {Endpoint}, generation {Generation}")]
     public static partial void LogInfoRemoveReplicaDropped(this ILogger<IRaft> logger, string local, int id, string endpoint, long generation);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] RemoveReplica: partition {Id} is led by {Endpoint}; handing leadership to {Successor} before the removal")]
+    public static partial void LogInfoRemoveReplicaHandOff(this ILogger<IRaft> logger, string local, int id, string endpoint, string successor);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] RemoveReplica: partition {Id} leadership handed off {Endpoint} -> {Successor} ({Status}, {ElapsedMs} ms)")]
+    public static partial void LogInfoRemoveReplicaHandOffDone(this ILogger<IRaft> logger, string local, int id, string endpoint, string successor, RaftOperationStatus status, long elapsedMs);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Local}] RemoveReplica: refusing to remove {Endpoint} from partition {Id} this pass: leadership hand-off to {Successor} did not complete ({Status}, {ElapsedMs} ms); the next placement pass retries")]
+    public static partial void LogWarningRemoveReplicaHandOffFailed(this ILogger<IRaft> logger, string local, int id, string endpoint, string successor, RaftOperationStatus status, long elapsedMs);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement move: {Kind} partition {Id} {Endpoint}")]
     public static partial void LogInfoPlacementMove(this ILogger<IRaft> logger, string local, Kommander.System.Placement.PlacementMoveKind kind, int id, string endpoint);
 

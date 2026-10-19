@@ -95,6 +95,9 @@ public sealed class RaftPartition : IDisposable
         }
     }
 
+    /// <summary>Whether this replica is quiesced — see <see cref="RaftPartitionStateMachine.Quiesced"/>.</summary>
+    internal bool IsQuiesced => stateMachine.Quiesced;
+
     internal long LeaderChangedTicks => Interlocked.Read(ref _leaderChangedTicks);
 
     private volatile int _startRange;

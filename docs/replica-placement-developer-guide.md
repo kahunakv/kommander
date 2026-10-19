@@ -241,8 +241,17 @@ leader starts replicating to it. The controller watches X's commit lag on R; onc
                                                          reclaims R's WAL locally
 ```
 
-If Y currently *leads* R, leadership is first transferred to another voter replica (best-effort — an
-election would recover anyway; the transfer just avoids an availability blip). If the process crashes
+If Y currently *leads* R, its leadership is handed to another voter replica **before** step 1, and the
+hand-off is confirmed: when the P0 leader itself leads R the local converging transfer runs; otherwise
+a transfer suggestion goes to the leader node and the controller waits, bounded (three election
+timeouts, between two and ten seconds), until the quorum-confirmed leader of R is someone else. A
+hand-off that does not complete refuses the removal for this pass with `LeadershipNotConfirmed` and
+the next pass retries; the attempt and its outcome are logged at Information, a refusal at Warning.
+The hand-off is not best-effort: an election does *not* recover a leader that left the replica set on
+its own when the range is quiesced (its followers gate elections on SWIM liveness of the leader's node,
+which stays alive), so a removal that went ahead left the range leaderless (Kahuna 1.12.7, 2026-10-18).
+As a safety net the followers now also treat a leader that is no longer in the range's replica set as
+vacated — see the partition-quiescence guide. If the process crashes
 between the two commits, the map durably shows a `Removing` replica, and the controller's next pass
 re-issues the removal, which skips straight to the final drop. Every handler is idempotent against
 its own retry.
