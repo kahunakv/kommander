@@ -52,7 +52,9 @@ namespace Kommander.Tests.Simulation.Transport;
 /// endpoints. One-way matters on its own: a link that fails in one direction only is what
 /// separates a genuinely partitioned leader from one that can still hear its followers, and the
 /// two produce very different elections. Duplication matters because Raft claims idempotence for
-/// its RPCs, and a claim of idempotence is worth testing.</para>
+/// its RPCs, and a claim of idempotence is worth testing. A filter by message kind
+/// (<see cref="SetLinkTraffic"/>) completes the set, and it is applied to every item inside a
+/// batched frame, because the dispatcher's batching is not part of simulated time.</para>
 /// </summary>
 public sealed class SimulatedTransport : ICommunication
 {
@@ -115,6 +117,11 @@ public sealed class SimulatedTransport : ICommunication
     /// carries everything except vote requests stops a node from starting its own election, so the
     /// candidate the scenario needs is the one that wins. Each is a real network shape: loss that
     /// hits one kind of message, or one node with a slow election timer.</para>
+    ///
+    /// <para><b>The filter sees through a batch.</b> The dispatcher coalesces queued messages for
+    /// one peer into one <c>BatchRequests</c> frame, and the filter is applied to each item inside
+    /// it, not to the frame (<see cref="FilterByLinkTraffic"/>). A scenario that relies on this
+    /// filter is otherwise at the mercy of whether two messages happened to share a frame.</para>
     /// </summary>
     public void SetLinkTraffic(string from, string to, LinkTraffic traffic) =>
         UpdateLink(from, to, fault => fault with { Traffic = traffic });
@@ -499,6 +506,24 @@ public sealed class SimulatedTransport : ICommunication
         if (IsOversized(Estimate(request)))
             return RefuseOversized(EmptyBatchRequests);
 
+        // The traffic filter is applied to each item here, before the frame reaches Intercept,
+        // which judges a frame by its own kind and knows "BatchRequests" as always carried. A
+        // blocked link is left to Intercept, so a dropped frame is counted once.
+        LinkFault fault = GetLinkFault(from, to);
+
+        if (!fault.Blocked)
+        {
+            BatchRequestsRequest? carried = FilterByLinkTraffic(fault.Traffic, request, out int filteredOut);
+
+            if (filteredOut > 0)
+                Interlocked.Add(ref droppedCount, filteredOut);
+
+            if (carried is null)
+                return EmptyBatchRequests;
+
+            request = carried;
+        }
+
         Func<BatchRequestsRequest> wire = Serialize(request, to);
 
         return Intercept(
@@ -869,13 +894,74 @@ public sealed class SimulatedTransport : ICommunication
         return heldResponse;
     }
 
-    /// <summary>Whether a link with this traffic setting carries a message of this kind.</summary>
-    private static bool Carries(LinkTraffic traffic, string messageType) => traffic switch
+    /// <summary>
+    /// Whether a link with this traffic setting carries a message of this kind.
+    ///
+    /// <para>A <c>BatchRequests</c> frame is always carried here, because its items were already
+    /// filtered one by one in <see cref="FilterByLinkTraffic"/> and a frame that kept no item was
+    /// dropped there. Judging the frame by its own kind is the defect that method exists for.</para>
+    /// </summary>
+    private static bool Carries(LinkTraffic traffic, string messageType)
     {
-        LinkTraffic.ElectionOnly => messageType is "RequestVotes" or "Vote",
-        LinkTraffic.NoVoteRequests => messageType != "RequestVotes",
-        _ => true,
+        if (messageType == "BatchRequests")
+            return true;
+
+        return traffic switch
+        {
+            LinkTraffic.ElectionOnly => messageType is "RequestVotes" or "Vote",
+            LinkTraffic.NoVoteRequests => messageType != "RequestVotes",
+            _ => true,
+        };
+    }
+
+    /// <summary>
+    /// The kind of one batch item in the vocabulary of <see cref="Carries"/>: a batched vote
+    /// request is a <c>RequestVotes</c> as much as one sent on its own RPC.
+    /// </summary>
+    private static string KindOf(BatchRequestsRequestType type) => type switch
+    {
+        BatchRequestsRequestType.RequestVote => "RequestVotes",
+        BatchRequestsRequestType.Vote => "Vote",
+        BatchRequestsRequestType.AppendLogs => "AppendLogs",
+        BatchRequestsRequestType.CompleteAppendLogs => "CompleteAppendLogs",
+        _ => type.ToString(),
     };
+
+    /// <summary>
+    /// Applies the traffic filter to each item of a batch. Returns the same batch when the link
+    /// carries every item, a new batch holding only the carried items when it carries some, and
+    /// <see langword="null"/> when it carries none. <paramref name="dropped"/> counts the items the
+    /// link did not carry.
+    ///
+    /// <para><b>Why the filter must look inside a batch.</b> <c>RaftTransportDispatcher</c> coalesces
+    /// whatever is queued for one peer into one <c>BatchRequests</c> frame, so a vote request rides
+    /// in a batch whenever another message to the same peer is queued at the same moment: a second
+    /// partition's vote request, a vote reply, an ack. The filter once judged the frame by its own
+    /// kind, so a batched vote request passed a <see cref="LinkTraffic.NoVoteRequests"/> link and a
+    /// batched vote was dropped by an <see cref="LinkTraffic.ElectionOnly"/> link. In
+    /// <c>TestStraddlingVoterScenarios</c> the straddler's vote requests for both partitions were
+    /// batched, leaked through, and the straddler won the term the scenario forbids it (GA run
+    /// 39526417260, 2026-10-21). Whether two messages share a frame is decided by the dispatcher's
+    /// thread, outside simulated time, which is why the leak was intermittent.</para>
+    /// </summary>
+    internal static BatchRequestsRequest? FilterByLinkTraffic(LinkTraffic traffic, BatchRequestsRequest request, out int dropped)
+    {
+        dropped = 0;
+
+        if (traffic == LinkTraffic.All || request.Requests is not { Count: > 0 } items)
+            return request;
+
+        List<BatchRequestsRequestItem> carried = items.Where(item => Carries(traffic, KindOf(item.Type))).ToList();
+        dropped = items.Count - carried.Count;
+
+        if (dropped == 0)
+            return request;
+
+        if (carried.Count == 0)
+            return null;
+
+        return new BatchRequestsRequest { Requests = carried };
+    }
 
     private LinkFault GetLinkFault(string from, string to)
     {

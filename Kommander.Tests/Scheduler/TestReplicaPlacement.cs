@@ -1194,7 +1194,7 @@ public sealed class TestReplicaPlacement
             // Default MaxReplicaMovesPerPass is 4: the lowest four ids convert in one commit.
             Assert.Single(payloads);
             Assert.Equal([5, 6], manager.GetPartitionsAwaitingPlacement().ToList());
-            Assert.All(new[] { 1, 2, 3, 4 }, id => Assert.Equal(3, MapEntry(manager, id).Replicas.Count));
+            Assert.All(Enumerable.Range(1, 4), id => Assert.Equal(3, MapEntry(manager, id).Replicas.Count));
 
             manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
             await RunEnqueuedPassToCompletionAsync(manager);
