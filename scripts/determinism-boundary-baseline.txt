@@ -34,7 +34,11 @@ Kommander/System/LeaderBalancer.cs|wall-clock-date 1
 Kommander/System/PartitionMapService.cs|wall-clock-sleep 3
 Kommander/System/RaftSystemCoordinator.cs|thread-pool-hop 1
 Kommander/System/RaftSystemCoordinator.cs|wall-clock-date 2
-Kommander/System/RaftSystemCoordinator.cs|wall-clock-sleep 1
+# The coordinator's control-plane retry delay, and the leader hand-off poll wait
+# (HandOffPartitionLeadershipCoreAsync). The poll only paces how often the coordinator re-reads the
+# leader hint while a remote transfer converges; the leader election itself decides the outcome.
+# Its deadline reads ValueStopwatch, the same real clock as the wait, for the watchdog reason above.
+Kommander/System/RaftSystemCoordinator.cs|wall-clock-sleep 2
 Kommander/System/ReplicaPlacementService.cs|wall-clock-date 1
 Kommander/System/ReplicaPlacementService.cs|wall-clock-sleep 1
 Kommander/System/SplitMergeController.cs|wall-clock-sleep 4
