@@ -2063,7 +2063,7 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 case 0: ReadVarint(data, ref pos); break;                             // varint
                 case 1: pos += 8; break;                                              // 64-bit
-                case 2: pos += (int)ReadVarint(data, ref pos); break;                 // length-delimited (skip payload)
+                case 2: SkipLengthDelimited(data, ref pos); break;                    // length-delimited (skip payload)
                 case 5: pos += 4; break;                                              // 32-bit
                 default: return 0;                                                    // unknown wire type — treat as default
             }
@@ -2116,7 +2116,7 @@ public class RocksDbWAL : IWAL, IDisposable
             switch (wireType)
             {
                 case 1: pos += 8; break;                                              // 64-bit
-                case 2: pos += (int)ReadVarint(data, ref pos); break;                 // length-delimited (skip payload)
+                case 2: SkipLengthDelimited(data, ref pos); break;                    // length-delimited (skip payload)
                 case 5: pos += 4; break;                                              // 32-bit
                 default: return;                                                      // unknown wire type — stop, keep defaults
             }
@@ -2308,6 +2308,19 @@ public class RocksDbWAL : IWAL, IDisposable
             logTypeCacheCount++;
 
         return value;
+    }
+
+    /// <summary>
+    /// Advances <paramref name="pos"/> past a length-delimited field: its varint length, then that many
+    /// bytes. The length is read into a local first: in <c>pos += (int)ReadVarint(data, ref pos)</c>, C#
+    /// reads <c>pos</c> before the call advances it, so the skip lands short by the length's own bytes
+    /// and the payload is parsed as fields, which can overwrite the header values decoded before it. A
+    /// length past the end of the buffer ends the scan, as a truncated field leaves nothing to read.
+    /// </summary>
+    private static void SkipLengthDelimited(ReadOnlySpan<byte> data, ref int pos)
+    {
+        ulong length = ReadVarint(data, ref pos);
+        pos = length > (ulong)(data.Length - pos) ? data.Length : pos + (int)length;
     }
 
     /// <summary>Decodes a base-128 varint at <paramref name="pos"/>, advancing it past the value.</summary>

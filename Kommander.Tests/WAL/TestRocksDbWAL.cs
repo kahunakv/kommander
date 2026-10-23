@@ -269,6 +269,69 @@ public sealed class TestRocksDbWAL
         }
     }
 
+    /// <summary>
+    /// A Proposed row has no type field on the wire (proto3 omits the default 0), so the header reader
+    /// walks on into the length-delimited log type and payload. A skip that landed one byte short would
+    /// read the payload's length, 32, as the tag of field 4 and the payload's first byte as the type,
+    /// Committed, and the proposed-tail sweep would then keep an entry no quorum agreed on.
+    /// </summary>
+    [Fact]
+    public void ProposedRowWhosePayloadLooksLikeATypeField_IsStillSweptAsProposed()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            byte[] payload = new byte[32];
+            payload[0] = (byte)RaftLogType.Committed;
+
+            List<RaftLog> proposed = [];
+            for (long id = 1; id <= 3; id++)
+                proposed.Add(new RaftLog { Id = id, Term = 5, Type = RaftLogType.Proposed, LogType = "op", LogData = payload });
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(6, proposed)]));
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateProposedLogsAfter(6, 0));
+
+            Assert.Empty(wal.ReadLogs(6));
+            Assert.Equal(0, wal.GetMaxLog(6));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// A row of term 0 has no term field on the wire, so the term reader walks on into the payload. A
+    /// skip that landed one byte short would read the payload's length, 24, as the tag of field 3 and
+    /// the payload's first byte as the term.
+    /// </summary>
+    [Fact]
+    public void TermZeroRowWhosePayloadLooksLikeATermField_ReadsTermZero()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            byte[] payload = new byte[24];
+            payload[0] = 9;
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write(
+                [(6, [new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Committed, LogType = "op", LogData = payload }])]));
+
+            Assert.Equal(0, wal.GetTermAt(6, 1));
+            Assert.Equal(0, wal.GetCurrentTerm(6));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog CreateLog(int partitionId, long id, long term, RaftLogType type = RaftLogType.Committed)
     {
         return new()
