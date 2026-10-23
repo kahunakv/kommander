@@ -82,6 +82,13 @@ public sealed record SimulationClusterOptions
     public long WalWriteLatencyMilliseconds { get; init; }
 
     /// <summary>
+    /// When true, every node records its write-ahead events for the TLA+ trace validator (see
+    /// <see cref="Trace.WalTraceRecorder"/> and <c>formal/README.md</c>). Off by default: a recorder
+    /// holds every event of the run in memory.
+    /// </summary>
+    public bool RecordWalTrace { get; init; }
+
+    /// <summary>
     /// Applied to every node's configuration after the defaults above. Use it to sample the
     /// safety-relevant configuration surface per run.
     /// </summary>

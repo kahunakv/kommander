@@ -123,9 +123,12 @@ internal sealed class WalCompletionRouter
 
             // The resolution twin: a commit marker that rode sync-off is written but not yet on
             // disk, so it must not count toward the frontier this node reports as durable — even
-            // when it lands below resolutions an earlier synced write already carried.
+            // when it lands below resolutions an earlier synced write already carried. The exact
+            // resolved ids go with it, because the written resolution frontier must not certify an
+            // id from the span alone.
             wal.MarkResolutionWritten(
-                completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex, completion.Synced);
+                completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex,
+                completion.ResolvedSparseLogIds, completion.Synced);
         }
 
         // ── Failed-write frontier repair ───────────────────────────────────────

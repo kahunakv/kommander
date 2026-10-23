@@ -384,6 +384,96 @@ public sealed class TestDurableCommitFrontier
         }
     }
 
+    /// <summary>
+    /// FINDING 9 end to end through the scheduler: a synced resolution of a higher id completes
+    /// while the marker for a lower held id is enqueued but its completion is not yet routed. The
+    /// commit frontier already covers both ids, and the synced high-water already covers both; only
+    /// the written resolution frontier knows the lower marker has not been written. A crash in this
+    /// window restores the lower id as <c>Proposed</c>, so the reported frontier must stay below it.
+    ///
+    /// <para>Asserts the two scheduler facts the case needs, so a change to either side fails here:
+    /// the never-held Committed row is written with an fsync (RequiresSync), and the marker over a
+    /// held row rides sync-off.</para>
+    /// </summary>
+    [Fact]
+    public async Task QueuedMarkerBelowASyncedResolution_IsNotReportedDurable_UntilItIsWrittenAndCarried()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            // 1 held as Proposed on disk.
+            Written(writeAhead, await Append(writeAhead, Proposed(1)));
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // The row for 2 arrives typed Committed before the marker for 1: a first write, synced.
+            RaftWalCompletion two = await Append(writeAhead, Committed(2));
+            Assert.True(two.Synced, "a Committed row this node never held must be fsynced");
+
+            // The marker for 1: a held row, so it rides sync-off. Its completion is not routed yet.
+            RaftWalCompletion one = await Append(writeAhead, Committed(1));
+            Assert.False(one.Synced, "a marker over a held row must ride sync-off for this case to exist");
+            Assert.Equal(2, writeAhead.GetCommitIndex());
+
+            // The synced write for 2 is routed first. Before the fix this reported 2.
+            Written(writeAhead, two);
+            Assert.Equal(2, writeAhead.GetDurableResolvedIndex());
+            Assert.Equal(0, writeAhead.GetWrittenResolvedIndex());
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // The marker for 1 is routed: written, but sync-off, so still not on disk.
+            Written(writeAhead, one);
+            Assert.Equal(2, writeAhead.GetWrittenResolvedIndex());
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // A synced write carries it.
+            Written(writeAhead, await Append(writeAhead, Proposed(3)));
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A batch whose resolved rows do not fill their own span carries the exact resolved ids, and
+    /// the written resolution frontier advances over exactly those: a follower batch that mixes a
+    /// Proposed row between two Committed rows must not certify the Proposed row's resolution.
+    /// </summary>
+    [Fact]
+    public async Task MixedBatch_CarriesTheExactResolvedIds_AndDoesNotCertifyTheSkippedOne()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Written(writeAhead, await Append(writeAhead, Committed(1), Committed(2)));
+            Assert.Equal(2, writeAhead.GetWrittenResolvedIndex());
+
+            RaftWalCompletion mixed = await Append(writeAhead, Committed(3), Proposed(4), Committed(5));
+            Assert.Equal(3, mixed.ResolvedMinLogIndex);
+            Assert.Equal(5, mixed.ResolvedMaxLogIndex);
+            Assert.NotNull(mixed.ResolvedSparseLogIds);
+            Assert.Equal([3L, 5L], mixed.ResolvedSparseLogIds);
+
+            Written(writeAhead, mixed);
+            Assert.Equal(3, writeAhead.GetWrittenResolvedIndex());
+
+            // A contiguous marker batch carries no id list and allocates nothing.
+            RaftWalCompletion four = await Append(writeAhead, Committed(4));
+            Assert.Null(four.ResolvedSparseLogIds);
+            Written(writeAhead, four);
+            Assert.Equal(5, writeAhead.GetWrittenResolvedIndex());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private readonly ConcurrentDictionary<long, TaskCompletionSource<RaftWalCompletion>> completions = new();
@@ -428,7 +518,8 @@ public sealed class TestDurableCommitFrontier
     {
         Durable(writeAhead, completion);
         writeAhead.MarkResolutionWritten(
-            completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex, completion.Synced);
+            completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex,
+            completion.ResolvedSparseLogIds, completion.Synced);
     }
 
     private static RaftLog Committed(long id, long term = 1) => new()

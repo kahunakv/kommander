@@ -748,6 +748,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             configuration.WalSingleFsyncCommit,
             configuration.TickSource,
             manualExecution: !configuration.EnableInternalSchedulingThreads);
+        walScheduler.TraceSink = configuration.WalTraceSink;
 
         loadReportService = new LoadReportService(
             this,

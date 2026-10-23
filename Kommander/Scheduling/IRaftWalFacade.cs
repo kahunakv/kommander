@@ -181,6 +181,15 @@ public interface IRaftWalFacade
     void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, bool synced) { }
 
     /// <summary>
+    /// <see cref="MarkResolutionWritten(long, long, bool)"/> with the exact resolved ids when they do
+    /// not fill the span (<see cref="RaftWalCompletion.ResolvedSparseLogIds"/>), so the written
+    /// resolution frontier never certifies an id from a span alone. The completion router calls this
+    /// overload. Defaults to the span overload for facades that do not track that frontier.
+    /// </summary>
+    void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, long[]? resolvedSparseLogIds, bool synced) =>
+        MarkResolutionWritten(resolvedMinLogIndex, resolvedMaxLogIndex, synced);
+
+    /// <summary>
     /// The commit index this node publishes OUTSIDE the replication protocol
     /// (<see cref="IRaft.GetCommitIndex"/>, the partition view): the highest id both resolved and
     /// durably held here, and never lower than a value returned earlier in this process lifetime.

@@ -267,6 +267,27 @@ public sealed class RaftWriteAhead
 
     private long ridingResolvedFloor = long.MaxValue;
 
+    // ── Written resolution ─────────────────────────────────────────────────────────────────
+    // commitIndex advances when a resolution is ENQUEUED, and durableResolvedIndex is a high-water
+    // mark over resolutions that COMPLETED. Together they over-reported: a follower holding 1 as
+    // Proposed receives the row for 2 typed Committed first (a synced first write), then the
+    // marker for 1. The marker closes the gap, so commitIndex covers 1 and 2 while the marker
+    // still waits in the WAL queue; the synced write for 2 then completes and lifts the high-water
+    // past 1. The riding floor cannot help, because it only learns of a sync-off marker when that
+    // marker's own completion arrives. The follower reported 2, and a crash before the marker was
+    // written restored 1 as Proposed with a commit frontier of 0 (FINDING 9: found by the TLA+
+    // model in formal/tla, config Current before this change, and reached by the deterministic
+    // simulation on seed 20261022).
+    //
+    // writtenResolvedIndex is the gap-buffered frontier of resolutions whose write COMPLETED,
+    // synced or not: an id counts only once its own resolution reached the store. It bounds the
+    // reported frontier beside the synced high-water and the riding floor, which still decide
+    // whether a written resolution is on disk. It never certifies an id from a span alone
+    // (RaftWalCompletion.ResolvedSparseLogIds). Single writer: the partition executor.
+    private long writtenResolvedIndex = 1;
+
+    private readonly SortedSet<long> pendingWrittenResolved = new();
+
     // The highest row id of any type the last restore read from the disk. Rows written before this
     // process started are not reported through MarkResolutionWritten, so GetReadableResolvedHighWater
     // must cover them from here: a resolved row restored above a hole becomes deliverable once the
@@ -794,6 +815,18 @@ public sealed class RaftWriteAhead
         durableResolvedIndex = commitIndex;
         ridingResolvedIndex = commitIndex;
         ridingResolvedFloor = long.MaxValue;
+        pendingWrittenResolved.Clear();
+        writtenResolvedIndex = commitIndex;
+
+        // The model's restore chains from id 1 over the disk alone. A floor that seeds the scan
+        // (checkpoint, compaction, application soft floor) is outside it, so the trace stops there.
+        if (manager.Configuration.WalTraceSink is not null)
+        {
+            if (restoreSoftFloorIndex > 0 || restoreCompactionFloor > 1 || certifiedCheckpointFloor > 0)
+                TraceUnsupported("restore seeded from a floor");
+            else
+                TraceFrontiers(WalTraceEventKind.Restore);
+        }
 
         // ── Restore the HLC floor before anything can mint a timestamp ────────────────────
         // Merge the durable high-water mark and the maximum restored entry timestamp into the node
@@ -1042,6 +1075,8 @@ public sealed class RaftWriteAhead
             // is enabled): one LeaderPropose enqueue per single-round committed write.
             WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.LeaderPropose);
 
+            TraceFrontiers(WalTraceEventKind.Frontiers);
+
             return operation;
         }
         finally
@@ -1177,6 +1212,8 @@ public sealed class RaftWriteAhead
                     if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                         AdvanceCommitFrontier(ordered[i].Id);
                 }
+
+                TraceFrontiers(WalTraceEventKind.Frontiers);
 
                 return operation;
             }
@@ -1325,6 +1362,8 @@ public sealed class RaftWriteAhead
                     if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                         AdvanceCommitFrontier(ordered[i].Id);
                 }
+
+                TraceFrontiers(WalTraceEventKind.Frontiers);
 
                 return operation;
             }
@@ -1673,10 +1712,34 @@ public sealed class RaftWriteAhead
         }
 
         if (commitRegressed || presenceRegressed)
+            TraceFrontiers(WalTraceEventKind.Frontiers);
+
+        if (commitRegressed || presenceRegressed)
             logger.LogError(
                 "[{Endpoint}/{Partition}] WAL write of range [{Min},{Max}] failed after the frontiers advanced optimistically; regressed commit frontier to {CommitIndex} and presence frontier to {PresentIndex} so this node stops advertising entries that are not on disk",
                 manager.LocalEndpoint, partition.PartitionId, minLogIndex, maxLogIndex, commitIndex - 1, presentIndex - 1);
     }
+
+    /// <summary>
+    /// Reports the raw frontier fields after an event to the test-only trace sink (see
+    /// <see cref="IWalTraceSink"/>); one null check when tracing is off. Executor thread, like every
+    /// writer of these fields, except the compaction pass, which reports only that it ran.
+    /// </summary>
+    private void TraceFrontiers(WalTraceEventKind kind, long min = -1, long max = -1, long[]? sparseIds = null, bool synced = false)
+    {
+        IWalTraceSink? sink = manager.Configuration.WalTraceSink;
+        if (sink is null)
+            return;
+
+        WalTraceFrontiers frontiers = new(
+            commitIndex, presentIndex, durablePresentIndex, durableResolvedIndex,
+            ridingResolvedIndex, ridingResolvedFloor, writtenResolvedIndex, GetDurableCommitFrontier());
+
+        sink.Record(new(partition.PartitionId, kind, frontiers, Synced: synced, Min: min, Max: max, SparseIds: sparseIds));
+    }
+
+    private void TraceUnsupported(string detail) =>
+        manager.Configuration.WalTraceSink?.Record(new(partition.PartitionId, WalTraceEventKind.Unsupported, Detail: detail));
 
     /// <summary>
     /// Records that a WAL write COMPLETED successfully, so every id it carried is on disk, and
@@ -1713,6 +1776,8 @@ public sealed class RaftWriteAhead
         }
 
         RefreshPublishedCommitIndex();
+
+        TraceFrontiers(WalTraceEventKind.Durable, minLogIndex, maxLogIndex, sparseLogIds);
     }
 
     /// <summary>
@@ -1741,10 +1806,19 @@ public sealed class RaftWriteAhead
     /// answering keeps advertising every entry it has queued — the leader's retention floor then
     /// followed a position the follower did not hold and compaction removed the range its backfill
     /// needed (a CamusDB slow-disk run). The published index is monotone for observers, so it would
-    /// hide the failed-write regression the leader's re-ship must see. Executor thread only.
+    /// hide the failed-write regression the leader's re-ship must see. The resolved part counts only
+    /// resolutions whose own write completed (FINDING 9) and that a synced write carried (FINDING 7,
+    /// FINDING 8). Executor thread only.
     /// </summary>
     public long GetDurableCommitFrontier() =>
-        Math.Min(Math.Min(commitIndex, durablePresentIndex), DurableResolvedFrontier()) - 1;
+        Math.Min(Math.Min(Math.Min(commitIndex, writtenResolvedIndex), durablePresentIndex), DurableResolvedFrontier()) - 1;
+
+    /// <summary>
+    /// Highest id below which every resolution has been written by a successful completion, with
+    /// no hole (see the field comment on <c>writtenResolvedIndex</c>). Test-visible for the same
+    /// reason as <see cref="GetDurablePresentIndex"/>.
+    /// </summary>
+    public long GetWrittenResolvedIndex() => writtenResolvedIndex - 1;
 
     /// <summary>
     /// Highest id below which every resolution is known to be on disk: the synced high-water,
@@ -1767,8 +1841,29 @@ public sealed class RaftWriteAhead
     /// whatever was synced above it. See the field comment on <c>durableResolvedIndex</c> for why
     /// the reported frontier needs both. Executor thread only.
     /// </summary>
-    public void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, bool synced)
+    public void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, bool synced) =>
+        MarkResolutionWritten(resolvedMinLogIndex, resolvedMaxLogIndex, null, synced);
+
+    /// <summary>
+    /// <see cref="MarkResolutionWritten(long, long, bool)"/> with the exact resolved ids when they do
+    /// not fill [<paramref name="resolvedMinLogIndex"/>, <paramref name="resolvedMaxLogIndex"/>]
+    /// (<see cref="RaftWalCompletion.ResolvedSparseLogIds"/>); null means they do. The written
+    /// resolution frontier advances over exactly those ids, gap-buffered, before the synced
+    /// high-water and the riding floor are updated. Executor thread only.
+    /// </summary>
+    public void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, long[]? resolvedSparseLogIds, bool synced)
     {
+        if (resolvedSparseLogIds is not null)
+        {
+            foreach (long id in resolvedSparseLogIds)
+                AdvanceWrittenResolution(id);
+        }
+        else if (resolvedMinLogIndex >= 0 && resolvedMaxLogIndex >= resolvedMinLogIndex)
+        {
+            for (long id = Math.Max(resolvedMinLogIndex, writtenResolvedIndex); id <= resolvedMaxLogIndex; id++)
+                AdvanceWrittenResolution(id);
+        }
+
         if (resolvedMaxLogIndex >= 0 && resolvedMaxLogIndex + 1 > ridingResolvedIndex)
             ridingResolvedIndex = resolvedMaxLogIndex + 1;
 
@@ -1778,11 +1873,51 @@ public sealed class RaftWriteAhead
                 durableResolvedIndex = ridingResolvedIndex;
 
             ridingResolvedFloor = long.MaxValue;
+            TraceFrontiers(WalTraceEventKind.Resolution, resolvedMinLogIndex, resolvedMaxLogIndex, resolvedSparseLogIds, synced: true);
             return;
         }
 
         if (resolvedMinLogIndex >= 0 && resolvedMinLogIndex < ridingResolvedFloor)
             ridingResolvedFloor = resolvedMinLogIndex;
+
+        TraceFrontiers(WalTraceEventKind.Resolution, resolvedMinLogIndex, resolvedMaxLogIndex, resolvedSparseLogIds, synced: false);
+    }
+
+    private void AdvanceWrittenResolution(long id)
+    {
+        if (id < writtenResolvedIndex)
+            return;
+
+        if (id > writtenResolvedIndex)
+        {
+            pendingWrittenResolved.Add(id);
+            return;
+        }
+
+        writtenResolvedIndex = id + 1;
+        DrainPendingWrittenResolved();
+    }
+
+    /// <summary>
+    /// Drops buffered written resolutions already covered by the frontier, then absorbs any that
+    /// have become contiguous. Shared by the completion advance and the snapshot seed.
+    /// </summary>
+    private void DrainPendingWrittenResolved()
+    {
+        while (pendingWrittenResolved.Count > 0)
+        {
+            long next = pendingWrittenResolved.Min;
+            if (next < writtenResolvedIndex)
+            {
+                pendingWrittenResolved.Remove(next);
+                continue;
+            }
+            if (next > writtenResolvedIndex)
+                break;
+
+            pendingWrittenResolved.Remove(next);
+            writtenResolvedIndex = next + 1;
+        }
     }
 
     /// <summary>
@@ -1857,7 +1992,11 @@ public sealed class RaftWriteAhead
     /// <see cref="Scheduling.IRaftWalFacade.MarkInheritedCommitted"/>). Monotonic and gap-buffered
     /// like every resolution: the later re-commit enqueue's own advance is then a no-op.
     /// </summary>
-    public void MarkInheritedCommitted(long id) => AdvanceCommitFrontier(id);
+    public void MarkInheritedCommitted(long id)
+    {
+        AdvanceCommitFrontier(id);
+        TraceFrontiers(WalTraceEventKind.Frontiers);
+    }
 
     /// <summary>
     /// Absorbs a prefix that is proven resolved by OTHER bookkeeping (the applied cursor, capped by
@@ -1890,10 +2029,13 @@ public sealed class RaftWriteAhead
         }
 
         RefreshPublishedCommitIndex();
+        TraceFrontiers(WalTraceEventKind.Frontiers);
     }
 
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false)
     {
+        TraceUnsupported("snapshot-boundary seed");
+
         // A truncating install just removed every WAL row above the boundary, so any bookkeeping
         // buffered above it — resolutions, presence, durability — describes rows that no longer
         // exist. Purge it BEFORE the drains below, or the seed itself absorbs the stale ids and
@@ -1906,6 +2048,10 @@ public sealed class RaftWriteAhead
                 pendingResolved.Remove(pendingResolved.Max);
             while (pendingDurable.Count > 0 && pendingDurable.Max > snapshotIndex)
                 pendingDurable.Remove(pendingDurable.Max);
+            while (pendingWrittenResolved.Count > 0 && pendingWrittenResolved.Max > snapshotIndex)
+                pendingWrittenResolved.Remove(pendingWrittenResolved.Max);
+            if (writtenResolvedIndex > snapshotIndex + 1)
+                writtenResolvedIndex = snapshotIndex + 1;
             while (pendingPresent.Count > 0)
             {
                 long maxPending = -1;
@@ -1967,6 +2113,9 @@ public sealed class RaftWriteAhead
         if (target > ridingResolvedIndex)
             ridingResolvedIndex = target;
         ridingResolvedFloor = long.MaxValue;
+        if (target > writtenResolvedIndex)
+            writtenResolvedIndex = target;
+        DrainPendingWrittenResolved();
 
         RefreshPublishedCommitIndex();
     }
@@ -2029,6 +2178,8 @@ public sealed class RaftWriteAhead
     /// </summary>
     public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId)
     {
+        TraceUnsupported("suffix truncation");
+
         long maxLogId = await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
             (walAdapter, partition.PartitionId, afterLogId),
@@ -2078,6 +2229,13 @@ public sealed class RaftWriteAhead
         if (durablePresentIndex > afterLogId + 1)
             durablePresentIndex = Math.Max(afterLogId, 0) + 1;
 
+        // Resolved rows above afterLogId are gone too, so their written resolutions are no longer
+        // in the store.
+        while (pendingWrittenResolved.Count > 0 && pendingWrittenResolved.Max > afterLogId)
+            pendingWrittenResolved.Remove(pendingWrittenResolved.Max);
+        if (writtenResolvedIndex > afterLogId + 1)
+            writtenResolvedIndex = Math.Max(afterLogId, 0) + 1;
+
         return maxLogId;
     }
 
@@ -2094,6 +2252,8 @@ public sealed class RaftWriteAhead
     public async ValueTask<(RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
         long snapshotIndex, long lastIncludedTerm)
     {
+        TraceUnsupported("snapshot boundary install");
+
         return await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
             (walAdapter, partition.PartitionId, snapshotIndex, lastIncludedTerm),
@@ -2490,6 +2650,8 @@ public sealed class RaftWriteAhead
         // Follower-side durable phase. Followers fsync on the propose quorum's critical
         // path, so this phase's latency is measured symmetrically with the leader's.
         WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.FollowerAppend);
+
+        TraceFrontiers(WalTraceEventKind.Frontiers);
 
         return operation;
     }
@@ -3005,6 +3167,9 @@ public sealed class RaftWriteAhead
 
                 return status == RaftOperationStatus.Success ? removed : 0;
             }).ConfigureAwait(false);
+
+            if (removedTotal > 0)
+                TraceUnsupported("compaction");
 
             logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, effectiveFloor);
 

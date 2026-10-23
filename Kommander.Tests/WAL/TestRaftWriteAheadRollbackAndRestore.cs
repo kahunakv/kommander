@@ -327,7 +327,7 @@ public sealed class TestRaftWriteAheadRollbackAndRestore
     private static void Written(RaftWriteAhead writeAhead, RaftWalCompletion completion)
     {
         writeAhead.MarkDurablyWritten(completion.MinLogIndex, completion.WrittenMaxLogIndex, completion.SparseLogIds);
-        writeAhead.MarkResolutionWritten(completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex, completion.Synced);
+        writeAhead.MarkResolutionWritten(completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex, completion.ResolvedSparseLogIds, completion.Synced);
     }
 
     /// <summary>

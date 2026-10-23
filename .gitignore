@@ -28,3 +28,4 @@ nupkg
 nupkgs
 specs/
 .DS_Store
+formal/.tools/

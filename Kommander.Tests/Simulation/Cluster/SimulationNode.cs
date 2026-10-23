@@ -37,12 +37,14 @@ public sealed class SimulationNode : IAsyncDisposable
         RaftManager manager,
         IWAL wal,
         SimulatedPartitionStateTransfer stateTransfer,
+        Trace.WalTraceRecorder? walTrace,
         SimulationClusterOptions options,
         VirtualTickSource clock,
         SimulatedTransport transport,
         ILogger<IRaft> logger)
     {
         NodeIndex = nodeIndex;
+        WalTrace = walTrace;
         Endpoint = endpoint;
         Manager = manager;
         Wal = wal;
@@ -110,6 +112,12 @@ public sealed class SimulationNode : IAsyncDisposable
     /// </summary>
     public SimulatedPartitionStateTransfer StateTransfer { get; }
 
+    /// <summary>
+    /// This node's write-ahead trace, or null unless <see cref="SimulationClusterOptions.RecordWalTrace"/>
+    /// is set. One instance for the life of the node, like the store it describes.
+    /// </summary>
+    public Trace.WalTraceRecorder? WalTrace { get; }
+
     /// <summary>Lifecycle state as the harness last set it.</summary>
     public SimulationNodeLifecycleStatus LifecycleStatus { get; private set; } =
         SimulationNodeLifecycleStatus.Stopped;
@@ -154,9 +162,11 @@ public sealed class SimulationNode : IAsyncDisposable
 
         SimulatedPartitionStateTransfer stateTransfer = new();
 
-        RaftManager manager = BuildManager(nodeIndex, options, clock, transport, logger, wal, stateTransfer);
+        Trace.WalTraceRecorder? walTrace = options.RecordWalTrace ? new Trace.WalTraceRecorder(endpoint) : null;
 
-        return new SimulationNode(nodeIndex, endpoint, manager, wal, stateTransfer, options, clock, transport, logger);
+        RaftManager manager = BuildManager(nodeIndex, options, clock, transport, logger, wal, stateTransfer, walTrace);
+
+        return new SimulationNode(nodeIndex, endpoint, manager, wal, stateTransfer, walTrace, options, clock, transport, logger);
     }
 
     /// <summary>
@@ -170,7 +180,8 @@ public sealed class SimulationNode : IAsyncDisposable
         SimulatedTransport transport,
         ILogger<IRaft> logger,
         IWAL wal,
-        SimulatedPartitionStateTransfer stateTransfer)
+        SimulatedPartitionStateTransfer stateTransfer,
+        Trace.WalTraceRecorder? walTrace)
     {
         List<RaftNode> peers = [];
         for (int peerIndex = 0; peerIndex < options.NodeCount; peerIndex++)
@@ -239,6 +250,10 @@ public sealed class SimulationNode : IAsyncDisposable
         };
 
         options.ConfigureNode?.Invoke(configuration);
+
+        // After the hook, so no per-run configuration can drop it. Set before the manager exists,
+        // because partitions restore while it starts and the restore is part of the trace.
+        configuration.WalTraceSink = walTrace;
 
         RaftManager manager = new(
             configuration,
@@ -405,8 +420,18 @@ public sealed class SimulationNode : IAsyncDisposable
         transport.MarkDown(Endpoint);
 
         Manager.Dispose();
+
+        long lostByLyingDisk = SimulatedWal?.ResolutionsLostByLyingDisk ?? 0;
         SimulatedWal?.Crash();
         StateTransfer.ReleaseHungExports();
+
+        // The model's crash drops exactly the writes no synced write carried. A plain in-memory
+        // store drops nothing, a store with a write latency also drops synced writes, and the
+        // lying-disk fault drops fsynced resolutions; the trace stops at any of them.
+        WalTrace?.RecordCrash(breaksFsyncContract:
+            SimulatedWal is null
+            || SimulatedWal.WriteLatencyMilliseconds > 0
+            || SimulatedWal.ResolutionsLostByLyingDisk > lostByLyingDisk);
     }
 
     /// <summary>
@@ -426,7 +451,7 @@ public sealed class SimulationNode : IAsyncDisposable
         if (LifecycleStatus == SimulationNodeLifecycleStatus.Running)
             throw new InvalidOperationException($"{Endpoint} is already running.");
 
-        Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal, StateTransfer);
+        Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal, StateTransfer, WalTrace);
         transport.ThawEndpoint(Endpoint);
         transport.MarkUp(Endpoint);
     }

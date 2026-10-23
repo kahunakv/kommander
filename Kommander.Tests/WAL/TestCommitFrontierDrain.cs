@@ -329,8 +329,67 @@ public sealed class TestCommitFrontierDrain
         }
     }
 
+    /// <summary>
+    /// A resolution that is still QUEUED is not durable, even when a synced resolution above it has
+    /// already completed (FINDING 9, found by the TLA+ model in <c>formal/tla</c>; the config
+    /// <c>ControlFinding9</c> keeps the rule before the fix and must still fail).
+    ///
+    /// <para>The commit frontier advances when a resolution is enqueued. A follower holding 1 as
+    /// <c>Proposed</c> receives the row for 2 typed <c>Committed</c> first (a first write, so it is
+    /// synced), then the marker for 1. The marker for 1 closes the gap and moves the commit
+    /// frontier to 2 while it waits in the WAL queue. The synced write for 2 then completes and
+    /// lifts the durable resolution high-water past 1. The riding floor does not help: it only
+    /// covers markers that completed sync-off. A crash before the marker for 1 is written restores
+    /// 1 as <c>Proposed</c> and a commit frontier of 0, so the frontier must say 0 until then.</para>
+    /// </summary>
+    [Fact]
+    public void DurableCommitFrontier_DoesNotCountAResolutionStillQueuedBelowASyncedOne()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            // Entry 1 is present on disk as Proposed (a propose is always synced).
+            Append(writeAhead, Proposed(1));
+            writeAhead.MarkDurablyWritten(1, 1, null);
+            writeAhead.MarkResolutionWritten(-1, -1, synced: true);
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // The row for 2 arrives typed Committed before the marker for 1, then the marker for 1.
+            Append(writeAhead, Committed(2));
+            Append(writeAhead, Committed(1));
+            Assert.Equal(2, writeAhead.GetCommitIndex());
+
+            // The synced first write of 2 completes. The marker for 1 has not been written.
+            writeAhead.MarkDurablyWritten(2, 2, null);
+            writeAhead.MarkResolutionWritten(2, 2, synced: true);
+            Assert.Equal(0, writeAhead.GetWrittenResolvedIndex());
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // Once the marker for 1 is written and carried by a synced write, both count.
+            writeAhead.MarkDurablyWritten(1, 1, null);
+            writeAhead.MarkResolutionWritten(1, 1, synced: false);
+            writeAhead.MarkResolutionWritten(-1, -1, synced: true);
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     private static void Append(RaftWriteAhead writeAhead, params RaftLog[] logs) =>
         writeAhead.EnqueueProposeOrCommit(logs.ToList());
+
+    private static RaftLog Proposed(long id) => new()
+    {
+        Id = id,
+        Term = 1,
+        Type = RaftLogType.Proposed,
+        LogType = "frontier-test",
+        LogData = [1, 2, 3],
+    };
 
     private static RaftLog Committed(long id) => new()
     {

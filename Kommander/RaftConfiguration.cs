@@ -536,6 +536,13 @@ public class RaftConfiguration
     public bool WalSingleFsyncCommit { get; set; } = true;
 
     /// <summary>
+    /// Test-only: receives the write-ahead events the TLA+ trace validator replays (see
+    /// <see cref="Diagnostics.IWalTraceSink"/>). Null, the default, emits nothing. Internal so it
+    /// can never be set outside this assembly and its tests.
+    /// </summary>
+    internal Diagnostics.IWalTraceSink? WalTraceSink { get; set; }
+
+    /// <summary>
     /// When <c>true</c> (the default), a leader sends a new proposal to its followers as soon as its
     /// own Proposed write is queued, so the followers' writes run while the leader's does. When
     /// <c>false</c>, the fan-out waits for the leader's write to be durable, which puts two WAL writes

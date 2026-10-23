@@ -83,7 +83,17 @@ public sealed record RaftWalCompletion(
     /// the marker as on disk while a crash still returns the row to <c>Proposed</c> (GA nightly
     /// run 36551556947, seed 7923056534695766174: "reported 7 ... after the crash 6:Proposed").
     /// </summary>
-    long ResolvedMinLogIndex = -1
+    long ResolvedMinLogIndex = -1,
+
+    /// <summary>
+    /// The distinct ascending resolved ids this write carried, when they do NOT fill
+    /// [<see cref="ResolvedMinLogIndex"/>, <see cref="ResolvedMaxLogIndex"/>]; null when they do,
+    /// which is the common case and allocates nothing. The written resolution frontier advances
+    /// over exactly these ids: a batch that mixes Proposed and Committed rows, or a marker batch
+    /// that skips an id, must not certify the skipped id's resolution from the span alone (the same
+    /// rule <see cref="SparseLogIds"/> enforces for presence).
+    /// </summary>
+    long[]? ResolvedSparseLogIds = null
 )
 {
     /// <summary>

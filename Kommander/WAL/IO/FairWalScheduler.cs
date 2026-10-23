@@ -114,6 +114,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private readonly bool lazyCommitMarkers;
 
     /// <summary>
+    /// Test-only: receives a Write event per operation after a successful batch write, and a Truncate
+    /// event after a successful proposed-tail truncation, so the TLA+ trace validator can keep its
+    /// model of the disk in step with this store (see <see cref="Diagnostics.IWalTraceSink"/>).
+    /// Null in production. Set once, by the manager, before the scheduler runs.
+    /// </summary>
+    internal Diagnostics.IWalTraceSink? TraceSink { get; set; }
+
+    /// <summary>
     /// True when this scheduler owns no worker threads and a caller drives every flush through
     /// <see cref="PumpOnce"/> or <see cref="PumpUntilIdle"/>.
     /// <para>Only a deterministic simulation sets this. Writes stay deferred rather than running
@@ -990,7 +998,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             }
 
             if (minTruncateIndex != long.MaxValue)
-                walAdapter.TruncateProposedLogsAfter(pid, Math.Max(minTruncateIndex, acceptedFloor));
+            {
+                long cut = Math.Max(minTruncateIndex, acceptedFloor);
+                RaftOperationStatus truncated = walAdapter.TruncateProposedLogsAfter(pid, cut);
+                if (TraceSink is { } truncateTrace && truncated == RaftOperationStatus.Success)
+                    truncateTrace.Record(new(pid, Diagnostics.WalTraceEventKind.Truncate, Max: cut));
+            }
         }
 
         // ── Phase 2: single cross-partition WAL write ──────────────────────
@@ -1041,6 +1054,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (logGroups.Count > 0)
             {
                 status = walAdapter.Write(logGroups, sync);
+
+                if (TraceSink is { } writeTrace && status == RaftOperationStatus.Success)
+                    TraceBatchWrite(writeTrace, groupBatches, sync);
                 Interlocked.Increment(ref _totalBatchesWritten);
                 if (sync)
                     Interlocked.Increment(ref _totalSyncBatchesWritten);
@@ -1257,6 +1273,63 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Records one Write event per log-carrying operation of a successful batch, in submission order
+    /// per partition, before any completion fires: the validator applies the rows to its disk model
+    /// at write time, so a crash between the write and the completion is modelled as the store sees it.
+    /// </summary>
+    private static void TraceBatchWrite(
+        Diagnostics.IWalTraceSink sink, List<(int, List<WALWriteOperation>)> groupBatches, bool synced)
+    {
+        foreach ((int pid, List<WALWriteOperation> ops) in groupBatches)
+            foreach (WALWriteOperation op in ops)
+            {
+                if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
+                    continue;
+
+                List<RaftLog> logs = op.Logs.Logs;
+                Diagnostics.WalTraceRow[] rows = new Diagnostics.WalTraceRow[logs.Count];
+                for (int i = 0; i < logs.Count; i++)
+                    rows[i] = new(logs[i].Id, logs[i].Type);
+
+                sink.Record(new(pid, Diagnostics.WalTraceEventKind.Write, Rows: rows, Synced: synced));
+            }
+    }
+
+    /// <summary>
+    /// True when the resolved rows of <paramref name="logs"/> cover every id in
+    /// [<paramref name="min"/>, <paramref name="max"/>]. One pass with no allocation when the resolved
+    /// rows are in ascending order without gaps, which is the common case; otherwise counts the
+    /// distinct resolved ids.
+    /// </summary>
+    private static bool ResolvedFillSpan(List<RaftLog> logs, long min, long max)
+    {
+        long previous = -1;
+        bool ordered = true;
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                continue;
+            if (previous >= 0 && log.Id != previous && log.Id != previous + 1)
+            {
+                ordered = false;
+                break;
+            }
+            previous = log.Id;
+        }
+
+        if (ordered)
+            return true;
+
+        HashSet<long> distinct = [];
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type is not (RaftLogType.Proposed or RaftLogType.ProposedCheckpoint))
+                distinct.Add(log.Id);
+        }
+        return distinct.Count == max - min + 1;
+    }
+
     private static bool AllCommittedMarkers(List<RaftLog> logs)
     {
         if (logs.Count == 0)
@@ -1363,6 +1436,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 sparseIds = null;
         }
 
+        // The resolved ids get the same treatment: allocation-free when they fill their own span,
+        // which a pure marker batch in id order always does.
+        long[]? resolvedSparseIds = null;
+        if (resolvedMin >= 0 && !ResolvedFillSpan(logs, resolvedMin, resolvedMax))
+            resolvedSparseIds = logs
+                .Where(static log => log.Type is not (RaftLogType.Proposed or RaftLogType.ProposedCheckpoint))
+                .Select(static log => log.Id).Distinct().Order().ToArray();
+
         return new RaftWalCompletion(
             PartitionId: op.Logs.PartitionId,
             OperationId: op.OperationId,
@@ -1375,7 +1456,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             SparseLogIds: sparseIds,
             Synced: synced,
             ResolvedMaxLogIndex: resolvedMax,
-            ResolvedMinLogIndex: resolvedMin
+            ResolvedMinLogIndex: resolvedMin,
+            ResolvedSparseLogIds: resolvedSparseIds
         )
         {
             DurableStageTicks = durableStageTicks
