@@ -224,6 +224,14 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     internal Action? OnAfterBoundaryScanForTesting;
 
+    /// <summary>
+    /// Test-only hook fired at the start of every commit-frontier advance attempt, with the partition
+    /// and the marker id, after the advance read the frontier and while it holds the partition's
+    /// <see cref="commitFrontierLocks"/> entry. Lets a concurrency test hold one advance while another
+    /// commit of the same partition, or a partition delete, races it. Null (no-op) in production.
+    /// </summary>
+    internal Action<int, long>? OnCommitFrontierAdvanceForTesting;
+
     private readonly ILogger<IRaft> logger;
 
     private readonly WriteOptions writeOptions;
@@ -1278,6 +1286,9 @@ public class RocksDbWAL : IWAL, IDisposable
         // the read lock and keep RocksDB's group commit across workers — see writeGuard.
         bool exclusive = ContainsCommittedCheckpoint(logs);
 
+        // Committed markers advance the frontier: see commitFrontierLocks.
+        int[]? advancing = PartitionsWithCommitMarkers(logs);
+
         try
         {
             using EngineLease lease = AcquireEngine();
@@ -1287,8 +1298,16 @@ public class RocksDbWAL : IWAL, IDisposable
             else
                 writeGuard.EnterReadLock();
 
+            int frontierLocksHeld = 0;
+
             try
             {
+            if (advancing is not null)
+            {
+                for (; frontierLocksHeld < advancing.Length; frontierLocksHeld++)
+                    Monitor.Enter(CommitFrontierLock(advancing[frontierLocksHeld]));
+            }
+
             if (logs is [{ Item2.Count: 1 } _]) // fast path
             {
                 RaftLog log = logs[0].Item2[0];
@@ -1581,6 +1600,9 @@ public class RocksDbWAL : IWAL, IDisposable
             }
             finally
             {
+                for (int i = frontierLocksHeld - 1; i >= 0; i--)
+                    Monitor.Exit(CommitFrontierLock(advancing![i]));
+
                 if (exclusive)
                     writeGuard.ExitWriteLock();
                 else
@@ -2692,6 +2714,52 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<int, long> commitFrontierCache = new();
 
+    /// <summary>
+    /// One lock per partition's commit frontier. An advance reads the frontier, probes the rows above
+    /// it and puts the new value unconditionally; two advances of the same partition that overlap
+    /// under the shared side of <see cref="writeGuard"/> could land in the opposite order, leaving the
+    /// LOWER value durable (both acknowledged, with sync on), so after a reopen the markers the higher
+    /// one absorbed read back as Proposed. A write holds the lock of every partition it carries
+    /// Committed markers for, in ascending partition order, from the frontier read through the write
+    /// and the cache raise. The paths that lower the frontier hold the exclusive side of the guard,
+    /// which no advance can overlap; <see cref="DeletePartitionWAL"/> takes the lock for its write.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, object> commitFrontierLocks = new();
+
+    /// <summary>Returns the lock that serializes the commit-frontier advances of a partition.</summary>
+    private object CommitFrontierLock(int partitionId) =>
+        commitFrontierLocks.GetOrAdd(partitionId, static _ => new object());
+
+    /// <summary>
+    /// The partitions whose commit frontier a write may advance (those with a Committed marker), in
+    /// ascending order so writes that lock several take them in one global order; null when none.
+    /// </summary>
+    private static int[]? PartitionsWithCommitMarkers(List<(int, List<RaftLog>)> logs)
+    {
+        List<int>? partitions = null;
+
+        foreach ((int partitionId, List<RaftLog> raftLogs) in logs)
+        {
+            foreach (RaftLog log in raftLogs)
+            {
+                if (log.Type != RaftLogType.Committed)
+                    continue;
+
+                partitions ??= [];
+                if (!partitions.Contains(partitionId))
+                    partitions.Add(partitionId);
+
+                break;
+            }
+        }
+
+        if (partitions is null)
+            return null;
+
+        partitions.Sort();
+        return partitions.ToArray();
+    }
+
     /// <summary>Builds the metadata-CF key that stores the commit frontier for a partition.</summary>
     private byte[] CommitFrontierKey(int partitionId) =>
         commitFrontierKeys.GetOrAdd(partitionId, static pid => Encoding.UTF8.GetBytes($"raft_commit_frontier_p{pid}"));
@@ -2816,6 +2884,8 @@ public class RocksDbWAL : IWAL, IDisposable
         HashSet<long>? stagedResolved,
         MarkerHeaderPrefetch? prefetched = null)
     {
+        OnCommitFrontierAdvanceForTesting?.Invoke(partitionId, log.Id);
+
         long target = log.Id;
         long advanced = pendingFrontier;
 
@@ -3365,22 +3435,28 @@ public class RocksDbWAL : IWAL, IDisposable
             // either). Batch them with the log deletes when there are any, else delete them standalone.
             // The compaction floor goes too: a reused partition id may start writing from low ids
             // again, and a stale (higher) floor would hide — and leak — those new entries.
-            if (staged > 0)
+            // Under the partition's frontier lock: an advance that read the old frontier must not put
+            // it back (into the durable key or the cache) after the delete — see commitFrontierLocks.
+            lock (CommitFrontierLock(partitionId))
             {
-                writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
-                writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
-                writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
-                db.Write(writeBatch, writeOptions);
-            }
-            else
-            {
-                db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                db.Remove(CompactionFloorKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                if (staged > 0)
+                {
+                    writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
+                    writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
+                    writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
+                    db.Write(writeBatch, writeOptions);
+                }
+                else
+                {
+                    db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                    db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                    db.Remove(CompactionFloorKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                }
+
+                compactionFloorCache.TryRemove(partitionId, out _);
+                commitFrontierCache.TryRemove(partitionId, out _);
             }
 
-            compactionFloorCache.TryRemove(partitionId, out _);
-            commitFrontierCache.TryRemove(partitionId, out _);
             InvalidateMaxLogCache(partitionId);
 
             return RaftOperationStatus.Success;

@@ -597,6 +597,137 @@ public sealed class TestRocksDbCommitFrontier
         }
     }
 
+    /// <summary>
+    /// Row 1 is Committed, row 2 Proposed, and the frontier is 0. A duplicate commit of 1 reads frontier
+    /// 0 and is held at its advance; a commit of 2 then walks over row 1 and absorbs 2. Without one lock
+    /// per partition the commit of 2 lands (frontier 2) while the commit of 1 waits, and the commit of 1
+    /// then puts frontier 1 over it: both succeed with sync on, and after a reopen row 2 reads Proposed.
+    /// Covers the single-entry and the multi-entry write path on both sides.
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ConcurrentCommits_LowerAdvanceLandingLast_DoesNotRegressPersistedFrontier(bool lowerBatched, bool higherBatched)
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using (RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: true))
+            {
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Committed(1, 5), Proposed(2, 5)])]));
+                Assert.Equal([RaftLogType.Committed, RaftLogType.Proposed], wal.ReadLogs(Partition).Select(l => l.Type));
+                Assert.Equal(0, wal.CommitMarkersAbsorbed);
+
+                using HeldAdvance held = new(wal, markerId: 1);
+                CancellationToken cancel = TestContext.Current.CancellationToken;
+
+                Task<RaftOperationStatus> lower = Task.Run(() => wal.Write(Marker(1, lowerBatched)), cancel);
+                Assert.True(held.Started.Wait(TimeSpan.FromSeconds(30), cancel));
+
+                Task<RaftOperationStatus> higher = Task.Run(() => wal.Write(Marker(2, higherBatched)), cancel);
+                await Task.WhenAny(higher, Task.Delay(500, cancel));
+                held.Release();
+
+                Assert.Equal(RaftOperationStatus.Success, await lower.WaitAsync(TimeSpan.FromSeconds(30), cancel));
+                Assert.Equal(RaftOperationStatus.Success, await higher.WaitAsync(TimeSpan.FromSeconds(30), cancel));
+                Assert.All(wal.ReadLogs(Partition), log => Assert.Equal(RaftLogType.Committed, log.Type));
+            }
+
+            using (RocksDbWAL reopened = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: true))
+            {
+                List<RaftLog> logs = reopened.ReadLogs(Partition);
+                Assert.Equal([1L, 2L], logs.Select(l => l.Id));
+                Assert.All(logs, log => Assert.Equal(RaftLogType.Committed, log.Type));
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+
+        // A batch adds an append to another partition, so the write takes the multi-entry path.
+        static List<(int, List<RaftLog>)> Marker(long id, bool batched) =>
+            batched ? [(Partition, [Committed(id, 5)]), (Partition + 1, [Proposed(id, 5)])] : [(Partition, [Committed(id, 5)])];
+    }
+
+    /// <summary>
+    /// A commit reads frontier 0 and is held at its advance while the partition is deleted. Unless the
+    /// delete waits for it, the commit then puts frontier 1 for a partition with no rows, and a reused
+    /// partition id's first Proposed row reads Committed.
+    /// </summary>
+    [Fact]
+    public async Task CommitOverlappingPartitionDelete_LeavesNoFrontierForReusedId()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: true);
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Committed(1, 5), Proposed(2, 5)])]));
+
+            using HeldAdvance held = new(wal, markerId: 1);
+            CancellationToken cancel = TestContext.Current.CancellationToken;
+
+            Task<RaftOperationStatus> commit = Task.Run(() => wal.Write([(Partition, [Committed(1, 5)])]), cancel);
+            Assert.True(held.Started.Wait(TimeSpan.FromSeconds(30), cancel));
+
+            Task<RaftOperationStatus> delete = Task.Run(() => wal.DeletePartitionWAL(Partition), cancel);
+            await Task.WhenAny(delete, Task.Delay(500, cancel));
+            held.Release();
+
+            Assert.Equal(RaftOperationStatus.Success, await commit.WaitAsync(TimeSpan.FromSeconds(30), cancel));
+            Assert.Equal(RaftOperationStatus.Success, await delete.WaitAsync(TimeSpan.FromSeconds(30), cancel));
+            Assert.Empty(wal.ReadLogs(Partition));
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Proposed(1, 6)])]));
+            Assert.Equal(RaftLogType.Proposed, Assert.Single(wal.ReadLogs(Partition)).Type);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Holds the first commit-frontier advance of one marker id at
+    /// <see cref="RocksDbWAL.OnCommitFrontierAdvanceForTesting"/> until <see cref="Release"/>; disposing
+    /// releases it and removes the hook.
+    /// </summary>
+    private sealed class HeldAdvance : IDisposable
+    {
+        private readonly RocksDbWAL wal;
+        private readonly ManualResetEventSlim gate = new();
+        private int armed = 1;
+
+        public HeldAdvance(RocksDbWAL wal, long markerId)
+        {
+            this.wal = wal;
+            wal.OnCommitFrontierAdvanceForTesting = (_, id) =>
+            {
+                if (id != markerId || Interlocked.Exchange(ref armed, 0) == 0)
+                    return;
+
+                Started.Set();
+                gate.Wait(TimeSpan.FromSeconds(30));
+            };
+        }
+
+        /// <summary>Set when the held advance starts to wait.</summary>
+        public ManualResetEventSlim Started { get; } = new();
+
+        /// <summary>Lets the held advance go on.</summary>
+        public void Release() => gate.Set();
+
+        public void Dispose()
+        {
+            gate.Set();
+            wal.OnCommitFrontierAdvanceForTesting = null;
+        }
+    }
+
     private static RaftLog Proposed(long id, long term, byte[]? payload = null) =>
         new() { Id = id, Term = term, Type = RaftLogType.Proposed, LogType = "op", LogData = payload };
 
