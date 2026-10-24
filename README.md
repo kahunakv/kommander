@@ -7,6 +7,13 @@ Kommander is designed to keep the consensus core separate from storage, discover
 [![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
 [![NuGet](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
 
+## Used In Production
+
+Kommander is the consensus layer of these production products:
+
+- **[CamusDB](https://camusdb.github.io/):** a distributed SQL database for .NET. Its transactional key-value storage layer is replicated with Kommander.
+- **[Kahuna](https://kahunakv.github.io/):** distributed locking with fencing tokens and leases, and a consistent key/value store with transactions and watchers.
+
 ## Features
 
 - **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
@@ -30,6 +37,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Fair I/O schedulers:** Synchronous WAL reads and writes are processed through configurable fair schedulers so storage work does not block partition state transitions.
 - **Application callbacks:** Restore, replication, replication-error, and leadership events let applications rebuild and advance their own state machines.
 - **ASP.NET Core integration:** Route extensions expose Raft gRPC and REST endpoints from an existing web host.
+- **Verified beyond unit tests:** [Jepsen](https://github.com/kahunakv/kommander-jepsen) tests a real cluster under injected faults, deterministic simulation testing (DST) searches real in-process clusters for states that break Raft, and TLA+ models check the commit and durability path. See [Correctness Testing](#correctness-testing).
 
 ## About Raft And Kommander
 
@@ -997,13 +1005,62 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestThreeNodeCluster"
 ```
 
-## Jepsen Tests
+## Correctness Testing
 
-Kommander is tested with [Jepsen](https://jepsen.io), the gold standard for verifying the correctness of distributed systems under real-world failure conditions. The Jepsen test suite subjects Kommander clusters to network partitions, process crashes, clock skew, and other fault injections while checking that the system upholds its safety guarantees — linearizability of committed operations, the Raft Log Matching Property, and leader election consistency.
+Unit and cluster tests check the paths that we expect. Kommander also uses three methods that search for the paths that we do not expect. Each method finds a different class of defect, and each one found real defects that the other two did not find.
 
-Running Jepsen against Kommander provides confidence that the consensus implementation is correct not just in happy-path unit tests but under the kind of adversarial conditions that expose subtle bugs in leader election, log replication, and membership changes — bugs that conventional testing rarely catches.
+| Method | What it tests | Where it runs |
+| --- | --- | --- |
+| [Jepsen](#jepsen) | A real five-node cluster in Docker, from the outside, under injected faults. Checkers verify the history of client operations. | Separate repository, run on demand. |
+| [Deterministic Simulation Testing (DST)](#deterministic-simulation-testing-dst) | Real three-node clusters in one process, with simulated time, network, and disk. A seeded random search looks for states that break Raft. | A short smoke run on every push and pull request. The full search runs nightly. |
+| [TLA+](#tla) | A formal model of the commit and durability path. The TLC model checker explores every reachable state of a small configuration. | `formal/run-tlc.sh`. |
 
-The Jepsen test suite is maintained in a separate repository: **[kommander-jepsen](https://github.com/kahunakv/kommander-jepsen)**.
+### Jepsen
+
+[Jepsen](https://jepsen.io) runs a five-node Kommander cluster in Docker. A nemesis injects faults while clients send operations: network partitions, process kills, process pauses, membership removal and rejoin, and clock skew between nodes. Each client operation is recorded, and a checker then verifies the full history. Two workloads are available:
+
+- **`register`:** linearizability of a compare-and-set register over a replicated key/value map, checked with Knossos.
+- **`log-append`:** the Raft Log Matching Property, checked directly. Replicas must agree, no acknowledged entry is lost, no entry is duplicated, and each entry is applied exactly once.
+
+Kommander is a library, not a server. For this reason, the suite includes a small ASP.NET host that embeds `IRaft` and applies committed entries to a key/value map. The host references Kommander by project, so a run tests the code in your working tree, not the last NuGet package. Both the gRPC and the REST transports can be tested.
+
+The Jepsen suite is in a separate repository: **[kommander-jepsen](https://github.com/kahunakv/kommander-jepsen)**. Its `FINDINGS.md` lists each confirmed anomaly with a reproducer.
+
+### Deterministic Simulation Testing (DST)
+
+DST runs the real Kommander code in three-node clusters inside one test process. The test replaces only the environment: virtual time, a simulated transport, and a simulated WAL decorator. A seeded generator builds a plan of actions, such as client writes, link faults, crashes, restarts, pauses, slow or full disks, compaction, and hung snapshot transfers.
+
+The harness checks the cluster after each step:
+
+- **Safety invariants:** for example, one leader per term, committed entries agree on every node, leader completeness, committed ids never move backwards, and compaction never removes an entry that a follower still needs.
+- **Liveness rules:** a connected majority must elect a reachable leader within a bound, and the cluster must converge after the faults heal.
+- **Client history:** a checker verifies that each acknowledged write survives and that reads are correct.
+
+A failure is reproducible. The run saves the plan of actions, and a replay of that plan executes the same actions in the same order. A shrinker reduces a failing plan to the few actions that cause the failure. A plan with a known cause goes into a regression folder and is replayed on each run from then on.
+
+The `DSTSmoke` category runs on every push and pull request. The `DSTRandom` search runs in the nightly GitHub Actions job (`.github/workflows/nightly-dst.yml`), which shrinks each failure that it finds and uploads the plans as artifacts.
+
+```shell
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=DSTSmoke"
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=DSTRandom"
+```
+
+See [Kommander.Tests/Simulation/README.md](Kommander.Tests/Simulation/README.md) for replay, shrinking, regression promotion, and how to read a failure.
+
+### TLA+
+
+The `formal/` folder holds [TLA+](https://lamport.azurewebsites.net/tla/tla.html) models of the commit and durability path of one partition. The model covers the write-ahead state of each replica, the WAL scheduler and its single-fsync rule, crashes and restore, compaction, and anchored backfill over a network that loses, duplicates, and reorders messages. The TLC model checker explores every reachable state of a small configuration and reports the first state that breaks a property. One example property: a frontier that a follower reports as durable always survives a crash.
+
+The model is connected to the code by **trace validation**. A DST run can record the write-ahead events of each node, and TLC replays that trace through the same model operators. Each frontier value that the code calculated must equal the value that the model calculates. If the code and the model drift apart, the trace check fails.
+
+Each fixed defect also has a **control** configuration that turns that one defect back on. The control must fail. If a control passes, the model cannot see that defect.
+
+```shell
+formal/run-tlc.sh                    # every config and every stored trace
+formal/run-tlc.sh --trace <dir|file> # validate traces recorded by a DST run
+```
+
+TLC needs Java 11 or later. The script downloads a pinned `tla2tools.jar`. See [formal/README.md](formal/README.md) for the properties, the configurations, and the findings.
 
 ## Current Limitations
 
