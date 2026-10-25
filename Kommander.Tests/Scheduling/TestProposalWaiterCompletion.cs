@@ -98,6 +98,38 @@ public class TestProposalWaiterCompletion
         Assert.Equal(1L, commitIndex);
     }
 
+    // ── single-node manual two-phase propose ───────────────────────────────────
+
+    [Fact]
+    public async Task SingleNode_ManualPropose_WaiterCompletesCommittedOnProposeQuorum()
+    {
+        // No peers: the single voter is its own quorum, so the propose phase is quorum-durable at
+        // the leader's own WAL completion. The public ReplicateLogs(autoCommit:false) caller awaits
+        // this waiter; it must not stall until ProposalTimeout (CamusDB DDL on a one-node cluster).
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _, CapturingReplySink sink) = MakeLeader(nodes: []);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        List<RaftLog> logs = [new() { Id = 1, Term = 1, LogType = "t" }];
+        sm.ReplicateLogs(logs, autoCommit: false, replyCorrelationId: 14);
+
+        await sm.CompleteWalOperationAsync(MakeProposeCompletion(host.PartitionId, logIndex: 1));
+
+        (ulong _, RaftResponse proposeReply) = Assert.Single(sink.Completed, r => r.Id == 14);
+        Assert.Equal(RaftOperationStatus.Success, proposeReply.Status);
+        HLCTimestamp ticketId = proposeReply.TicketId;
+
+        Task<(RaftProposalTicketState, long)>? waiterTask = sm.GetTicketWaiterTask(ticketId);
+        Assert.NotNull(waiterTask);
+
+        // Propose quorum is already satisfied by the self-vote: the waiter must be complete now.
+        Assert.True(waiterTask.IsCompleted);
+        (RaftProposalTicketState state, long idx) = await waiterTask;
+        Assert.Equal(RaftProposalTicketState.Committed, state);
+        Assert.Equal(1L, idx);
+    }
+
     // ── multi-node auto-commit ─────────────────────────────────────────────────
 
     [Fact]

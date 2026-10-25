@@ -233,6 +233,85 @@ public sealed class TestSingleNodeCluster
         await node.LeaveCluster(true, CancellationToken.None);
     }
 
+    /// <summary>
+    /// Regression: a manual two-phase proposal (<c>autoCommit: false</c>) on a 0-peer partition
+    /// answered <c>ProposalTimeout</c> after the full 10 s. The single voter is its own quorum, so
+    /// the propose phase is quorum-durable at the leader's own WAL completion, but the single-voter
+    /// branch of the propose completion released the caller's waiter only for auto-commit proposals
+    /// (the multi-voter path releases it from the quorum ack). Found by CamusDB, whose DDL proposes
+    /// with <c>autoCommit: false</c>: every schema change on a one-node cluster failed. The 5 s bound
+    /// below sits far under <see cref="RaftConfiguration.ProposalTimeout"/> and far above a healthy
+    /// local round, so it separates the two outcomes without timing sensitivity.
+    /// </summary>
+    [Fact]
+    public async Task SingleNode_Leader_ManualPropose_CommitsAndRollsBackWithoutPeers()
+    {
+        IRaft node = BuildSingleNode(1);
+
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(30));
+
+        List<long> applied = [];
+        node.OnReplicationReceived += (partitionId, log) =>
+        {
+            if (partitionId == 1 && log.LogType == "Greeting")
+                lock (applied) applied.Add(log.Id);
+            return Task.FromResult(true);
+        };
+
+        await node.JoinCluster(cts.Token);
+        Assert.True(node.IsInitialized);
+        await node.WaitForLeader(1, cts.Token);
+        Assert.True(await node.AmILeaderQuick(1));
+
+        try
+        {
+            // Propose phase: answered on the leader's own durability, not after ProposalTimeout.
+            Stopwatch proposeClock = Stopwatch.StartNew();
+            RaftReplicationResult proposed = await node.ReplicateLogs(1, "Greeting", "Hello"u8.ToArray(), autoCommit: false, cancellationToken: cts.Token);
+            proposeClock.Stop();
+
+            Assert.Equal(RaftOperationStatus.Success, proposed.Status);
+            Assert.True(proposed.Success);
+            Assert.True(proposeClock.Elapsed < TimeSpan.FromSeconds(5), $"manual propose took {proposeClock.Elapsed.TotalMilliseconds:F0} ms");
+            Assert.NotEqual(HLCTimestamp.Zero, proposed.TicketId);
+
+            // Nothing is applied before the explicit commit.
+            lock (applied) Assert.DoesNotContain(proposed.LogIndex, applied);
+
+            // Commit phase: the entry reaches the leader's consumer and is marked Committed in the WAL.
+            (bool committed, RaftOperationStatus commitStatus, long commitLogId) = await node.CommitLogs(1, proposed.TicketId, cts.Token);
+            Assert.True(committed);
+            Assert.Equal(RaftOperationStatus.Success, commitStatus);
+            Assert.Equal(proposed.LogIndex, commitLogId);
+
+            await WaitUntil(() => { lock (applied) return applied.Contains(proposed.LogIndex); }, cts.Token);
+            Assert.Contains(node.WalAdapter.ReadLogs(1), l => l.Id == proposed.LogIndex && l.Type == RaftLogType.Committed);
+
+            // Rollback phase: a second manual proposal is also answered promptly, then rolled back.
+            RaftReplicationResult second = await node.ReplicateLogs(1, "Greeting", "Discard"u8.ToArray(), autoCommit: false, cancellationToken: cts.Token);
+            Assert.Equal(RaftOperationStatus.Success, second.Status);
+            Assert.True(second.LogIndex > proposed.LogIndex);
+
+            (bool rolledBack, RaftOperationStatus rollbackStatus, _) = await node.RollbackLogs(1, second.TicketId, cts.Token);
+            Assert.True(rolledBack);
+            Assert.Equal(RaftOperationStatus.Success, rollbackStatus);
+
+            await WaitUntil(() => node.WalAdapter.ReadLogs(1).Any(l => l.Id == second.LogIndex && l.Type == RaftLogType.RolledBack), cts.Token);
+            lock (applied) Assert.DoesNotContain(second.LogIndex, applied);
+        }
+        finally
+        {
+            await node.LeaveCluster(true, CancellationToken.None);
+        }
+    }
+
+    private static async Task WaitUntil(Func<bool> condition, CancellationToken cancellationToken)
+    {
+        while (!condition())
+            await Task.Delay(25, cancellationToken);
+    }
+
     private IRaft BuildSingleNode(int partitions)
     {
         RaftConfiguration config = new()

@@ -451,7 +451,23 @@ internal sealed class WalCompletionRouter
         {
             proposalQuorum.SetState(RaftProposalState.Completed);
 
-            if (autoCommit)
+            if (!autoCommit)
+            {
+                // Manual two-phase: the public ReplicateLogs(autoCommit:false) caller awaits the
+                // propose phase on this waiter, and the multi-voter path releases it from
+                // ReplicationAckProcessor.CompleteQuorum when the quorum ack lands. Here the
+                // self-vote is the whole quorum, so this completion IS propose-quorum-durable and
+                // the release belongs here: no ack will ever arrive to do it. Without it the
+                // ticket sits Completed in the registry and the caller blocks until
+                // ProposalTimeout (the event-driven wait no longer polls CheckTicketCompletion,
+                // which reported {AutoCommit:false, Completed} as Committed and so masked this on
+                // the old poll path). The later CommitLogs/RollbackLogs fire
+                // CompleteWaiterOnSuccess/FailWaiter again; both are no-ops on a completed waiter,
+                // exactly as on the multi-voter path.
+                logger.LogInfoProposalNoAutoCommit(host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
+                proposals.CompleteWaiterOnSuccess(proposalQuorum, proposalQuorum.LastLogIndex, ProposalReplySite.ManualProposeQuorum);
+            }
+            else
             {
                 // A single-voter leader is its own quorum, so the propose fsync that just
                 // completed already made the entry quorum-durable: the fast path applies here too.
