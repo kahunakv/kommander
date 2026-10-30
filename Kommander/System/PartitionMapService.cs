@@ -50,6 +50,7 @@ internal sealed class PartitionMapService
     private readonly Dictionary<int, MergeInProgress> pendingMerges;
     private readonly Func<TimeSpan> getRetryDelay;
     private readonly int maxRetries;
+    private readonly PartitionCountLimit partitionCountLimit;
     private readonly ILogger<IRaft> logger;
 
     internal PartitionMapService(
@@ -73,6 +74,7 @@ internal sealed class PartitionMapService
         Dictionary<int, MergeInProgress> pendingMerges,
         Func<TimeSpan> getRetryDelay,
         int maxRetries,
+        PartitionCountLimit partitionCountLimit,
         ILogger<IRaft> logger)
     {
         this.systemConfiguration = systemConfiguration;
@@ -95,6 +97,7 @@ internal sealed class PartitionMapService
         this.pendingMerges = pendingMerges;
         this.getRetryDelay = getRetryDelay;
         this.maxRetries = maxRetries;
+        this.partitionCountLimit = partitionCountLimit;
         this.logger = logger;
     }
 
@@ -369,6 +372,14 @@ internal sealed class PartitionMapService
         }
     }
 
+    /// <summary>
+    /// Adds one partition to the committed map. A create of an id that is already
+    /// <see cref="RaftPartitionState.Active"/> answers <see cref="RaftOperationStatus.Success"/>
+    /// without a write, and stays open at <see cref="RaftConfiguration.MaxPartitions"/> because it
+    /// adds nothing. A new entry past the bound answers
+    /// <see cref="RaftOperationStatus.PartitionLimitReached"/>; that check runs after the request is
+    /// validated and before the map changes, so nothing is proposed and the id is not spent.
+    /// </summary>
     internal async Task TryCreatePartition(RaftSystemRequest message, CancellationToken cancellationToken)
     {
         TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
@@ -459,6 +470,12 @@ internal sealed class PartitionMapService
                     return;
                 }
             }
+        }
+
+        if (!partitionCountLimit.TryAdmit(map, PartitionCountLimit.CreatePath, message.PartitionId))
+        {
+            completion?.TrySetResult((RaftOperationStatus.PartitionLimitReached, 0));
+            return;
         }
 
         RaftPartitionRange newRange = new()

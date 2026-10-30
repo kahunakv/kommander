@@ -251,10 +251,34 @@ The caller specifies an explicit partition id and routing mode. For `HashRange` 
   highest id it ever handed out, so an id whose tombstone is missing is still refused.
 - For `HashRange`, `start <= end` (no inverted ranges).
 - For `HashRange`, the new range must not overlap any existing `HashRange` entry.
+- When `RaftConfiguration.MaxPartitions` > 0, the map must hold fewer partitions than the bound
+  (see below).
 
 On success the coordinator appends the new entry with `Generation = 1`, `State = Active`,
 replicates, updates `systemConfiguration`, calls `StartPartitions`, and resolves the
 caller's `TaskCompletionSource`.
+
+### The partition-count bound
+
+Every partition costs each replica that hosts it a WAL, elections, heartbeats, check-quorum,
+snapshot and checkpoint work, and file handles. `RaftConfiguration.MaxPartitions` (default `0`,
+no bound) caps how many data partitions the committed map may hold:
+
+- The count covers every entry that is not `Removed`, excluding the system partition. `Splitting`
+  and `Draining` entries count, because they still hold resources.
+- At the bound, `CreatePartitionAsync` and `SplitPartitionAsync` answer
+  `RaftOperationStatus.PartitionLimitReached` with `Success = false`. The check runs on the
+  coordinator, after the request is validated and before the map changes: nothing is proposed,
+  the map version stays, and `HighestPartitionIdEver` does not advance, so the same id is usable
+  once a slot frees.
+- A create of an id that is already `Active` stays idempotent at the bound, because it adds
+  nothing. A removal or a merge frees a slot.
+- The bootstrap layout is never refused at run time. `Validate()` refuses an
+  `InitialPartitions` above the bound at startup instead.
+- The bound is per cluster. Only the system-partition leader checks it, so configure the same
+  value on every node: a leader change otherwise changes the effective bound.
+- Each refusal is counted in `raft.partitions.create_refused_total{path="create"|"split"}`. The
+  first refusal of an episode logs a warning; the episode ends when a later check finds room.
 
 ### Removing
 

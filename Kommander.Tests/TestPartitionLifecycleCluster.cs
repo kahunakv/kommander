@@ -38,7 +38,8 @@ public sealed class TestPartitionLifecycleCluster
         InMemoryCommunication communication,
         int port, int nodeId,
         IEnumerable<string> peers,
-        int initialPartitions)
+        int initialPartitions,
+        int maxPartitions)
     {
         RaftConfiguration config = new()
         {
@@ -47,6 +48,7 @@ public sealed class TestPartitionLifecycleCluster
             Host = "localhost",
             Port = port,
             InitialPartitions = initialPartitions,
+            MaxPartitions = maxPartitions,
             HeartbeatInterval = TimeSpan.FromMilliseconds(50),
             RecentHeartbeat = TimeSpan.FromMilliseconds(25),
             VotingTimeout = TimeSpan.FromMilliseconds(250),
@@ -67,16 +69,16 @@ public sealed class TestPartitionLifecycleCluster
             logger);
     }
 
-    private async Task<RaftManager[]> AssembleCluster(int basePort, int initialPartitions, CancellationToken ct)
+    private async Task<RaftManager[]> AssembleCluster(int basePort, int initialPartitions, CancellationToken ct, int maxPartitions = 0)
     {
         InMemoryCommunication comm = new();
         string Ep(int i) => $"localhost:{basePort + i}";
 
         RaftManager[] nodes =
         [
-            MakeNode(comm, basePort + 1, 1, [Ep(2), Ep(3)], initialPartitions),
-            MakeNode(comm, basePort + 2, 2, [Ep(1), Ep(3)], initialPartitions),
-            MakeNode(comm, basePort + 3, 3, [Ep(1), Ep(2)], initialPartitions),
+            MakeNode(comm, basePort + 1, 1, [Ep(2), Ep(3)], initialPartitions, maxPartitions),
+            MakeNode(comm, basePort + 2, 2, [Ep(1), Ep(3)], initialPartitions, maxPartitions),
+            MakeNode(comm, basePort + 3, 3, [Ep(1), Ep(2)], initialPartitions, maxPartitions),
         ];
 
         comm.SetNodes(new Dictionary<string, IRaft>
@@ -456,6 +458,63 @@ public sealed class TestPartitionLifecycleCluster
             RaftPartitionLifecycleResult removedAgain = await stillLeader.RemovePartitionAsync(newPartition, ct);
             Assert.True(removedAgain.Success, $"Idempotent remove failed: {removedAgain.Status}");
             Assert.DoesNotContain(stillLeader.GetPartitionMap(), r => r.PartitionId == newPartition);
+        }
+        finally
+        {
+            foreach (RaftManager n in nodes)
+                await n.LeaveCluster(true, CancellationToken.None);
+        }
+    }
+
+    // ── Partition count bound ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="RaftConfiguration.MaxPartitions"/> holds across a system-leader change: a create
+    /// at the bound is refused with <see cref="RaftOperationStatus.PartitionLimitReached"/> on the
+    /// first P0 leader and again on the next one, with the map and the spent-id floor unchanged on
+    /// every node. A removal then frees the slot for the same id.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_AtTheBound_IsRefusedAcrossASystemLeaderChange_UntilARemoval()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        RaftManager[] nodes = await AssembleCluster(basePort: 8340, initialPartitions: 1, ct, maxPartitions: 2);
+
+        try
+        {
+            RaftManager systemLeader = await LeaderOf(nodes, RaftSystemConfig.SystemPartition, ct);
+            RaftPartitionLifecycleResult filled = await systemLeader.CreatePartitionAsync(2, RaftRoutingMode.Unrouted, ct: ct);
+            Assert.True(filled.Success, $"Create below the bound failed: {filled.Status}");
+
+            await WaitForCondition(() => nodes.All(n => n.GetPartitionMap().Any(r => r.PartitionId == 2)), ct, timeoutMs: 20_000);
+
+            RaftPartitionLifecycleResult refused = await systemLeader.CreatePartitionAsync(3, RaftRoutingMode.Unrouted, ct: ct);
+            Assert.False(refused.Success);
+            Assert.Equal(RaftOperationStatus.PartitionLimitReached, refused.Status);
+
+            // Move P0 leadership; the next leader reads the same committed map and refuses too.
+            RaftManager nextLeader = nodes.First(n => n != systemLeader);
+            await TransferLeadershipTo(systemLeader, RaftSystemConfig.SystemPartition, nextLeader, ct);
+
+            RaftPartitionLifecycleResult refusedAgain = await nextLeader.CreatePartitionAsync(3, RaftRoutingMode.Unrouted, ct: ct);
+            Assert.False(refusedAgain.Success);
+            Assert.Equal(RaftOperationStatus.PartitionLimitReached, refusedAgain.Status);
+
+            foreach (RaftManager n in nodes)
+            {
+                Assert.DoesNotContain(n.GetPartitionMap(), r => r.PartitionId == 3);
+                Assert.Equal(3, n.GetNextAvailablePartitionId());
+            }
+
+            RaftManager remover = await LeaderOf(nodes, RaftSystemConfig.SystemPartition, ct);
+            RaftPartitionLifecycleResult removed = await remover.RemovePartitionAsync(2, ct);
+            Assert.True(removed.Success, $"Remove failed: {removed.Status}");
+
+            RaftManager creator = await LeaderOf(nodes, RaftSystemConfig.SystemPartition, ct);
+            RaftPartitionLifecycleResult created = await creator.CreatePartitionAsync(3, RaftRoutingMode.Unrouted, ct: ct);
+            Assert.True(created.Success, $"Create after the removal failed: {created.Status}");
+
+            await WaitForCondition(() => nodes.All(n => n.HostsPartition(3)), ct, timeoutMs: 20_000);
         }
         finally
         {

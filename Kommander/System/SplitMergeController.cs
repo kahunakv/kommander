@@ -46,6 +46,7 @@ internal sealed class SplitMergeController
     private readonly Action<int> deletePartitionWAL;
     private readonly Func<TimeSpan> getRetryDelay;
     private readonly int maxRetries;
+    private readonly PartitionCountLimit partitionCountLimit;
     private readonly ILogger<IRaft> logger;
 
     internal Dictionary<int, SplitInProgress> PendingSplits => _pendingSplits;
@@ -64,6 +65,7 @@ internal sealed class SplitMergeController
         Action<int> deletePartitionWAL,
         Func<TimeSpan> getRetryDelay,
         int maxRetries,
+        PartitionCountLimit partitionCountLimit,
         ILogger<IRaft> logger)
     {
         this.systemConfiguration = systemConfiguration;
@@ -78,6 +80,7 @@ internal sealed class SplitMergeController
         this.deletePartitionWAL = deletePartitionWAL;
         this.getRetryDelay = getRetryDelay;
         this.maxRetries = maxRetries;
+        this.partitionCountLimit = partitionCountLimit;
         this.logger = logger;
     }
 
@@ -86,6 +89,11 @@ internal sealed class SplitMergeController
     /// <see cref="RaftPartitionState.Splitting"/>, replicates the map, then
     /// either auto-enqueues Phase 2 (when <see cref="RaftSplitPlan.AutoCommit"/>
     /// is true) or leaves the split pending for the caller to commit explicitly.
+    /// <para>A split adds a partition, so it answers
+    /// <see cref="RaftOperationStatus.PartitionLimitReached"/> at
+    /// <see cref="RaftConfiguration.MaxPartitions"/>. The check runs after the request is
+    /// validated and before the source range is touched, so a refused split leaves the map,
+    /// its version and the spent-id floor unchanged.</para>
     /// </summary>
     internal async Task TrySplitPartition(
         int partitionId,
@@ -157,6 +165,12 @@ internal sealed class SplitMergeController
                 "TrySplitPartition: Target partition id {Id} was already handed out (highest ever {Highest}); a spent id cannot be reused",
                 targetPartitionId, map.HighestPartitionIdEver);
             completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
+            return;
+        }
+
+        if (!partitionCountLimit.TryAdmit(map, PartitionCountLimit.SplitPath, targetPartitionId))
+        {
+            completion?.TrySetResult((RaftOperationStatus.PartitionLimitReached, partitionRange.Generation));
             return;
         }
 

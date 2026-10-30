@@ -217,6 +217,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
             manager.LocalEndpoint,
             logger);
 
+        PartitionCountLimit partitionCountLimit = new(manager.Configuration.MaxPartitions, logger);
+
         _splitMerge = new SplitMergeController(
             systemConfiguration,
             Replicate,
@@ -230,6 +232,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             partitionId => { manager.WalAdapter.DeletePartitionWAL(partitionId); },
             () => RetryDelay,
             MaxRetries,
+            partitionCountLimit,
             logger);
 
         _partitionMap = new PartitionMapService(
@@ -253,6 +256,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             _splitMerge.PendingMerges,
             () => RetryDelay,
             MaxRetries,
+            partitionCountLimit,
             logger);
 
         _replicaPlacement = new ReplicaPlacementService(

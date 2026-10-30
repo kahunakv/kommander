@@ -88,6 +88,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.Host)] = RaftOptionKind.Deployment,
         [nameof(RaftConfiguration.Port)] = RaftOptionKind.Deployment,
         [nameof(RaftConfiguration.InitialPartitions)] = RaftOptionKind.Deployment,
+        [nameof(RaftConfiguration.MaxPartitions)] = RaftOptionKind.Deployment,
         [nameof(RaftConfiguration.HttpScheme)] = RaftOptionKind.Deployment,
         [nameof(RaftConfiguration.GrpcScheme)] = RaftOptionKind.Deployment,
         [nameof(RaftConfiguration.TransportSecurity)] = RaftOptionKind.Safety,

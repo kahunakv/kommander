@@ -75,6 +75,27 @@ public class RaftConfiguration
     /// </summary>
     public int InitialPartitions { get; set; } = 1;
 
+    /// <summary>
+    /// Upper bound on how many data partitions the committed partition map may hold.
+    /// <b>0 (the default) means no bound</b>, today's behavior.
+    /// <para>Every partition is a standing cost on each replica that hosts it: a WAL segment set,
+    /// elections, heartbeats, check-quorum, snapshot and checkpoint work, and file handles. A
+    /// consumer that creates partitions in a loop (a bug, or a client that drives range splits)
+    /// can grow that cost until the nodes fall over. When &gt; 0, the system leader refuses a
+    /// <see cref="IRaft.CreatePartitionAsync"/> or <see cref="IRaft.SplitPartitionAsync"/> that
+    /// would go past the bound with <see cref="Data.RaftOperationStatus.PartitionLimitReached"/>,
+    /// before the map changes: nothing is proposed and no partition id is spent.</para>
+    /// <para>The count covers every map entry that is not <see cref="System.RaftPartitionState.Removed"/>,
+    /// excluding the system partition (0). <c>Splitting</c> and <c>Draining</c> entries count,
+    /// because they still hold resources. A create of an id that is already <c>Active</c> stays
+    /// idempotent at the bound (it adds nothing), and the bootstrap layout is never refused —
+    /// <see cref="Validate"/> refuses an <see cref="InitialPartitions"/> above the bound instead.</para>
+    /// <para>The bound is per cluster, not per node. Only the system-partition leader checks it, so
+    /// <b>configure the same value on every node</b>: a leader change otherwise changes the effective
+    /// bound.</para>
+    /// </summary>
+    public int MaxPartitions { get; set; }
+
     // ── Transport ─────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -2053,6 +2074,18 @@ public class RaftConfiguration
                 "[Kommander] EnableInternalSchedulingThreads=true is not supported by the thread-free " +
                 "build (KOMMANDER_THREAD_FREE). Leave it false and use EnableHostPumpedScheduling.");
 #endif
+
+        if (MaxPartitions < 0)
+            throw new RaftException(
+                $"[Kommander] MaxPartitions ({MaxPartitions}) must not be negative; use zero for no bound.");
+
+        // The bootstrap layout is the operator's choice and is never refused at run time, so a
+        // layout above the bound would start a cluster that refuses every later create. Refuse
+        // the combination here instead.
+        if (MaxPartitions > 0 && InitialPartitions > MaxPartitions)
+            throw new RaftException(
+                $"[Kommander] InitialPartitions ({InitialPartitions}) exceeds MaxPartitions ({MaxPartitions}). " +
+                "Raise MaxPartitions or lower InitialPartitions.");
 
         // Degraded-node avoidance drains leadership off a node, so a misconfigured threshold is a
         // liveness hazard rather than a tuning nuisance. A multiplier at or below 1.0 marks every

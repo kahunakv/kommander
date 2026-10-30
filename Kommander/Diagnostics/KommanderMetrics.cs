@@ -576,6 +576,19 @@ public static class KommanderMetrics
         set => Interlocked.Exchange(ref _placementRangesAwaitingInitial, value);
     }
 
+    // ── Partition count bound ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Partition creates and splits the system leader refused because the committed map was at
+    /// <see cref="RaftConfiguration.MaxPartitions"/>, tagged by <c>path</c> (<c>create</c> /
+    /// <c>split</c>). Each refusal proposed nothing and spent no partition id. A steady climb means
+    /// a consumer keeps asking for partitions at the bound and does not back off.
+    /// </summary>
+    internal static readonly Counter<long> PartitionCreateRefusedTotal =
+        Meter.CreateCounter<long>(
+            "raft.partitions.create_refused_total",
+            description: "Partition creates and splits refused at the MaxPartitions bound, by path (create/split).");
+
     // ── Read scheduler (per instance, tagged "scheduler") ─────────────────────
 
     /// <summary>

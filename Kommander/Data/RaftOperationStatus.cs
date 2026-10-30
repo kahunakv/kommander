@@ -181,4 +181,14 @@ public enum RaftOperationStatus
     /// re-reads the current state and retries; the placement pass does so on its next tick.
     /// </summary>
     StaleSystemConfiguration = 27,
+
+    /// <summary>
+    /// A partition create or split was refused because the committed partition map already holds
+    /// <see cref="RaftConfiguration.MaxPartitions"/> partitions. The refusal happens on the system
+    /// leader before the map changes: nothing was proposed, and no partition id was spent, so the
+    /// same id stays usable for a later create once a removal or a merge frees a slot. This is a
+    /// determinate refusal, not a transient one: retrying at once gets the same answer until the
+    /// partition count drops.
+    /// </summary>
+    PartitionLimitReached = 28,
 }

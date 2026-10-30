@@ -912,6 +912,9 @@ public interface IRaft
     /// <summary>
     /// Creates a new partition. Leader-only. Idempotent: if the partition already exists
     /// with Active state, returns its current generation without mutating the map.
+    /// When the committed map already holds <see cref="RaftConfiguration.MaxPartitions"/>
+    /// partitions, a new entry is refused with <see cref="RaftOperationStatus.PartitionLimitReached"/>:
+    /// nothing is proposed and the id is not spent, so the caller may use it again once a slot frees.
     /// Throws <see cref="RaftException"/> if <paramref name="partitionId"/> is the system
     /// partition (id 0); P0 is permanently protected and can never be created, removed,
     /// split, or merged.
@@ -941,6 +944,10 @@ public interface IRaft
     /// auto-assign the next available id. The <paramref name="plan"/> controls the
     /// hash boundary and routing mode; <see cref="RaftSplitPlan.HashBoundary"/> = null
     /// computes the midpoint automatically.
+    /// </para>
+    /// <para>
+    /// A split adds a partition, so it answers <see cref="RaftOperationStatus.PartitionLimitReached"/>
+    /// at <see cref="RaftConfiguration.MaxPartitions"/>, with the map unchanged.
     /// </para>
     /// </summary>
     public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(
