@@ -68,7 +68,7 @@ internal sealed class PartitionCountLimit
 
         if (count < maxPartitions)
         {
-            if (Interlocked.Exchange(ref refusing, 0) == 1)
+            if (Interlocked.Exchange(ref refusing, 0) == 1 && logger.IsEnabled(LogLevel.Information))
                 logger.LogInformation(
                     "PartitionCountLimit: partition count {Count} is below the bound {Max} again; creates resume",
                     count, maxPartitions);
