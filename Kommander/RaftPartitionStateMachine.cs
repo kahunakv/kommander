@@ -2444,6 +2444,14 @@ public sealed class RaftPartitionStateMachine
         proposals.CheckTicketCompletion(timestamp);
 
     /// <summary>
+    /// The proposal registered under <paramref name="ticket"/>, or null. Test hook: lets a test observe
+    /// what a settled record still holds (its entries are released at the commit completion, its last
+    /// index is kept) without widening the registry's surface.
+    /// </summary>
+    internal RaftProposalQuorum? GetRegisteredProposalForTesting(HLCTimestamp ticket) =>
+        proposals.TryGet(ticket, out RaftProposalQuorum? proposal) ? proposal : null;
+
+    /// <summary>
     /// Single-fsync commit fast path (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>).
     /// For an <c>autoCommit</c> proposal whose propose quorum is already durable, advances the
     /// leader's commit frontier and moves the proposal to <see cref="RaftProposalState.Committed"/>

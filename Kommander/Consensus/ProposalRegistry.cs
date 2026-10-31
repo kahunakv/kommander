@@ -369,11 +369,13 @@ internal sealed class ProposalRegistry
     }
 
     /// <summary>
-    /// Releases settled proposals, returning each to the pool so its log payload is not retained
-    /// until the next leadership change. The 30-second window is measured on
+    /// Drops settled proposals whose ticket window has passed and returns each to the pool. The
+    /// entries themselves were already released at the commit or rollback completion
+    /// (<see cref="RaftProposalQuorum.ReleaseEntries"/>); what the window retains is the record that
+    /// answers the ticket, not the payload. The 30-second window is measured on
     /// <see cref="RaftProposalQuorum.StartTicks"/> (local monotonic) for the same reason
-    /// <see cref="RetryUnresolved"/> is: an HLC age frozen by skew retained settled payloads for
-    /// the whole skew window.
+    /// <see cref="RetryUnresolved"/> is: an HLC age frozen by skew kept settled records for the
+    /// whole skew window.
     /// </summary>
     public void PruneSettled(long nowTicks)
     {

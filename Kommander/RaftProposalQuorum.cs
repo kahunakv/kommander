@@ -76,8 +76,19 @@ public sealed class RaftProposalQuorum
     /// Contains the collection of Raft logs associated with the proposal within the quorum.
     /// Each log entry represents an operation or state in the consensus process, consisting of
     /// an identifier, term, timestamp, data, and other relevant metadata.
+    /// <para>Empty once <see cref="ReleaseEntries"/> ran: the leader has committed or rolled the
+    /// proposal back and fanned the resolution out, and the record stays registered only so its
+    /// ticket is answerable. Readers of a settled proposal must use <see cref="LastLogIndex"/>,
+    /// which survives the release, and never assume the list is populated.</para>
     /// </summary>
     public List<RaftLog> Logs { get; private set; }
+
+    /// <summary>
+    /// The last entry's id, kept when <see cref="ReleaseEntries"/> drops the list so
+    /// <see cref="LastLogIndex"/> still answers for the settled proposal. -1 while the entries are
+    /// present (the list answers) and after <see cref="Clear"/>.
+    /// </summary>
+    private long settledLastLogIndex = -1;
 
     /// <summary>
     /// Indicates whether the logs in the current Raft proposal quorum should be automatically committed upon achieving a quorum.
@@ -108,9 +119,30 @@ public sealed class RaftProposalQuorum
     /// Retrieves the index of the last log entry within the proposal quorum.
     /// This index serves as a reference to the most recently added log entry
     /// maintained in the quorum, typically reflecting progress in the log replication process
-    /// during distributed consensus.
+    /// during distributed consensus. Answers from the retained index once the entries were
+    /// released (<see cref="ReleaseEntries"/>); -1 for a proposal with no entries.
     /// </summary>
-    public long LastLogIndex => Logs.Last().Id;
+    public long LastLogIndex => Logs.Count > 0 ? Logs[^1].Id : settledLastLogIndex;
+
+    /// <summary>True once <see cref="ReleaseEntries"/> dropped the entry list.</summary>
+    internal bool EntriesReleased => settledLastLogIndex >= 0;
+
+    /// <summary>
+    /// Drops this proposal's reference to its entries once nothing on the leader will read them again:
+    /// the commit (or rollback) marker is durable, the resolution is broadcast, and the local applies
+    /// ran or were deferred from a copy. The record stays registered for its ticket window with only
+    /// <see cref="LastLogIndex"/> retained, so the window no longer pins every settled payload.
+    /// <para>The list is <b>dropped, never emptied</b>, for the reason <see cref="Clear"/> gives: the
+    /// WAL write and the transport sends still queued for a slow peer share it.</para>
+    /// </summary>
+    public void ReleaseEntries()
+    {
+        if (Logs.Count == 0)
+            return;
+
+        settledLastLogIndex = Logs[^1].Id;
+        Logs = [];
+    }
 
     /// <summary>
     /// Stopwatch stamp taken when the leader finished the fan-out of this proposal, or 0 when the
@@ -301,6 +333,7 @@ public sealed class RaftProposalQuorum
         localDurable = true;
         completedNodeCount = 0;
         FanoutStageTicks = 0;
+        settledLastLogIndex = -1;
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
@@ -321,6 +354,7 @@ public sealed class RaftProposalQuorum
         _waiter?.TrySetResult((RaftProposalTicketState.NotFound, -1));
         _waiter = null;
         Logs = [];
+        settledLastLogIndex = -1;
         nodes.Clear();
         completedNodeCount = 0;
         localDurable = true;

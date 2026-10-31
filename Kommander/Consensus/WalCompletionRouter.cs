@@ -726,6 +726,13 @@ internal sealed class WalCompletionRouter
                 (currentTime - proposal.StartTimestamp).TotalMilliseconds
             );
 
+        // Nothing on this leader reads the entries again: the commit marker is durable, the
+        // resolution is on its way to every peer, and the local applies ran or were deferred from a
+        // copy. The record stays registered for its ticket window with only the last index, so the
+        // window stops pinning every settled payload: at kilobyte values and thousands of proposals
+        // a second those entries were the largest surviving population on the leader's heap.
+        proposal.ReleaseEntries();
+
         wal.NotifyCommitted();
 
         // Promotion barrier: this commit's inherited drain (above) has applied every prior-term
@@ -865,6 +872,10 @@ internal sealed class WalCompletionRouter
                 ticketId,
                 string.Join(',', proposal.Logs.Select(x => x.Id.ToString()))
             );
+
+        // Same as the commit completion: the rollback marker is durable and broadcast, so the
+        // entries are released and the record answers its ticket from the retained last index.
+        proposal.ReleaseEntries();
 
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
     }
