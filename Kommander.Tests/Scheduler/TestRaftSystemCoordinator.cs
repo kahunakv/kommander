@@ -1751,6 +1751,120 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
+    /// <summary>
+    /// The committed roster records why each member left, and a re-admission drops the record.
+    /// This is what an excluded node decides its leave latch on: an eviction voids a
+    /// decommission, a removal by request is final, and the member list alone cannot tell them
+    /// apart (Kahuna nightly, 2026-10-27).
+    /// </summary>
+    [Fact]
+    public async Task RemoveMember_RecordsWhyTheMemberLeft_AndReadmissionDropsTheRecord()
+    {
+        (RaftManager manager, _) = BuildWithMembershipHarness();
+        using (manager)
+        {
+            CancellationToken ct = TestContext.Current.CancellationToken;
+
+            async Task<long> Commit(RaftSystemRequest request)
+            {
+                manager.SystemCoordinator.Send(request);
+                (RaftOperationStatus status, long version) = await request.Completion!.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                Assert.Equal(RaftOperationStatus.Success, status);
+                return version;
+            }
+
+            static TaskCompletionSource<(RaftOperationStatus Status, long Generation)> Tcs() =>
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            // Three voters, so that one can be evicted and another drained with a voter left.
+            long v = await Commit(new RaftSystemRequest(RaftSystemRequestType.AddMember, "node1:9001", 1, 0, Tcs()));
+            v = await Commit(new RaftSystemRequest(RaftSystemRequestType.AddMember, "node2:9002", 2, v, Tcs()));
+            v = await Commit(new RaftSystemRequest(RaftSystemRequestType.AddMember, "node3:9003", 3, v, Tcs()));
+            v = await Commit(new RaftSystemRequest(RaftSystemRequestType.PromoteMember, "node1:9001", 1, v, Tcs()));
+            v = await Commit(new RaftSystemRequest(RaftSystemRequestType.PromoteMember, "node2:9002", 2, v, Tcs()));
+            v = await Commit(new RaftSystemRequest(RaftSystemRequestType.PromoteMember, "node3:9003", 3, v, Tcs()));
+
+            Kommander.System.ClusterMembership m = manager.SystemCoordinator.GetMembership();
+            Assert.Empty(m.Departures);
+
+            // The eviction driver's removal.
+            long evictedAt = await Commit(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, "node1:9001", 1, v, Tcs())
+            {
+                RemovalReason = Kommander.System.ClusterDepartureReason.Evicted
+            });
+
+            m = manager.SystemCoordinator.GetMembership();
+            Kommander.System.ClusterDeparture? record = m.DepartureOf("node1:9001");
+            Assert.NotNull(record);
+            Assert.Equal(Kommander.System.ClusterDepartureReason.Evicted, record.Reason);
+            Assert.Equal(evictedAt, record.Version);
+            Assert.Null(m.DepartureOf("node2:9002"));
+
+            // A role change carries the record forward unchanged.
+            await Commit(new RaftSystemRequest(RaftSystemRequestType.SetMemberRole, "node2:9002", 2, evictedAt, Kommander.System.ClusterMemberRole.Leaving, Tcs()));
+            Assert.Equal(Kommander.System.ClusterDepartureReason.Evicted, manager.SystemCoordinator.GetMembership().DepartureOf("node1:9001")?.Reason);
+            long rolledBackAt = await Commit(new RaftSystemRequest(RaftSystemRequestType.SetMemberRole, "node2:9002", 2, evictedAt + 1, Kommander.System.ClusterMemberRole.Voter, Tcs()));
+
+            // Re-admission drops the record: the endpoint starts over.
+            long readmittedAt = await Commit(new RaftSystemRequest(RaftSystemRequestType.AddMember, "node1:9001", 1, rolledBackAt, Tcs()));
+            Assert.Null(manager.SystemCoordinator.GetMembership().DepartureOf("node1:9001"));
+
+            // A removal that was asked for (the default) is recorded as such.
+            long leftAt = await Commit(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, "node1:9001", 1, readmittedAt, Tcs()));
+            record = manager.SystemCoordinator.GetMembership().DepartureOf("node1:9001");
+            Assert.NotNull(record);
+            Assert.Equal(Kommander.System.ClusterDepartureReason.Requested, record.Reason);
+            Assert.Equal(leftAt, record.Version);
+        }
+    }
+
+    /// <summary>
+    /// The roster's wire shape stays compatible: the departure record round-trips through the
+    /// system JSON context, and a roster written by a leader that predates it (no
+    /// <c>Departures</c> property) reads as an empty record — "unknown", which the readers treat
+    /// as "not proven evicted".
+    /// </summary>
+    [Fact]
+    public void ClusterMembership_Json_RoundTripsDepartures_AndLegacyJsonReadsEmpty()
+    {
+        Kommander.System.ClusterMembership roster = new()
+        {
+            MembershipVersion = 7,
+            Members = [new Kommander.System.ClusterMember { Endpoint = "a:1", NodeId = 1, Role = Kommander.System.ClusterMemberRole.Voter, JoinedVersion = 1 }],
+            Departures = [new Kommander.System.ClusterDeparture { Endpoint = "b:2", Version = 7, Reason = Kommander.System.ClusterDepartureReason.Evicted }]
+        };
+
+        string json = global::System.Text.Json.JsonSerializer.Serialize(roster, Kommander.System.SystemJsonContext.Default.ClusterMembership);
+        Kommander.System.ClusterMembership? back = global::System.Text.Json.JsonSerializer.Deserialize(json, Kommander.System.SystemJsonContext.Default.ClusterMembership);
+
+        Assert.NotNull(back);
+        Kommander.System.ClusterDeparture? record = back.DepartureOf("b:2");
+        Assert.NotNull(record);
+        Assert.Equal(Kommander.System.ClusterDepartureReason.Evicted, record.Reason);
+        Assert.Equal(7, record.Version);
+
+        const string legacy = "{\"MembershipVersion\":3,\"Members\":[{\"Endpoint\":\"a:1\",\"NodeId\":1,\"Role\":1,\"JoinedVersion\":1}]}";
+        Kommander.System.ClusterMembership? old = global::System.Text.Json.JsonSerializer.Deserialize(legacy, Kommander.System.SystemJsonContext.Default.ClusterMembership);
+
+        Assert.NotNull(old);
+        Assert.Empty(old.Departures);
+        Assert.Null(old.DepartureOf("a:1"));
+
+        // The record is bounded, and a repeat departure of the same endpoint replaces its entry.
+        Kommander.System.ClusterMembership full = new() { MembershipVersion = 1, Members = [] };
+        for (int i = 0; i < Kommander.System.ClusterMembership.MaxDepartures + 5; i++)
+            full.Departures = full.DeparturesAfterRemoval($"n{i}", i + 2, Kommander.System.ClusterDepartureReason.Requested);
+
+        Assert.Equal(Kommander.System.ClusterMembership.MaxDepartures, full.Departures.Count);
+        Assert.Null(full.DepartureOf("n0"));
+        Assert.NotNull(full.DepartureOf($"n{Kommander.System.ClusterMembership.MaxDepartures + 4}"));
+
+        full.Departures = full.DeparturesAfterRemoval("n10", 99, Kommander.System.ClusterDepartureReason.Evicted);
+        Assert.Equal(Kommander.System.ClusterMembership.MaxDepartures, full.Departures.Count);
+        Assert.Equal(99, full.DepartureOf("n10")?.Version);
+        Assert.Single(full.Departures, d => d.Endpoint == "n10");
+    }
+
     [Fact]
     public async Task AddMember_WithStaleExpectedVersion_ReturnsStaleMembership()
     {

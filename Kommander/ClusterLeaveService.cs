@@ -29,10 +29,27 @@ namespace Kommander;
 /// A drain whose <c>Voter → Leaving</c> commit was never confirmed (the request timed out
 /// against an unreachable or mid-election P0 leader) keeps the latch too, because the commit may
 /// still land — but it arms the roster observer, so the next committed roster decides: one that
-/// still names the node <c>Voter</c>, or one that evicts it before any <c>Leaving</c> was ever
-/// committed, releases the latch; one that names it <c>Leaving</c> confirms the drain. Without
-/// that, a timed-out request left the latch raised with nothing able to release it, and a later
-/// eviction parked the node exactly as above (Kahuna nightly, 2026-10-13).
+/// still names the node <c>Voter</c> releases the latch; one that names it <c>Leaving</c>
+/// confirms the drain. Without that, a timed-out request left the latch raised with nothing able
+/// to release it, and a later eviction parked the node exactly as above (Kahuna nightly,
+/// 2026-10-13).
+/// </para>
+/// <para>
+/// An <b>eviction voids a decommission</b>. When a committed roster excludes this node, the
+/// roster's own departure record (<see cref="ClusterMembership.Departures"/>, written by the P0
+/// leader at the removal) says whether the node was evicted as a dead member or removed because
+/// it asked. Evicted while a <see cref="RequestLeaveAsync"/> departure was in force — whatever
+/// the drain's state: never committed, committed late with nobody driving it, or mid-drain —
+/// releases the latch, because nothing the request sent can land after an exclusion (a role
+/// change for an absent member is refused, a removal of an absent member is a no-op) and the
+/// node still hosts every replica it had. The auto-rejoin that follows is the only exit: a
+/// NotMember node keeps leading its ranges, receives no P0 entries, and so can never feed the
+/// learners the planner adds to move those ranges off it. Deciding this from the member list
+/// alone was impossible, and inferring it from local state left a hole per shape (Kahuna
+/// nightly, 2026-10-27: a drain-leg commit that landed after the request timed out, then an
+/// eviction while <c>Leaving</c>). Removed by request keeps the latch for good. A roster with no
+/// record (an older leader) falls back to the version-adjacency rule of the unconfirmed drain
+/// request.
 /// </para>
 /// <para>
 /// Ordering matters throughout: drain → role transition → roster removal → teardown. Committing
@@ -73,8 +90,9 @@ internal sealed class ClusterLeaveService : IDisposable
     /// later committed roster that names this node <c>Voter</c> again
     /// (<see cref="ObserveCommittedRoster"/>, which covers a rollback whose acknowledgement was
     /// lost, and a drain request whose <c>Leaving</c> commit never landed — see
-    /// <see cref="_drainLegUnconfirmed"/>). Never released by <see cref="LeaveCluster"/>: teardown
-    /// follows there regardless.
+    /// <see cref="_drainLegUnconfirmed"/>), or when a committed roster records this node
+    /// <i>evicted</i> while a decommission was in force (see <see cref="_departureIsDecommission"/>).
+    /// Never released by <see cref="LeaveCluster"/>: teardown follows there regardless.
     /// Election suppression (<see cref="_leaving"/>) is a separate latch — a node that was refused
     /// is still a full member and must keep campaigning.
     /// </para>
@@ -104,6 +122,43 @@ internal sealed class ClusterLeaveService : IDisposable
     /// commit's answer or by a committed roster) and when the latch is released.
     /// </summary>
     private volatile bool _drainLegUnconfirmed;
+
+    /// <summary>
+    /// True while the raised latch belongs to a <see cref="RequestLeaveAsync"/> attempt: an
+    /// operator decommission of a node that keeps running. Only such a departure is voided by an
+    /// eviction (<see cref="ObserveCommittedRoster"/>): the node is alive, was not asked out by
+    /// the eviction, and still hosts its replicas, so it must auto-rejoin. The other two raisers
+    /// clear it — <see cref="LeaveCluster"/> tears the node down whatever happens, and
+    /// <see cref="WithdrawFailedJoinAsync"/> exists to undo an admission, so neither may be undone
+    /// by a rejoin. Cleared with the latch.
+    /// </summary>
+    private volatile bool _departureIsDecommission;
+
+    /// <summary>
+    /// The version of the roster whose departure record this node last acted on, so the record is
+    /// logged once rather than on every roster a NotMember node learns through gossip.
+    /// </summary>
+    private long _departureObservedAt;
+
+    /// <summary>
+    /// Set by <see cref="SettleExclusion"/> when a committed roster records this node evicted
+    /// while a <see cref="RequestLeaveAsync"/> attempt is running; cleared when the next attempt
+    /// starts. The attempt's waits read it instead of the roster: the auto-rejoin that the same
+    /// roster event starts can re-admit the node (as a Learner) before the drain loop's next poll,
+    /// at which point the roster names the node again and the eviction is no longer visible there
+    /// — the attempt would then run on to its drain deadline and try to roll back a role the node
+    /// no longer holds. The outcome must be <see cref="LeaveClusterOutcome.Evicted"/> either way.
+    /// </summary>
+    private volatile bool _evictedDuringRequest;
+
+    /// <summary>
+    /// How long an attempt waits for the local roster cache to reach a version the P0 leader
+    /// reported before deciding, from that roster's departure record, whether an exclusion was an
+    /// eviction. The leader's answer carries the version; the roster itself reaches an excluded
+    /// node only by gossip, so a short wait is usually enough and the fallback (the historical
+    /// "departed" answer) is reached only when gossip is cut too.
+    /// </summary>
+    private static readonly TimeSpan ExclusionRecordWait = TimeSpan.FromSeconds(3);
 
     /// <summary>
     /// Serializes <see cref="RequestLeaveAsync"/> so two concurrent callers cannot run overlapping
@@ -177,11 +232,15 @@ internal sealed class ClusterLeaveService : IDisposable
     /// <para>
     /// Also settles a drain request whose <c>Leaving</c> commit was never confirmed
     /// (<see cref="_drainLegUnconfirmed"/>): a newer roster naming the node <c>Voter</c> releases
-    /// the latch as above; the very next roster excluding the node is an eviction (no
-    /// <c>Leaving</c> was committed in between, and the pass removes <c>Leaving</c> members only),
-    /// so it releases the latch too and the auto-rejoin check that follows re-admits the node; a
-    /// roster naming the node <c>Leaving</c> confirms the drain, re-raises the latch if a roster
-    /// in between had released it, and arms the watermark at that version.
+    /// the latch as above; a roster naming the node <c>Leaving</c> confirms the drain, re-raises
+    /// the latch if a roster in between had released it, and arms the watermark at that version.
+    /// </para>
+    /// <para>
+    /// A roster that <i>excludes</i> the node is settled by its departure record
+    /// (<see cref="SettleExclusion"/>): evicted releases the latch of a decommission, removed by
+    /// request keeps it. The record is what makes this independent of how the roster arrived —
+    /// an evicted node is partitioned while it is evicted and usually learns the roster through
+    /// a gossip push that skips versions, which defeated every rule keyed on the version itself.
     /// </para>
     /// <para>
     /// This is the path that catches a rollback whose acknowledgement was lost:
@@ -211,25 +270,98 @@ internal sealed class ClusterLeaveService : IDisposable
             return;
         }
 
-        long armedAt = Volatile.Read(ref _drainRoleCommittedVersion);
-
-        if (!_leaveRequested || armedAt == 0 || membership.MembershipVersion <= armedAt)
+        if (!_leaveRequested)
             return;
 
-        if (self?.Role == ClusterMemberRole.Voter)
+        if (self is null)
         {
-            ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} names this node Voter again after a drain");
+            SettleExclusion(membership);
             return;
         }
 
-        // Excluded by the very next roster after an unconfirmed drain request. Roster versions
-        // advance by one per commit, so no Leaving could have been committed in between: the
-        // placement pass removes Leaving members only, which makes this exclusion a dead-member
-        // eviction, not the drain's removal. The handler runs the auto-rejoin check right after
-        // this call, so the release takes effect for this same roster. A roster that skipped
-        // versions (gossip push, snapshot) proves nothing and keeps the latch.
-        if (self is null && _drainLegUnconfirmed && membership.MembershipVersion == armedAt + 1)
+        long armedAt = Volatile.Read(ref _drainRoleCommittedVersion);
+
+        if (armedAt == 0 || membership.MembershipVersion <= armedAt)
+            return;
+
+        if (self.Role == ClusterMemberRole.Voter)
+            ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} names this node Voter again after a drain");
+    }
+
+    /// <summary>
+    /// Decides what a committed roster that excludes this node means for a raised leave latch.
+    /// Only a <see cref="RequestLeaveAsync"/> departure is open to question (see
+    /// <see cref="_departureIsDecommission"/>); the roster's departure record then answers it:
+    /// <list type="bullet">
+    /// <item><see cref="ClusterDepartureReason.Evicted"/>: the request is void. Nothing it sent can
+    /// land after the exclusion, and the node still hosts its replicas, so the latch is released
+    /// and the auto-rejoin check that the handler runs right after this call re-admits it.</item>
+    /// <item><see cref="ClusterDepartureReason.Requested"/>: the departure the node asked for
+    /// happened (its own removal, or the placement pass finishing a drain the request had given up
+    /// on). The latch stays for good.</item>
+    /// <item>No record (a roster committed by a leader that predates it): the version-adjacency
+    /// rule of the unconfirmed drain request — excluded by the very next roster after a request
+    /// whose <c>Leaving</c> never committed can only be an eviction, because versions advance by
+    /// one per commit and the pass removes <c>Leaving</c> members only. A roster that skipped
+    /// versions proves nothing and keeps the latch, as before the record existed.</item>
+    /// </list>
+    /// </summary>
+    private void SettleExclusion(ClusterMembership membership)
+    {
+        if (!_departureIsDecommission)
+            return;
+
+        ClusterDeparture? departure = membership.DepartureOf(localEndpoint);
+
+        if (departure is not null)
+        {
+            if (departure.Reason == ClusterDepartureReason.Evicted)
+            {
+                _evictedDuringRequest = true;
+                ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} records this node evicted as a dead member at v{departure.Version}; nothing from the leave request can land after an eviction");
+                return;
+            }
+
+            if (Interlocked.Exchange(ref _departureObservedAt, departure.Version) != departure.Version && logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{LocalEndpoint}] Leave request honoured: committed roster v{Version} records this node removed by request at v{DepartureVersion}; it stays out of the cluster and will not auto-rejoin", localEndpoint, membership.MembershipVersion, departure.Version);
+
+            return;
+        }
+
+        long armedAt = Volatile.Read(ref _drainRoleCommittedVersion);
+
+        if (_drainLegUnconfirmed && armedAt != 0 && membership.MembershipVersion == armedAt + 1)
             ReleaseLeaveRequest($"committed roster v{membership.MembershipVersion} evicted this node and no roster since the unconfirmed drain request (v{armedAt}) named it Leaving");
+    }
+
+    /// <summary>
+    /// True when the committed roster this node holds records it evicted as a dead member. Waits
+    /// up to <see cref="ExclusionRecordWait"/> for the local cache to reach
+    /// <paramref name="reportedVersion"/> (the version a P0 leader answered with when it said the
+    /// node is not a member) so the decision is made on the roster that excluded the node rather
+    /// than on a stale one; a cache that never gets there answers false, which keeps the
+    /// historical "departed" reading of the outcome.
+    /// </summary>
+    private async Task<bool> WasEvictedAsync(long reportedVersion)
+    {
+        ValueStopwatch sw = ValueStopwatch.StartNew();
+
+        while (true)
+        {
+            if (_evictedDuringRequest)
+                return true;
+
+            ClusterMembership roster = getCoordinator().GetMembership();
+
+            if (roster.MembershipVersion >= reportedVersion
+                && !roster.Members.Any(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal)))
+                return roster.DepartureOf(localEndpoint)?.Reason == ClusterDepartureReason.Evicted;
+
+            if (sw.GetElapsedMilliseconds() >= (long)ExclusionRecordWait.TotalMilliseconds)
+                return false;
+
+            await Task.Delay(50).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -243,11 +375,12 @@ internal sealed class ClusterLeaveService : IDisposable
             return;
 
         _leaveRequested = false;
+        _departureIsDecommission = false;
         _drainLegUnconfirmed = false;
         Volatile.Write(ref _drainRoleCommittedVersion, 0);
 
         if (logger.IsEnabled(LogLevel.Information))
-            logger.LogInformation("[{LocalEndpoint}] Leave request released: {Reason}; the node stays a full member and will auto-rejoin after an eviction", localEndpoint, reason);
+            logger.LogInformation("[{LocalEndpoint}] Leave request released: {Reason}; the node is a full member by right and auto-rejoins after an eviction", localEndpoint, reason);
     }
 
     /// <summary>Overall bound on <see cref="WithdrawFailedJoinAsync"/>; each attempt has its own shorter bound.</summary>
@@ -282,6 +415,8 @@ internal sealed class ClusterLeaveService : IDisposable
     /// </summary>
     internal async Task<bool> WithdrawFailedJoinAsync(IReadOnlyList<string> contacts, CancellationToken cancellationToken)
     {
+        // Not a decommission: an eviction of the never-promoted learner must not re-admit it.
+        _departureIsDecommission = false;
         _leaveRequested = true;
 
         LeaveRequest request = new(localEndpoint, configuration.NodeId);
@@ -538,7 +673,9 @@ internal sealed class ClusterLeaveService : IDisposable
     internal async Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default)
     {
         // Departure is decided before anything else runs: teardown follows whatever the commit
-        // attempt reports, so the roster that excludes this node must never start an auto-rejoin.
+        // attempt reports, so the roster that excludes this node must never start an auto-rejoin
+        // — not even one that evicts it while the attempt runs.
+        _departureIsDecommission = false;
         _leaveRequested = true;
 
         // If we are part of a committed roster AND there is at least one other Voter peer,
@@ -596,6 +733,9 @@ internal sealed class ClusterLeaveService : IDisposable
     /// <see cref="LeaveClusterOutcome.Committed"/>. Full-replication clusters (no replica sets)
     /// and deployments with <see cref="RaftConfiguration.EnablePlacementRebalancer"/> off (no
     /// evacuation machinery exists there) keep the historical direct-removal behaviour unchanged.
+    /// A node the cluster evicts as dead while the attempt runs is reported as
+    /// <see cref="LeaveClusterOutcome.Evicted"/>, not as a departure: nothing was evacuated, the
+    /// request is void, and the node re-admits itself through auto-rejoin.
     /// </para>
     /// <para>
     /// Campaigning is left alone until the removal commits, and suppressed for good afterwards: a
@@ -623,8 +763,12 @@ internal sealed class ClusterLeaveService : IDisposable
         {
             // Recorded before anything can short-circuit: even an attempt answered "you are already
             // out" is an operator asking this node to go, and a node that then re-admitted itself
-            // would undo the decommission just as surely as one that never left.
+            // would undo the decommission just as surely as one that never left. Marked as a
+            // decommission: the node keeps running, so an eviction voids the request instead of
+            // parking the node as NotMember (see SettleExclusion).
             _leaveRequested = true;
+            _departureIsDecommission = true;
+            _evictedDuringRequest = false;
 
             RaftSystemCoordinator systemCoordinator = getCoordinator();
             ClusterMembership roster = systemCoordinator.GetMembership();
@@ -691,10 +835,21 @@ internal sealed class ClusterLeaveService : IDisposable
 
             // A leader acknowledgement can be lost in transit or arrive after the deadline, leaving
             // an attempt reported as timed out even though the removal committed. Re-reading the
-            // roster resolves that in the caller's favour whenever the new roster is already here.
+            // roster resolves that in the caller's favour whenever the new roster is already here
+            // — unless that roster records an eviction, which is not the departure asked for.
             if (!result.Left &&
                 !systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal)))
-                result = new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
+            {
+                ClusterMembership excluded = systemCoordinator.GetMembership();
+                result = excluded.DepartureOf(localEndpoint)?.Reason == ClusterDepartureReason.Evicted
+                    ? new(LeaveClusterOutcome.Evicted, excluded.MembershipVersion)
+                    : new(LeaveClusterOutcome.Committed, excluded.MembershipVersion);
+            }
+
+            // An eviction recorded while the attempt ran is never a departure: the node still
+            // hosts its replicas and re-admits itself (the latch was released on that roster).
+            if (_evictedDuringRequest)
+                result = new(LeaveClusterOutcome.Evicted, systemCoordinator.GetMembership().MembershipVersion);
 
             // Only a departure that actually happened stops the node campaigning, and it stops it
             // for good: it is out of the roster and must not contend for leadership it no longer
@@ -723,8 +878,10 @@ internal sealed class ClusterLeaveService : IDisposable
     /// Returns <c>null</c> when the drain completed and the caller should proceed to the normal
     /// <c>RemoveMember</c> commit; returns a terminal <see cref="LeaveClusterResult"/> for every
     /// other outcome — a refusal (nothing committed, the node keeps serving as a Voter), a
-    /// timeout (role rolled back to Voter so the campaign gates release the node), or a
-    /// departure already completed by the placement pass (removal won the rollback race).
+    /// timeout (role rolled back to Voter so the campaign gates release the node), a
+    /// departure already completed by the placement pass (removal won the rollback race), or an
+    /// eviction while draining (<see cref="LeaveClusterOutcome.Evicted"/>: not a departure; the
+    /// node still hosts its replicas and re-admits itself).
     /// </para>
     /// <para>
     /// Resumable: when <paramref name="selfRole"/> is already <c>Leaving</c> (a previous attempt
@@ -766,7 +923,12 @@ internal sealed class ClusterLeaveService : IDisposable
                     return new(LeaveClusterOutcome.RefusedDrainInProgress, systemCoordinator.GetMembership().MembershipVersion);
 
                 case RaftOperationStatus.MemberNotFound:
-                    // Already out of the roster — a previous removal committed. Departed.
+                    // Already out of the roster. Departed — unless the roster that excluded the
+                    // node records an eviction, in which case nothing was asked for and the node
+                    // re-admits itself (the latch release happens on that roster's event).
+                    if (await WasEvictedAsync(leavingVersion).ConfigureAwait(false))
+                        return new(LeaveClusterOutcome.Evicted, systemCoordinator.GetMembership().MembershipVersion);
+
                     return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
 
                 default:
@@ -816,8 +978,25 @@ internal sealed class ClusterLeaveService : IDisposable
 
         while (true)
         {
-            if (!systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal)))
-                return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion, Drained: true);
+            // Read before the roster: the rejoin that follows an eviction can already have put
+            // the node back into the roster as a Learner (see the field).
+            if (_evictedDuringRequest)
+                return new(LeaveClusterOutcome.Evicted, systemCoordinator.GetMembership().MembershipVersion);
+
+            ClusterMembership roster = systemCoordinator.GetMembership();
+
+            if (!roster.Members.Any(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal)))
+            {
+                // Excluded mid-drain. The pass finishing the drain and committing the removal
+                // itself is the expected exit; an eviction (the node was unreachable for longer
+                // than the grace) is not a departure at all — the replicas were never evacuated —
+                // and must not be reported as one, or the caller stops a node that still hosts
+                // them while the latch (already released on that roster's event) lets it rejoin.
+                if (roster.DepartureOf(localEndpoint)?.Reason == ClusterDepartureReason.Evicted)
+                    return new(LeaveClusterOutcome.Evicted, roster.MembershipVersion);
+
+                return new(LeaveClusterOutcome.Committed, roster.MembershipVersion, Drained: true);
+            }
 
             if (!committedMapNamesLocalEndpoint())
                 return null;
@@ -861,7 +1040,9 @@ internal sealed class ClusterLeaveService : IDisposable
     /// while the timeout was firing, the rollback observes
     /// <see cref="RaftOperationStatus.MemberNotFound"/> (or the roster no longer names us) and
     /// reports the leave as <b>completed</b> — the node must never keep serving while out of the
-    /// committed roster.
+    /// committed roster. The one exception is an exclusion the roster records as an
+    /// <i>eviction</i>: the drain did not complete and the node is about to re-admit itself, so
+    /// the outcome is <see cref="LeaveClusterOutcome.Evicted"/>, never a departure.
     /// </para>
     /// <para>
     /// A <b>confirmed</b> rollback (the commit succeeded, or the roster already names this node
@@ -875,13 +1056,26 @@ internal sealed class ClusterLeaveService : IDisposable
     /// </summary>
     private async Task<LeaveClusterResult> RollBackDrainAsync()
     {
-        (RaftOperationStatus status, _) = await CommitRoleTransitionAsync(ClusterMemberRole.Voter, CancellationToken.None).ConfigureAwait(false);
+        // Evicted while the drain waited: there is no Leaving role left to roll back (the node is
+        // out, or already re-admitted as a Learner), and the request is void.
+        if (_evictedDuringRequest)
+            return new(LeaveClusterOutcome.Evicted, getCoordinator().GetMembership().MembershipVersion);
+
+        (RaftOperationStatus status, long reportedVersion) = await CommitRoleTransitionAsync(ClusterMemberRole.Voter, CancellationToken.None).ConfigureAwait(false);
 
         ClusterMembership after = getCoordinator().GetMembership();
         ClusterMember? self = after.Members.FirstOrDefault(m => string.Equals(m.Endpoint, localEndpoint, StringComparison.Ordinal));
 
         if (status == RaftOperationStatus.MemberNotFound || self is null)
-            return new(LeaveClusterOutcome.Committed, after.MembershipVersion, Drained: true);
+        {
+            // Out of the roster. Removal-wins is the expected reading — unless the roster that
+            // excluded the node records an eviction: then the drain never completed, the
+            // replicas are still here, and the node re-admits itself.
+            if (await WasEvictedAsync(reportedVersion).ConfigureAwait(false))
+                return new(LeaveClusterOutcome.Evicted, getCoordinator().GetMembership().MembershipVersion);
+
+            return new(LeaveClusterOutcome.Committed, getCoordinator().GetMembership().MembershipVersion, Drained: true);
+        }
 
         if (status == RaftOperationStatus.Success || self.Role == ClusterMemberRole.Voter)
         {

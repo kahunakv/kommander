@@ -1422,7 +1422,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 "[RaftSystemCoordinator] Evicting Dead member {Endpoint} (dead > {Grace:g}); roster version {Version}",
                 endpoint, grace, roster.MembershipVersion);
 
-            Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, endpoint, member.NodeId, roster.MembershipVersion));
+            // Tagged as an eviction so the committed roster records why the member left: the
+            // evicted node reads that record to tell this apart from a departure it asked for
+            // (see ClusterMembership.Departures).
+            Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, endpoint, member.NodeId, roster.MembershipVersion)
+            {
+                RemovalReason = ClusterDepartureReason.Evicted
+            });
 
             // One eviction per tick — the coordinator loop processes them serially.
             return;
@@ -1705,7 +1711,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     Role = ClusterMemberRole.Learner,
                     JoinedVersion = newVersion
                 }
-            ]
+            ],
+            // A re-admitted endpoint starts over: its old departure record must not colour a
+            // later exclusion.
+            Departures = _cachedMembership.DeparturesAfterAdmission(endpoint)
         };
 
         _membershipChangePending = true;
@@ -1760,7 +1769,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 .Select(m => m.Endpoint == endpoint
                     ? new ClusterMember { Endpoint = m.Endpoint, NodeId = m.NodeId, Role = ClusterMemberRole.Voter, JoinedVersion = m.JoinedVersion }
                     : m)
-                .ToList()
+                .ToList(),
+            Departures = _cachedMembership.Departures
         };
 
         _membershipChangePending = true;
@@ -1880,7 +1890,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 .Select(m => m.Endpoint == endpoint
                     ? new ClusterMember { Endpoint = m.Endpoint, NodeId = m.NodeId, Role = targetRole, JoinedVersion = m.JoinedVersion }
                     : m)
-                .ToList()
+                .ToList(),
+            Departures = _cachedMembership.Departures
         };
 
         _membershipChangePending = true;
@@ -1902,9 +1913,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
     }
 
     /// <summary>
-    /// Removes a node from the committed roster (graceful leave or failure-driven eviction).
-    /// Quorum shrinks at the commit point; single-server safety is preserved because
-    /// changes are applied one node at a time.
+    /// Removes a node from the committed roster (graceful leave, drain completion, operator
+    /// removal, or failure-driven eviction). Quorum shrinks at the commit point; single-server
+    /// safety is preserved because changes are applied one node at a time. The request's
+    /// <see cref="RaftSystemRequest.RemovalReason"/> is recorded in the new roster's
+    /// <see cref="ClusterMembership.Departures"/>, which is how the removed node later learns
+    /// whether it was evicted or left by request.
     /// </summary>
     private async Task TryRemoveMember(RaftSystemRequest message, CancellationToken cancellationToken)
     {
@@ -1946,14 +1960,20 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         long newVersion = _cachedMembership.MembershipVersion + 1;
 
+        // The reason travels with the committed roster. This is the only place that knows it —
+        // the request says whether the eviction driver or a leave/drain/operator asked — and the
+        // removed node is the one that needs it: an evicted node must void its own leave request
+        // and auto-rejoin, a node removed by request must stay out, and the member list alone
+        // reads the same either way.
         ClusterMembership newMembership = new()
         {
             MembershipVersion = newVersion,
-            Members = _cachedMembership.Members.Where(m => m.Endpoint != endpoint).ToList()
+            Members = _cachedMembership.Members.Where(m => m.Endpoint != endpoint).ToList(),
+            Departures = _cachedMembership.DeparturesAfterRemoval(endpoint, newVersion, message.RemovalReason)
         };
 
         _membershipChangePending = true;
-        logger.LogInfoRemoveMember(endpoint, newVersion);
+        logger.LogInfoRemoveMember(endpoint, newVersion, message.RemovalReason);
 
         try
         {

@@ -526,7 +526,11 @@ classified as repair too. Three drain-specific rules live in the controller:
 
 A drain that cannot finish within `DecommissionDrainTimeout` rolls the role back to `Voter` (the
 campaign gates otherwise keep a `Leaving` node from ever campaigning again); if the pass's removal
-races that rollback, removal wins and the leave reports completed. Known limitation: a range whose
+races that rollback, removal wins and the leave reports completed. A `Leaving` member that the SWIM
+detector evicts before the pass has evacuated it is a different exclusion: the roster records it
+as `Evicted` (`ClusterMembership.Departures`), the leave reports `Evicted` instead of completed,
+and the node re-admits itself — its replicas are still on it, and the learners the pass then adds
+to move them off can only be fed once it is a member again. Known limitation: a range whose
 *only* voter is the leaver (RF 1) can only drain while the leaver retains that range's leadership —
 if leadership is lost mid-drain the range has no electable voter until the drain times out and
 rolls back. Treat RF 1 decommission as unsupported.

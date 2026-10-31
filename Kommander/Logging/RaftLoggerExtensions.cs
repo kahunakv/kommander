@@ -359,8 +359,8 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Endpoint {Endpoint} is not in the roster; treating as idempotent success at version {Version}")]
     public static partial void LogInfoRemoveMemberNotInRoster(this ILogger<IRaft> logger, string endpoint, long version);
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Removing {Endpoint} at version {Version}")]
-    public static partial void LogInfoRemoveMember(this ILogger<IRaft> logger, string endpoint, long version);
+    [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Removing {Endpoint} at version {Version} ({Reason})")]
+    public static partial void LogInfoRemoveMember(this ILogger<IRaft> logger, string endpoint, long version, Kommander.System.ClusterDepartureReason reason);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "TrySetMemberRole: {Endpoint} {FromRole} -> {ToRole} at version {Version}")]
     public static partial void LogInfoSetMemberRole(this ILogger<IRaft> logger, string endpoint, Kommander.System.ClusterMemberRole fromRole, Kommander.System.ClusterMemberRole toRole, long version);

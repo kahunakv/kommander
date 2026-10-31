@@ -68,6 +68,15 @@ public sealed class RaftSystemRequest
     public int MemberNodeId { get; init; }
 
     /// <summary>
+    /// Why a <see cref="RaftSystemRequestType.RemoveMember"/> request removes the member. The
+    /// coordinator records it in <see cref="ClusterMembership.Departures"/> so the removed node
+    /// can tell an eviction (<see cref="ClusterDepartureReason.Evicted"/>, set only by the
+    /// dead-member eviction driver) from a removal that was asked for (the default). Ignored by
+    /// every other request type.
+    /// </summary>
+    public ClusterDepartureReason RemovalReason { get; init; }
+
+    /// <summary>
     /// The <see cref="ClusterMembership.MembershipVersion"/> the caller read before building
     /// this request. The coordinator rejects the change with
     /// <see cref="RaftOperationStatus.StaleMembership"/> if the committed version has moved.

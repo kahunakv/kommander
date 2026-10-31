@@ -367,6 +367,20 @@ once no range names it.
 Clusters without placed replica sets (full replication, RF 0) or with the rebalancer off skip the
 drain and keep the historical direct-removal behaviour.
 
+**An eviction voids a decommission.** A node the SWIM detector evicts as dead while its
+`RequestLeaveAsync` is in force — mid-drain, after a `Timeout` whose `Leaving` commit landed late,
+or after a `Timeout` that never committed anything — is out of the roster, but not because it was
+asked: its replicas were never evacuated. The call reports `Evicted` (never `Left`, so a caller
+that stops the process on `Left` keeps the replicas), the node drops its leave request and, with
+`EnableAutoRejoin` on, re-admits itself as it would after any eviction. Retry the decommission
+once the node is a `Voter` again. The node can tell this exclusion from the removal it asked for
+because the P0 leader records *why* each member left in the committed roster
+(`ClusterMembership.Departures`): the member list alone reads the same either way, and a node
+removed by request — its own `RemoveMember`, or the pass completing a drain the call had already
+given up on — must stay out for good. Without that record an evicted ex-leaver kept leading its
+ranges as `NotMember`, received no P0 entries, and so could never feed the learners the planner
+added to move those ranges off it (Kahuna nightly, 2026-10-11, 2026-10-13 and 2026-10-27).
+
 > ⚠️ **Rolling-upgrade hazard:** a peer running a pre-drain version drops `Leaving` members from
 > its peer list (its `UpdateNodes` filter predates the role), which severs replication to the
 > draining node and wedges the drain. The drain's role-transition RPC (`SetMemberRole`) also does
@@ -453,7 +467,10 @@ voters to 1 is allowed: single-node commit is supported.)
 
 If a node dies without calling `LeaveCluster`, the SWIM failure detector marks it `Suspect` → `Dead`,
 and after `DeadMemberEvictionGrace` the P0 leader commits a `RemoveMember` for it automatically. See
-the next section.
+the next section. The roster that commits the eviction records it (`Departures`: endpoint,
+version, `Evicted`), and the record stays until the endpoint is admitted again — an evicted node
+is partitioned while it is evicted and usually learns the roster through a gossip push that skips
+versions, so it must be able to read its own eviction off whichever roster reaches it first.
 
 ---
 
@@ -540,14 +557,19 @@ All on `RaftConfiguration`. Defaults shown are the current code defaults.
 When you need to change or debug membership, start here.
 
 ### Data model
-- `Kommander/System/ClusterMembership.cs` — the versioned roster record.
+- `Kommander/System/ClusterMembership.cs` — the versioned roster record, with `Departures`, the
+  bounded record of recent removals and why they happened.
 - `Kommander/System/ClusterMember.cs` — one member entry (Endpoint/NodeId/Role/JoinedVersion).
 - `Kommander/System/ClusterMemberRole.cs` — `Learner | Voter | Leaving | NotMember`.
+- `Kommander/System/ClusterDeparture.cs` — one departure record and its reason
+  (`Requested | Evicted`); written by `TryRemoveMember` from the request's `RemovalReason`, read
+  by `ClusterLeaveService` to decide whether an exclusion voids a leave request.
 
 ### The commit path & drivers (the brain)
 - `Kommander/System/RaftSystemCoordinator.cs`:
   - `TryAddMember` / `TryPromoteMember` / `TryRemoveMember` — the single-server mutations (validate
-    version, mutate, bump, replicate). `TryRemoveMember` holds the `InsufficientVoters` guard.
+    version, mutate, bump, replicate). `TryRemoveMember` holds the `InsufficientVoters` guard and
+    records the departure's reason; `TryAddMember` drops the record of a re-admitted endpoint.
   - `CheckLearnerPromotionsAsync` — the promotion driver (P0-leader-only; lag + stable-window).
   - `EvictDeadMembersAsync` — the eviction driver (P0-leader-only; reads `LivenessTable`).
   - `ApplyGossipRoster` — applies a gossiped roster to the local cache (monotonic, never to the log).

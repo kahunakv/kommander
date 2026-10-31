@@ -92,7 +92,9 @@ internal sealed class AutoRejoinDriver
     /// leave that is still in force (the removal is intentional — including an attempt that timed
     /// out, because the removal may still land later and re-admitting would undo an
     /// operator-ordered decommission; an attempt that was refused, or whose drain was rolled back
-    /// to Voter, releases the latch because the node is provably a full member again);
+    /// to Voter, releases the latch because the node is provably a full member again, and so does
+    /// a committed roster that records the node <i>evicted</i> during a decommission — the
+    /// request is void then, and this driver is the node's only way back to its ranges);
     /// this node has never been in a committed roster (first-time joins own their admission retry
     /// loop in the seed-join path, and a booting learner or a bare test manager routinely observes
     /// rosters that don't include it); or the roster is the pre-seed version 0.

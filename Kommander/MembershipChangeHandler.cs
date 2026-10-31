@@ -7,7 +7,8 @@ namespace Kommander;
 /// <summary>
 /// Reacts to every advance of the committed cluster roster: notifies the application, repairs
 /// per-follower replication progress for members the new roster (re)admits, lets the leave
-/// service observe its own role (a drain rolled back to Voter releases the leave latch), and
+/// service observe its own role (a drain rolled back to Voter releases the leave latch, and so
+/// does a roster whose departure record says this node was evicted during a decommission), and
 /// hands an eviction of this node to the auto-rejoin driver — in that order, so a release is
 /// visible to the eviction check of the same or any later roster.
 /// <para>
@@ -63,9 +64,10 @@ internal sealed class MembershipChangeHandler
 
         ResetProgressForReadmittedMembers(membership);
 
-        // A drain rolled back to Voter releases the leave latch here, BEFORE the rejoin check:
-        // the auto-rejoin driver consults that latch, and a node whose decommission was not
-        // honoured must be treated as the full Voter it is.
+        // A drain rolled back to Voter, or an eviction recorded by the roster during a
+        // decommission, releases the leave latch here, BEFORE the rejoin check: the auto-rejoin
+        // driver consults that latch, and a node whose decommission was not honoured must be
+        // treated as the full Voter it is.
         leaveService.ObserveCommittedRoster(membership);
 
         // Record self-inclusion BEFORE the rejoin check: during startup restore the

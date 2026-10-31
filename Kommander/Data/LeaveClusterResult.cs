@@ -60,7 +60,19 @@ public enum LeaveClusterOutcome
     /// already have moved. Retrying resumes the drain (replicas already evacuated stay
     /// evacuated).
     /// </summary>
-    DrainTimedOut = 7
+    DrainTimedOut = 7,
+
+    /// <summary>
+    /// The cluster evicted this node as a dead member while the request was in progress (it was
+    /// unreachable for longer than <see cref="RaftConfiguration.DeadMemberEvictionGrace"/>), so
+    /// the node is out of the committed roster — but not because it was asked: its replicas were
+    /// not evacuated, nothing the request sent can land any more, and the node re-admits itself
+    /// through auto-rejoin (when enabled) and returns to <c>Voter</c>. The decommission did not
+    /// happen; retry once the node is a member again. Never reported as
+    /// <see cref="LeaveClusterResult.Left"/>: a caller that stopped the process on this outcome
+    /// would lose the replicas that were never evacuated.
+    /// </summary>
+    Evicted = 8
 }
 
 /// <summary>
