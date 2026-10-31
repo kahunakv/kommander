@@ -321,8 +321,8 @@ internal sealed class LogReplicator
         }
 
         // Registered before anything is sent: an ack is handled on this executor, after this turn,
-        // and must find the proposal. Not returned to the pool on failure — the pool's Clear would
-        // empty the caller's log list, which the queued write still carries.
+        // and must find the proposal. Not returned to the pool on failure: the queued write still
+        // carries the caller's log list, and the pool's Clear drops the quorum's reference to it.
         if (!proposals.TryAdd(ticketId, proposalQuorum))
             return null;
 

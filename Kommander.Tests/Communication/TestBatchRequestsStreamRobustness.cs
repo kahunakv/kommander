@@ -127,7 +127,62 @@ public sealed class TestBatchRequestsStreamRobustness
         }
     }
 
+    /// <summary>
+    /// A frame over the receive limit surfaces as <see cref="StatusCode.ResourceExhausted"/> from
+    /// the request reader. The handler must fail the call with that status and name the limit in
+    /// force: it used to log the configured RaftConfiguration.GrpcMaxMessageBytes (16 MiB) while a
+    /// 4 MB library default was refusing the frames, and then return normally, so the sender saw
+    /// only <c>RpcException: Status(StatusCode="OK")</c> for a frame this side had refused (CamusDB
+    /// fault soak, 2026-10-30).
+    /// </summary>
+    [Fact]
+    public async Task OversizedFrame_FailsTheCallWithResourceExhausted_NamingTheLimitInForce()
+    {
+        using Kommander.WAL.InMemoryWAL wal = new(Microsoft.Extensions.Logging.Abstractions.NullLogger<IRaft>.Instance);
+        Kommander.Discovery.StaticDiscovery discovery = new([]);
+        Kommander.Communication.Memory.InMemoryCommunication comm = new();
+        RaftConfiguration cfg = new() { NodeId = 1, Host = "localhost", Port = 9983, InitialPartitions = 1 };
+        RaftManager manager = new(cfg, discovery, wal, comm, new HybridLogicalClock(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<IRaft>.Instance);
+
+        CapturingLogger logger = new();
+        RaftService service = new(manager, logger);
+
+        ThrowingStreamReader reader = new(new RpcException(new Status(
+            StatusCode.ResourceExhausted, "Received message exceeds the maximum configured message size.")));
+        FakeStreamWriter writer = new();
+
+        try
+        {
+            RpcException failure = await Assert.ThrowsAsync<RpcException>(
+                () => service.BatchRequests(reader, writer, new FakeServerCallContext()));
+
+            Assert.Equal(StatusCode.ResourceExhausted, failure.StatusCode);
+            Assert.Contains("receive limit in force", failure.Status.Detail);
+            Assert.Contains($"GrpcMaxMessageBytes={cfg.GrpcMaxMessageBytes}", failure.Status.Detail);
+
+            // No HTTP context on a direct call, so the limit in force is reported as unknown — never
+            // as the configured value, which is the number that misled the soak's diagnosis.
+            string line = Assert.Single(logger.Messages, m => m.Contains("receive limit in force"));
+            Assert.Contains("(unknown bytes;", line);
+            Assert.Contains($"RaftConfiguration.GrpcMaxMessageBytes={cfg.GrpcMaxMessageBytes}", line);
+            Assert.Contains("test-peer:1234", line);
+        }
+        finally
+        {
+            manager.Dispose();
+        }
+    }
+
     // ── fakes ────────────────────────────────────────────────────────────────
+
+    /// <summary>Request reader whose first read fails the way an over-limit frame does.</summary>
+    private sealed class ThrowingStreamReader(Exception failure) : IAsyncStreamReader<GrpcBatchRequestsRequest>
+    {
+        public GrpcBatchRequestsRequest Current => null!;
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken) => Task.FromException<bool>(failure);
+    }
 
     private sealed class FakeStreamReader : IAsyncStreamReader<GrpcBatchRequestsRequest>
     {

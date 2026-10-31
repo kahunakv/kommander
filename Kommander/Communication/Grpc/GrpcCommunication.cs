@@ -159,16 +159,7 @@ public class GrpcCommunication : ICommunication
         GrpcBatchRequestsRequest batchRequests = new();
         batchRequests.Requests.Add(requestItem);
 
-        try
-        {
-            await streaming.Semaphore.WaitAsync();
-            
-            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-        } 
-        finally
-        {
-            streaming.Semaphore.Release();
-        }
+        await WriteFrameAsync(streaming, batchRequests).ConfigureAwait(false);
 
         return requestVotesResponse;
     }
@@ -210,17 +201,8 @@ public class GrpcCommunication : ICommunication
         GrpcBatchRequestsRequest batchRequests = new();
         batchRequests.Requests.Add(requestItem);
 
-        try
-        {
-            await streaming.Semaphore.WaitAsync();
-            
-            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-        } 
-        finally
-        {
-            streaming.Semaphore.Release();
-        }
-        
+        await WriteFrameAsync(streaming, batchRequests).ConfigureAwait(false);
+
         return voteResponse;
     }
 
@@ -261,23 +243,7 @@ public class GrpcCommunication : ICommunication
             GrpcBatchRequestsRequest batchRequests = new();
             batchRequests.Requests.Add(requestItem);
 
-            try
-            {
-                await streaming.Semaphore.WaitAsync();
-
-                await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-            }
-            catch
-            {
-                // A failed write means the duplex stream is broken; flag it so the pool
-                // recreates this slot on the next GetStreaming instead of reusing a dead stream.
-                streaming.MarkFaulted();
-                throw;
-            }
-            finally
-            {
-                streaming.Semaphore.Release();
-            }
+            await WriteFrameAsync(streaming, batchRequests).ConfigureAwait(false);
         }
         finally
         {
@@ -285,6 +251,47 @@ public class GrpcCommunication : ICommunication
         }
 
         return appendLogsResponse;
+    }
+
+    /// <summary>
+    /// Writes one frame on the slot's duplex stream under its write lock. Every writer in this
+    /// class goes through here so the three rules below hold on every path:
+    /// <list type="bullet">
+    /// <item>a fault flagged after the pool handed the slot out is repaired <em>under the lock</em>,
+    /// so the dead call is never disposed beneath a writer that is mid-frame on it;</item>
+    /// <item>the call that is written to is the call a failure is reported against
+    /// (<see cref="GrpcInterSharedStreaming.MarkFaultedAfterWriteFailure"/>), so a verdict about
+    /// a replaced call cannot fault its replacement;</item>
+    /// <item>a frame this side's own <c>MaxSendMessageSize</c> refuses leaves the stream in place —
+    /// it is the caller's frame that is wrong, not the stream.</item>
+    /// </list>
+    /// The exception is rethrown unchanged: the dispatcher logs it and the Raft retry paths
+    /// re-ship whatever the frame carried.
+    /// </summary>
+    private static async Task WriteFrameAsync(GrpcInterSharedStreaming streaming, GrpcBatchRequestsRequest frame)
+    {
+        await streaming.Semaphore.WaitAsync().ConfigureAwait(false);
+
+        try
+        {
+            streaming.EnsureHealthy();
+
+            AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call = streaming.Streaming;
+
+            try
+            {
+                await call.RequestStream.WriteAsync(frame).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                streaming.MarkFaultedAfterWriteFailure(call, ex);
+                throw;
+            }
+        }
+        finally
+        {
+            streaming.Semaphore.Release();
+        }
     }
 
     /// <summary>
@@ -326,14 +333,19 @@ public class GrpcCommunication : ICommunication
             streaming,
             static async (s, b) =>
             {
+                // The flusher holds the slot's semaphore here (FlushCoalesced acquired it), so this
+                // is the same write discipline as WriteFrameAsync: repair a flagged fault under the
+                // lock, then report a failure against the call that was actually written to.
+                s.EnsureHealthy();
+                AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call = s.Streaming;
+
                 try
                 {
-                    await s.Streaming.RequestStream.WriteAsync(b);
+                    await call.RequestStream.WriteAsync(b);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Broken stream: flag for recreation on the next GetStreaming.
-                    s.MarkFaulted();
+                    s.MarkFaultedAfterWriteFailure(call, ex);
                     throw;
                 }
             },
@@ -542,16 +554,7 @@ public class GrpcCommunication : ICommunication
             GrpcBatchRequestsRequest batchRequests = new();
             batchRequests.Requests.Add(requestItem);
 
-            try
-            {
-                await streaming.Semaphore.WaitAsync();
-
-                await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-            }
-            finally
-            {
-                streaming.Semaphore.Release();
-            }
+            await WriteFrameAsync(streaming, batchRequests).ConfigureAwait(false);
         }
         finally
         {
@@ -601,17 +604,11 @@ public class GrpcCommunication : ICommunication
 
             batchRequests.Requests.Add(item);
         }
-        
-        try
-        {
-            await streaming.Semaphore.WaitAsync();
 
-            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-        }
-        finally
-        {
-            streaming.Semaphore.Release();
-        }
+        // A write failure on this path used to leave the slot unflagged: the dispatcher logged the
+        // completed-call error and the next frame hit the same dead stream until the response
+        // drain noticed. WriteFrameAsync flags it at once.
+        await WriteFrameAsync(streaming, batchRequests).ConfigureAwait(false);
 
         // Return the rented wire children only after WriteAsync completed — the serializer may
         // read them until then. On a failed write the objects are simply collected (a pool drop

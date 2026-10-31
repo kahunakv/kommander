@@ -112,6 +112,50 @@ public class TestExpectedLeaderBackoff
     }
 
     /// <summary>
+    /// A voter without a leader for longer than three election timeouts explains itself at Warning:
+    /// the pre-vote rounds it starts, the reason it does not campaign, and the pre-votes it denies.
+    /// Before that bound the same events stay at Information, so a routine failover logs nothing
+    /// new. The CamusDB fault soak of 2026-10-30 stayed leaderless for 245 s with two voters alive
+    /// and a Warning-level log that held only transport errors.
+    /// </summary>
+    [Fact]
+    public async Task LeaderlessBeyondThreeTimeouts_NamesTheRoundsTheHeldCandidacyAndTheDenialsAtWarning()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, ControllableWal wal) = BuildWithCapturedLog([Voter], out List<string> messages);
+        wal.PresentId = 5;
+        int endTimeoutMs = host.Config.EndElectionTimeout;
+
+        // First trigger: no leader was ever heard, so the episode is anchored here — Information only.
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(endTimeoutMs + 50));
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.DoesNotContain(messages, m => m.Contains("No leader for"));
+
+        // Past three timeouts without a leader: the round start is a Warning that says how long.
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(endTimeoutMs * 3 + 50));
+        host.Outbound.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.Contains(messages, m => m.Contains("No leader for") && m.Contains("starting pre-vote round"));
+
+        // A peer whose log is behind is denied, and the denial names the reason.
+        await sm.VoteAsync(new RaftNode(Voter), voteTerm: 2, remoteMaxLogId: 1, timestamp: Timestamp(host), preVote: true, remoteLastLogTerm: 1);
+
+        Assert.Contains(messages, m => m.Contains("No leader for") && m.Contains("denying pre-vote") && m.Contains("outdated log"));
+
+        // The application withholds candidacy: the held round names that too, every round.
+        sm.SetCandidacyWithheld(true);
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(endTimeoutMs + 50));
+        host.Outbound.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.Contains(messages, m => m.Contains("No leader for") && m.Contains("not campaigning") && m.Contains("withheld"));
+    }
+
+    /// <summary>
     /// The application's candidacy word is a plain volatile flag: setting it to the value it
     /// already holds changes nothing, and the latest call wins.
     /// </summary>

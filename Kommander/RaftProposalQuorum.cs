@@ -307,12 +307,20 @@ public sealed class RaftProposalQuorum
         StartTicks = startTicks;
     }
 
+    /// <summary>
+    /// Drains this instance before it goes back to the pool. The log list is <b>dropped, never
+    /// emptied</b>: the quorum does not own it. The same list is referenced by the WAL write and by
+    /// every <c>AppendLogs</c> still queued in the transport dispatcher for a slow peer, and
+    /// <c>List.Clear()</c> here turned those queued requests into empty heartbeats and released
+    /// none of the bytes the dispatcher had reserved for them. Replacing the reference releases the
+    /// payloads from this pooled object just the same.
+    /// </summary>
     public void Clear()
     {
         // Drain any pending waiter so awaiting callers are unblocked before the object is pooled.
         _waiter?.TrySetResult((RaftProposalTicketState.NotFound, -1));
         _waiter = null;
-        Logs.Clear();
+        Logs = [];
         nodes.Clear();
         completedNodeCount = 0;
         localDurable = true;

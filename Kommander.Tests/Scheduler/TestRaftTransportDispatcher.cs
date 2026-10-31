@@ -3,6 +3,7 @@ using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Gossip;
+using Kommander.Tests.Scheduling;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -595,6 +596,98 @@ public sealed class TestRaftTransportDispatcher
 
             Assert.Equal(5, await dispatcher.FlushAsync());
             Assert.Equal([[1, 2, 3, 4, 5]], FramesOfAppendLogsTerms(comm.Calls));
+        }
+    }
+
+    /// <summary>
+    /// The CamusDB fault-soak shape (2026-10-30): a request queued behind a paused peer outlives
+    /// its proposal, and the proposal pool used to clear the log list the request shares. The
+    /// release must subtract what the enqueue reserved, not a recount of the (now empty) list —
+    /// otherwise the reservation leaks, the peer reads as saturated for good, and every later
+    /// entry-carrying message to it is dropped while heartbeats keep passing.
+    /// </summary>
+    [Fact]
+    public async Task ByteReservation_IsReleasedAsReserved_WhenTheQueuedLogListIsClearedBeforeTheSend()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        // Budget of exactly one 1000-byte-payload message (1000 + 128 overhead).
+        RaftTransportDispatcher dispatcher = new(manager, comm, NullLogger<IRaft>.Instance,
+            maxQueuedPayloadBytesPerPeer: 1000 + 128,
+            manualExecution: true);
+
+        using (manager)
+        using (dispatcher)
+        {
+            const string Ep = "node-a:8001";
+
+            RaftResponderRequest queued = MakePayloadAppendLogs(Ep, term: 1, payloadSize: 1000);
+            dispatcher.Enqueue(Ep, queued);
+            Assert.True(dispatcher.IsOutboundQueueSaturated(Ep), "the one accepted message fills the budget");
+
+            // The proposal settled while the message waited: its log list is emptied under the
+            // queued request.
+            queued.AppendLogsRequest!.Logs!.Clear();
+
+            Assert.Equal(1, await dispatcher.FlushAsync());
+
+            Assert.False(dispatcher.IsOutboundQueueSaturated(Ep), "the reservation taken at enqueue must be released in full");
+
+            // And the peer accepts entries again.
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 2, payloadSize: 1000));
+            Assert.Equal(1, await dispatcher.FlushAsync());
+            Assert.Contains(FramesOfAppendLogsTerms(comm.Calls), frame => frame.Contains(2L));
+        }
+    }
+
+    /// <summary>
+    /// A message whose payload alone exceeds the frame budget ships by itself, but no longer
+    /// silently: the sender names it, because the receiver's limit is its only ceiling and a
+    /// refusal there surfaces on this side only as a completed-call write error.
+    /// </summary>
+    [Fact]
+    public async Task OversizedMessage_IsNamedInTheSendersLog()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        RaftTransportDispatcher dispatcher = new(manager, comm, CapturingLoggerFactory.Create<IRaft>(out List<string> messages),
+            maxQueuedPayloadBytesPerPeer: 64L * 1024 * 1024,
+            maxBatchPayloadBytes: 1500,
+            manualExecution: true);
+
+        using (manager)
+        using (dispatcher)
+        {
+            const string Ep = "node-a:8001";
+
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 1, payloadSize: 1000)); // fits: silent
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 2, payloadSize: 5000)); // over the budget alone
+
+            Assert.Equal(2, await dispatcher.FlushAsync());
+
+            string line = Assert.Single(messages, m => m.Contains("over the 1500-byte frame budget"));
+            Assert.Contains("5128 payload bytes", line);
+            Assert.Contains(Ep, line);
         }
     }
 

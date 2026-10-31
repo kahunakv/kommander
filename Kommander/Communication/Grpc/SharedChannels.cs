@@ -62,12 +62,71 @@ public sealed class GrpcInterSharedStreaming
     }
 
     /// <summary>
-    /// Flags this stream as faulted so the next <see cref="EnsureHealthy"/> recreates it.
-    /// A writer whose <c>WriteAsync</c> throws calls this to trigger prompt recovery rather
-    /// than waiting for <see cref="ListenForEvents"/> to observe the broken response stream.
-    /// Safe to call from any thread.
+    /// Flags the current stream as faulted so the next <see cref="EnsureHealthy"/> recreates it.
+    /// Safe to call from any thread. Writers inside this assembly use
+    /// <see cref="MarkFaultedAfterWriteFailure"/>, which also knows which call failed and why.
     /// </summary>
     public void MarkFaulted() => faulted = true;
+
+    /// <summary>
+    /// Flags the slot after a <c>WriteAsync</c> on <paramref name="call"/> threw
+    /// <paramref name="exception"/>, so the next hand-out recreates the stream instead of waiting
+    /// for <see cref="ListenForEvents"/> to notice — with two exceptions that keep a healthy stream
+    /// in place:
+    /// <list type="bullet">
+    /// <item>a <see cref="StatusCode.ResourceExhausted"/> raised while the call is still open is this
+    /// side's own <c>MaxSendMessageSize</c> refusing the frame before it was written; the stream is
+    /// intact, and disposing it here is what started the recreate churn described on
+    /// <see cref="ListenForEvents"/>;</item>
+    /// <item>a failure on a call that <see cref="EnsureHealthy"/> has already replaced says nothing
+    /// about its replacement.</item>
+    /// </list>
+    /// A server-side refusal arrives as a <em>completed</em> call (the peer ended the stream with the
+    /// status), so it is classified as dead and recreated like any other fault.
+    /// </summary>
+    internal void MarkFaultedAfterWriteFailure(
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call,
+        Exception exception)
+    {
+        if (exception is RpcException { StatusCode: StatusCode.ResourceExhausted } && !IsCallComplete(call))
+            return;
+
+        FlagFaulted(call);
+    }
+
+    /// <summary>
+    /// True once gRPC has a final status for <paramref name="call"/>: the peer completed or refused
+    /// it, or it was cancelled. <see cref="AsyncDuplexStreamingCall{TRequest,TResponse}.GetStatus"/>
+    /// throws <see cref="InvalidOperationException"/> while the call is still in progress, which is
+    /// the only signal gRPC exposes for "in progress" without awaiting the response stream.
+    /// </summary>
+    private static bool IsCallComplete(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call)
+    {
+        try
+        {
+            call.GetStatus();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Sets the fault flag only when <paramref name="call"/> is still the slot's current call.
+    /// Taken under <see cref="recreateLock"/> so the check cannot interleave with the swap in
+    /// <see cref="EnsureHealthy"/>: a verdict about a call that was replaced must never land on
+    /// its replacement.
+    /// </summary>
+    private void FlagFaulted(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call)
+    {
+        lock (recreateLock)
+        {
+            if (ReferenceEquals(streaming, call))
+                faulted = true;
+        }
+    }
 
     /// <summary>
     /// If the stream has faulted, disposes the dead call and lazily recreates a fresh duplex
@@ -105,6 +164,15 @@ public sealed class GrpcInterSharedStreaming
     /// Drains the response stream for the life of <paramref name="call"/>.  When the loop ends —
     /// whether the peer completed it or a transport fault threw — the stream is flagged faulted
     /// so the pool recreates it on next use instead of leaving a dead slot in rotation.
+    ///
+    /// <para><b>The flag is set only while <paramref name="call"/> is still the slot's current
+    /// call.</b> <see cref="EnsureHealthy"/> disposes the call it replaces, which ends that call's
+    /// drain loop with a cancellation some time later — on a loaded thread pool, after the fresh
+    /// call was installed and the flag cleared. Setting the flag unconditionally here then marked
+    /// the healthy replacement faulted, the next hand-out disposed <em>it</em>, its own loop ended
+    /// the same way, and the slot re-opened a stream on every send for as long as traffic flowed:
+    /// each frame was written to a brand-new stream and the previous stream was reset under the
+    /// frame still in flight on it, so large frames never arrived while small ones did.</para>
     /// </summary>
     private async Task ListenForEvents(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call)
     {
@@ -123,18 +191,26 @@ public sealed class GrpcInterSharedStreaming
             // itself an allocation and DID throw OutOfMemoryException out of this catch in the
             // Caraxes run Q crash (SIGABRT from the finalizer thread). Nothing thrown from
             // logging may escape; the finally still flags the stream for recreation.
-            try
+            //
+            // The cancellation of a call EnsureHealthy already replaced is the expected end of its
+            // drain loop, not an event: left in, it printed one line per recreated stream.
+            bool replacedCallCancelled = ex is RpcException { StatusCode: StatusCode.Cancelled }
+                                         && !ReferenceEquals(streaming, call);
+            if (!replacedCallCancelled)
             {
-                Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
-            }
-            catch
-            {
-                // Logging failed (most likely OOM); the fault flag below is the required outcome.
+                try
+                {
+                    Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
+                }
+                catch
+                {
+                    // Logging failed (most likely OOM); the fault flag below is the required outcome.
+                }
             }
         }
         finally
         {
-            faulted = true;
+            FlagFaulted(call);
         }
     }
 }

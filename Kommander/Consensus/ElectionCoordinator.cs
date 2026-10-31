@@ -253,7 +253,15 @@ internal sealed class ElectionCoordinator
     /// vote-grant cooldowns it keeps refreshing — so the complete peer's own pre-vote can reach
     /// quorum. Bounded so a fresher peer that never campaigns cannot suppress this node forever.
     /// </summary>
-    private bool ShouldDeferCandidacy()
+    private bool ShouldDeferCandidacy() => ShouldDeferCandidacy(out _);
+
+    /// <summary>
+    /// <see cref="ShouldDeferCandidacy()"/> with the reason the round is yielded in
+    /// <paramref name="reason"/> (empty when it is not), for the leaderless-stall Warning: the
+    /// stall and withheld deferrals log once per episode by design, and an episode that began
+    /// minutes before the leader died left nothing in the window where the partition had no leader.
+    /// </summary>
+    private bool ShouldDeferCandidacy(out string reason)
     {
         // A node whose own WAL write is stalled must not campaign: it would win on log freshness (a
         // deposed leader's log is the freshest by construction), then hold the partition again with a
@@ -271,6 +279,7 @@ internal sealed class ElectionCoordinator
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, wal.GetOldestPendingWriteAgeMs(), host.Configuration.WalStallStepDownTimeout);
             }
 
+            reason = $"this node's oldest pending WAL write has been unanswered for {wal.GetOldestPendingWriteAgeMs():F0} ms (bound {host.Configuration.WalStallStepDownTimeout}); a stalled disk must not win the term";
             return true;
         }
 
@@ -289,6 +298,7 @@ internal sealed class ElectionCoordinator
                 logger.LogWarnCandidacyWithheld(host.LocalEndpoint, host.PartitionId, coreState.NodeState);
             }
 
+            reason = "the application withheld this replica's candidacy (its projection is incomplete)";
             return true;
         }
 
@@ -297,11 +307,15 @@ internal sealed class ElectionCoordinator
         if (!wal.HasPresenceGap() || !KnowsFresherAliveVoter(wal.GetPresentIndex()))
         {
             candidacyDeferrals = 0;
+            reason = "";
             return false;
         }
 
         if (candidacyDeferrals >= MaxCandidacyDeferrals)
+        {
+            reason = "";
             return false;
+        }
 
         candidacyDeferrals++;
 
@@ -309,8 +323,70 @@ internal sealed class ElectionCoordinator
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Deferring candidacy ({Attempt}/{MaxAttempts}): this log has a hole (contiguous through {PresentId}) and a fresher live voter is known — yielding the term so it can win and backfill.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, candidacyDeferrals, MaxCandidacyDeferrals, wal.GetPresentIndex());
 
+        reason = $"this log has a hole (contiguous through {wal.GetPresentIndex()}) and a fresher live voter is known; yielding round {candidacyDeferrals}/{MaxCandidacyDeferrals}";
         return true;
     }
+
+    /// <summary>
+    /// Multiple of <see cref="RaftConfiguration.EndElectionTimeout"/> after which a voter with no
+    /// leader explains itself at Warning (see <see cref="LeaderlessForLong"/>).
+    /// </summary>
+    internal const int LeaderlessWarnTimeoutMultiple = 3;
+
+    /// <summary>
+    /// Monotonic tick from which this node counts its current leaderless episode; 0 while none is
+    /// open. Set by the first election trigger after the leader went silent — at that trigger
+    /// <see cref="RaftPartitionCoreState.LastHeartbeatTicks"/> is the genuine last contact, or the
+    /// step-down tick of a node that led — and closed by a later leader contact
+    /// (<see cref="RaftPartitionCoreState.LastLeaderContactTicks"/>, stamped only by an accepted
+    /// AppendLogs or a leader adoption) or by this node's own promotion. Not derived from
+    /// <c>LastHeartbeatTicks</c> alone because every failed candidacy re-stamps that.
+    /// </summary>
+    private long leaderlessSinceTicks;
+
+    /// <summary>
+    /// Opens or continues the leaderless episode at an election trigger and returns its length. A
+    /// leader contact that landed after the episode began closes it, so a leader that was merely
+    /// slow (a GC pause past the election timeout) does not leave an old anchor behind that would
+    /// make the next real outage read as hours long.
+    /// </summary>
+    private TimeSpan TrackLeaderless(long nowTicks)
+    {
+        if (leaderlessSinceTicks != 0 && coreState.LastLeaderContactTicks > leaderlessSinceTicks)
+            leaderlessSinceTicks = 0;
+
+        if (leaderlessSinceTicks == 0)
+            leaderlessSinceTicks = coreState.LastHeartbeatTicks != 0 ? coreState.LastHeartbeatTicks : nowTicks;
+
+        return RaftMonotonic.Elapsed(leaderlessSinceTicks, nowTicks);
+    }
+
+    /// <summary>
+    /// True once the open leaderless episode has outlasted
+    /// <see cref="LeaderlessWarnTimeoutMultiple"/> election timeouts; <paramref name="leaderlessMs"/>
+    /// carries its length for the log line. The election paths then log at Warning what they
+    /// otherwise log at Information or Debug: the pre-vote rounds this node starts, why it does not
+    /// campaign, and why it denies a peer. Both survivors of a three-voter partition that cannot
+    /// elect are in this state, so between them the Warning log names the gate that holds.
+    /// </summary>
+    private bool LeaderlessForLong(long nowTicks, out long leaderlessMs)
+    {
+        leaderlessMs = 0;
+
+        if (leaderlessSinceTicks == 0 || coreState.NodeState == RaftNodeState.Leader)
+            return false;
+
+        if (coreState.LastLeaderContactTicks > leaderlessSinceTicks)
+            return false;
+
+        TimeSpan leaderless = RaftMonotonic.Elapsed(leaderlessSinceTicks, nowTicks);
+        leaderlessMs = (long)leaderless.TotalMilliseconds;
+
+        return leaderless > TimeSpan.FromMilliseconds((long)host.Configuration.EndElectionTimeout * LeaderlessWarnTimeoutMultiple);
+    }
+
+    /// <summary>Closes the leaderless episode: this node took office.</summary>
+    private void NoteLeaderEstablished() => leaderlessSinceTicks = 0;
 
     /// <summary>
     /// True while this node's own oldest pending WAL write is older than
@@ -486,27 +562,47 @@ internal sealed class ElectionCoordinator
         discoveryGateWarned = false;
 
         long nowTicks = host.GetMonotonicTimestamp();
+        TrackLeaderless(nowTicks);
+        bool leaderlessWarn = LeaderlessForLong(nowTicks, out long leaderlessMs);
 
         // A stalled disk never campaigns, and neither does a replica whose candidacy the application
         // withheld, whether this election was reached by timeout or by a step-down notice from a peer
         // (which skips the cooldown block below).
-        if ((IsLocalWalStalled() || coreState.CandidacyWithheld) && ShouldDeferCandidacy())
+        if ((IsLocalWalStalled() || coreState.CandidacyWithheld) && ShouldDeferCandidacy(out string unconditionalDeferral))
+        {
+            if (leaderlessWarn)
+                logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple, unconditionalDeferral);
             return;
+        }
 
         if (!ignoreRecentVoteCooldown)
         {
             if (InsideRecentVoteCooldown(nowTicks))
+            {
+                if (leaderlessWarn)
+                    logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple,
+                        $"inside the recent-vote cooldown: granted a vote or stepped down {RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks).TotalMilliseconds:F0} ms ago and heard no leader since");
                 return;
+            }
 
             string expectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
             if (!string.IsNullOrEmpty(expectedLeader) && LeaderActivityIsFresh(expectedLeader, nowTicks))
+            {
+                if (leaderlessWarn)
+                    logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple,
+                        $"the expected leader {expectedLeader} showed activity {RaftMonotonic.Elapsed(host.GetLastNodeActivityTicks(expectedLeader, host.PartitionId), nowTicks).TotalMilliseconds:F0} ms ago");
                 return;
+            }
 
             // A gapped log with a fresher live voter known: yield the round (bounded) instead of
             // winning a term this node would refuse at the promotion gates. Skipped when a
             // pre-vote quorum promoted us here (peers already judged us electable).
-            if (ShouldDeferCandidacy())
+            if (ShouldDeferCandidacy(out string deferral))
+            {
+                if (leaderlessWarn)
+                    logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple, deferral);
                 return;
+            }
         }
 
         // No global "am I outdated?" pre-election veto here (removed): candidate eligibility is decided
@@ -571,6 +667,7 @@ internal sealed class ElectionCoordinator
         if (CountVoterPeers() == 0)
         {
             tracker.ClearProgressKeepingCommitFrontiers();
+            NoteLeaderEstablished();
             // published == false: barrier pending, self-quorum commit publishes shortly after
             // (see CompleteLeaderCommit), which also fires the LeaderChanged notification.
             bool published = await becomeLeaderAsync().ConfigureAwait(false);
@@ -604,6 +701,8 @@ internal sealed class ElectionCoordinator
         }
 
         long nowTicks = host.GetMonotonicTimestamp();
+        TrackLeaderless(nowTicks);
+        bool leaderlessWarn = LeaderlessForLong(nowTicks, out long leaderlessMs);
 
         // Same "should I even try?" guards as a real election. These guards do NOT touch any Raft
         // consensus state (coreState.CurrentTerm / votes / expectedLeaders / coreState.NodeState) — that is the whole
@@ -611,18 +710,32 @@ internal sealed class ElectionCoordinator
         // refresh on the "leader still fresh" path, mirroring StartElectionAsync, not a consensus
         // mutation: it just records that we observed the leader so we don't immediately re-trigger.
         if (InsideRecentVoteCooldown(nowTicks))
+        {
+            if (leaderlessWarn)
+                logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple,
+                    $"inside the recent-vote cooldown: granted a vote or stepped down {RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks).TotalMilliseconds:F0} ms ago and heard no leader since");
             return;
+        }
 
         // Intentional back-off write inside: remembers we saw the leader. Not a consensus mutation.
         string expectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
         if (!string.IsNullOrEmpty(expectedLeader) && LeaderActivityIsFresh(expectedLeader, nowTicks))
+        {
+            if (leaderlessWarn)
+                logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple,
+                    $"the expected leader {expectedLeader} showed activity {RaftMonotonic.Elapsed(host.GetLastNodeActivityTicks(expectedLeader, host.PartitionId), nowTicks).TotalMilliseconds:F0} ms ago");
             return;
+        }
 
         // A gapped log with a fresher live voter known: yield the round (bounded) instead of
         // probing for a term this node would refuse at the promotion gates. Unlike the removed
         // global veto this is TTL- and liveness-gated and bounded, so it cannot suppress forever.
-        if (ShouldDeferCandidacy())
+        if (ShouldDeferCandidacy(out string deferral))
+        {
+            if (leaderlessWarn)
+                logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple, deferral);
             return;
+        }
 
         // No global "am I outdated?" pre-election veto here (removed): a pre-vote is side-effect-free by
         // design, so a genuinely-behind node can safely probe — its peers deny the pre-vote via the
@@ -647,7 +760,10 @@ internal sealed class ElectionCoordinator
         preVotes.Clear();
         preVotes.Add(host.LocalEndpoint);
 
-        logger.LogInfoStartingPreVoteRound(host.LocalEndpoint, host.PartitionId, coreState.NodeState, preVoteTerm);
+        if (leaderlessWarn)
+            logger.LogWarnLeaderlessPreVoteRound(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple, preVoteTerm);
+        else
+            logger.LogInfoStartingPreVoteRound(host.LocalEndpoint, host.PartitionId, coreState.NodeState, preVoteTerm);
 
         await RequestVotesAsync(currentTime, preVoteTerm, preVote: true).ConfigureAwait(false);
     }
@@ -751,9 +867,17 @@ internal sealed class ElectionCoordinator
             // Side-effect-free pre-vote (Raft §9.6). NOTHING below this branch's `return`
             // may mutate state: we only read term/log/leader-freshness and, on grant, reply.
 
+            // Diagnostic only (no consensus state): while this node has itself been without a leader
+            // for long, each denial below is also named at Warning — the denier's reason is the half
+            // of a stalled election that the candidate's own log cannot show.
+            long preVoteNowTicks = host.GetMonotonicTimestamp();
+            bool denyWarn = LeaderlessForLong(preVoteNowTicks, out long denyLeaderlessMs);
+
             if (!host.IsVoter(node.Endpoint))
             {
                 logger.LogDebugDenyingPreVoteNotVoter(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
+                if (denyWarn)
+                    logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, "endpoint is not a committed voter");
                 return;
             }
 
@@ -813,10 +937,12 @@ internal sealed class ElectionCoordinator
                         && !ExpectedLeaderLeftTheRange(preVoteExpectedLeader))
                     {
                         logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
+                        if (denyWarn)
+                            logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, $"quiesced and the expected leader {preVoteExpectedLeader} is Alive per SWIM");
                         return;
                     }
                 }
-                else if (coreState.LastHeartbeatTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastHeartbeatTicks, host.GetMonotonicTimestamp()) < coreState.ElectionTimeout))
+                else if (coreState.LastHeartbeatTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastHeartbeatTicks, preVoteNowTicks) < coreState.ElectionTimeout))
                 {
                     // Not quiesced: a recent heartbeat from our leader means it is still live to us.
                     // Measured as local elapsed time since we last heard from the leader (monotonic),
@@ -825,6 +951,8 @@ internal sealed class ElectionCoordinator
                     // heartbeat look fresh (or vice-versa). "How long we've been without a heartbeat" is a
                     // purely local quantity.
                     logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
+                    if (denyWarn)
+                        logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, $"the expected leader {preVoteExpectedLeader} was heard {RaftMonotonic.Elapsed(coreState.LastHeartbeatTicks, preVoteNowTicks).TotalMilliseconds:F0} ms ago");
                     return;
                 }
             }
@@ -833,6 +961,8 @@ internal sealed class ElectionCoordinator
             if (voteTerm < coreState.CurrentTerm)
             {
                 logger.LogDebugDenyingPreVoteStaleTerm(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, coreState.CurrentTerm);
+                if (denyWarn)
+                    logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, $"stale term, CurrentTerm={coreState.CurrentTerm}");
                 return;
             }
 
@@ -845,6 +975,8 @@ internal sealed class ElectionCoordinator
             if (CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, preVoteLocalLastTerm, preVoteLocalMaxId))
             {
                 logger.LogDebugDenyingPreVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, remoteMaxLogId, preVoteLocalMaxId);
+                if (denyWarn)
+                    logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, $"outdated log: remote (term {remoteLastLogTerm}, index {remoteMaxLogId}) is behind local (term {preVoteLocalLastTerm}, index {preVoteLocalMaxId})");
                 return;
             }
 
@@ -855,28 +987,40 @@ internal sealed class ElectionCoordinator
             return;
         }
 
+        // Same diagnostic as the pre-vote branch: denials of a real vote while this node has long had
+        // no leader are named at Warning.
+        bool voteDenyWarn = LeaderlessForLong(host.GetMonotonicTimestamp(), out long voteDenyLeaderlessMs);
+
         if (!host.IsVoter(node.Endpoint))
         {
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebugDenyingVoteNotVoter(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, "endpoint is not a committed voter");
             return;
         }
 
         if (votes.ContainsKey(voteTerm))
         {
             logger.LogInfoAlreadyVotedInTerm(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, "this node already tallied votes for that term as a candidate");
             return;
         }
 
         if (coreState.NodeState != RaftNodeState.Follower && voteTerm == coreState.CurrentTerm)
         {
             logger.LogInfoCandidateOrLeaderSameTerm(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, "this node is a candidate in the same term");
             return;
         }
 
         if (coreState.CurrentTerm > voteTerm)
         {
             logger.LogInfoVoteOnPreviousTerm(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, $"stale term, CurrentTerm={coreState.CurrentTerm}");
             return;
         }
 
@@ -940,6 +1084,8 @@ internal sealed class ElectionCoordinator
         if (!string.IsNullOrEmpty(expectedLeader) && expectedLeader != node.Endpoint)
         {
             logger.LogInfoAlreadyVotedForOther(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, expectedLeader);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, $"already voted for {expectedLeader} in this term");
             return;
         }
         
@@ -954,6 +1100,8 @@ internal sealed class ElectionCoordinator
             // `coreState.CurrentTerm++` heuristic that forced us to be elected is no longer needed and only
             // risked spurious term churn.
             logger.LogInfoVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, remoteMaxLogId, localMaxId);
+            if (voteDenyWarn)
+                logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, $"outdated log: remote (term {remoteLastLogTerm}, index {remoteMaxLogId}) is behind local (term {localLastLogTerm}, index {localMaxId})");
             return;
         }
         
@@ -1324,6 +1472,7 @@ internal sealed class ElectionCoordinator
             tracker.SeedOptimisticProgress(peer.Endpoint, maxLogResponse);
         }
 
+        NoteLeaderEstablished();
         bool leadershipPublished = await becomeLeaderAsync().ConfigureAwait(false);
 
         double electionElapsedMs = RaftMonotonic.Elapsed(coreState.VotingStartedTicks, host.GetMonotonicTimestamp()).TotalMilliseconds;

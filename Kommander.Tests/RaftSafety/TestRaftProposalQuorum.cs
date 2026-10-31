@@ -25,6 +25,25 @@ public class TestRaftProposalQuorum
         Assert.True(quorum.HasQuorum());
     }
 
+    /// <summary>
+    /// The quorum shares its log list with the WAL write and with every AppendLogs still queued in
+    /// the transport dispatcher for a slow peer. Returning the quorum to the pool must drop the
+    /// list, not empty it: emptying it turned those queued requests into empty heartbeats and
+    /// released none of the bytes the dispatcher had reserved for them.
+    /// </summary>
+    [Fact]
+    public void Clear_DropsTheLogListWithoutEmptyingTheCallersList()
+    {
+        List<RaftLog> logs = [new RaftLog { Id = 1, Term = 1 }, new RaftLog { Id = 2, Term = 1 }];
+        RaftProposalQuorum quorum = new(logs, autoCommit: true, HLCTimestamp.Zero);
+
+        quorum.Clear();
+
+        Assert.Equal(2, logs.Count);
+        Assert.NotSame(logs, quorum.Logs);
+        Assert.Empty(quorum.Logs);
+    }
+
     [Theory]
     [InlineData(3, 1)]
     [InlineData(5, 2)]

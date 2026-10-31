@@ -508,4 +508,20 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Ignoring TransferLeadership from {Endpoint} Term={Term}: this replica's candidacy is withheld by the application")]
     public static partial void LogWarnTransferRefusedCandidacyWithheld(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
+
+    // ── Election stall diagnostics (ElectionCoordinator) ──────────────────
+    // While a voter has had no leader for longer than LeaderlessWarnTimeoutMultiple election
+    // timeouts, the pre-vote round starts, the reasons it does not campaign, and the (pre-)votes it
+    // denies are logged at Warning instead of Information/Debug, so a leaderless partition explains
+    // itself in a Warning-level log (the CamusDB fault soak of 2026-10-30 stayed leaderless for 245 s
+    // with two voters alive, and the log held only transport errors).
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] No leader for {LeaderlessMs}ms (over {Multiple}x EndElectionTimeout): starting pre-vote round for Term={PreVoteTerm}")]
+    public static partial void LogWarnLeaderlessPreVoteRound(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long leaderlessMs, int multiple, long preVoteTerm);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] No leader for {LeaderlessMs}ms (over {Multiple}x EndElectionTimeout) and this node is not campaigning: {Reason}")]
+    public static partial void LogWarnLeaderlessCandidacyHeld(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long leaderlessMs, int multiple, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] No leader for {LeaderlessMs}ms (over {Multiple}x EndElectionTimeout): denying {Kind} to {Endpoint} Term={Term}: {Reason}")]
+    public static partial void LogWarnLeaderlessDenyingVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long leaderlessMs, int multiple, string kind, string endpoint, long term, string reason);
 }

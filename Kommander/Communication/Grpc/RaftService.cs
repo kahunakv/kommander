@@ -361,6 +361,9 @@ public sealed class RaftService : Rafter.RafterBase
         // the ValidateAuth remarks.
         ValidateAuth(context, request: null);
 
+        int? receiveLimitInForce = ReceiveLimitInForce(context);
+        WarnOnceIfReceiveLimitBelowConfigured(receiveLimitInForce);
+
         try
         {
             // One reusable response per stream: the client drains and discards these (real
@@ -613,17 +616,59 @@ public sealed class RaftService : Rafter.RafterBase
         }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.ResourceExhausted)
         {
-            // A frame over this node's receive limit. Name the limit and the option so the
-            // operator can line it up against the sender's MaxOutboundBatchBytes and
-            // MaxBackfillBytesPerRound instead of guessing which side to change.
+            // A frame over this node's receive limit. The limit in force comes from the host's gRPC
+            // options, not from RaftConfiguration — the two differ when the host registered gRPC
+            // without AddKommanderGrpc — so both are named: the previous line reported the configured
+            // 16 MiB while a 4 MB library default was refusing 4 MiB frames. The call is failed with
+            // the status rather than completed: returning normally completed it with OK, and the
+            // sender logged `RpcException: Status(StatusCode="OK")` for a frame this side refused.
+            string inForce = receiveLimitInForce?.ToString() ?? "unknown";
+
             logger.LogError(
-                "BatchRequests: stream from {Peer} failed: a frame exceeded this node's gRPC receive limit ({MaxReceiveMessageBytes} bytes, RaftConfiguration.GrpcMaxMessageBytes); the sender's MaxOutboundBatchBytes and MaxBackfillBytesPerRound must stay below it. {Message}",
-                context.Peer, raft.Configuration.GrpcMaxMessageBytes, ex.Message);
+                "BatchRequests: stream from {Peer} failed: a frame exceeded this node's gRPC receive limit in force ({ReceiveLimitInForce} bytes; RaftConfiguration.GrpcMaxMessageBytes={ConfiguredBytes}); the sender's MaxOutboundBatchBytes and MaxBackfillBytesPerRound plus framing must stay below the limit in force. {Message}",
+                context.Peer, inForce, raft.Configuration.GrpcMaxMessageBytes, ex.Message);
+
+            throw new RpcException(new Status(
+                StatusCode.ResourceExhausted,
+                $"BatchRequests frame exceeded the receiver's gRPC receive limit in force ({inForce} bytes; receiver GrpcMaxMessageBytes={raft.Configuration.GrpcMaxMessageBytes}): lower MaxOutboundBatchBytes/MaxBackfillBytesPerRound on the sender, or register the receiver's gRPC with AddKommanderGrpc() so the configured limit applies"));
         }
         catch (Exception ex)
         {
             logger.LogError("BatchRequests: stream from {Peer} failed: {Exception}", context.Peer, ex.ToString());
         }
+    }
+
+    /// <summary>
+    /// The receive limit the host's gRPC options apply to this service, resolved through the call's
+    /// request services, or <see langword="null"/> when the call carries no HTTP context (direct
+    /// invocation in tests). See <see cref="GrpcCommunicationExtensions.ResolveRaftReceiveLimit"/>.
+    /// </summary>
+    private static int? ReceiveLimitInForce(ServerCallContext context) =>
+        TryGetHttpContext(context)?.RequestServices is { } services
+            ? GrpcCommunicationExtensions.ResolveRaftReceiveLimit(services)
+            : null;
+
+    /// <summary>1 once the receive-limit mismatch below was logged; it is a wiring fact, so once per process is enough.</summary>
+    private static int receiveLimitMismatchLogged;
+
+    /// <summary>
+    /// Logs, once per process, that the receive limit in force for this service is below
+    /// <see cref="RaftConfiguration.GrpcMaxMessageBytes"/>. <see cref="GrpcCommunicationExtensions.MapGrpcRaftRoutes"/>
+    /// lines the two up when it maps the service; this covers a host that mapped the service itself.
+    /// A sender sizes its frames by the configuration, so a frame of MaxOutboundBatchBytes plus
+    /// framing is refused by a lower limit and tears the replication stream down.
+    /// </summary>
+    private void WarnOnceIfReceiveLimitBelowConfigured(int? receiveLimitInForce)
+    {
+        if (receiveLimitInForce is not { } inForce || inForce >= raft.Configuration.GrpcMaxMessageBytes)
+            return;
+
+        if (Interlocked.Exchange(ref receiveLimitMismatchLogged, 1) != 0)
+            return;
+
+        logger.LogError(
+            "The gRPC receive limit in force for the Raft service is {InForceBytes} bytes, below RaftConfiguration.GrpcMaxMessageBytes ({ConfiguredBytes}): BatchRequests frames up to the sender's MaxOutboundBatchBytes plus framing will be refused and tear the replication stream down. Register gRPC with AddKommanderGrpc(), or map the service with MapGrpcRaftRoutes()",
+            inForce, raft.Configuration.GrpcMaxMessageBytes);
     }
 
     /// <summary>

@@ -29,7 +29,17 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
     private sealed class EndpointWorker : IDisposable
     {
-        private readonly Channel<RaftResponderRequest> _channel;
+        /// <summary>
+        /// One queued envelope with the payload bytes it was accounted at. The count is fixed at
+        /// enqueue and travels with the message: the frame cap reads it and the release subtracts
+        /// exactly it. Recounting from the live log list at send time released nothing for a request
+        /// whose proposal had settled meanwhile — the proposal pool used to clear the list the queued
+        /// request shares — so a peer paused for longer than the settled-retention window stayed
+        /// "saturated" for good and every later entry-carrying message to it was dropped silently.
+        /// </summary>
+        private readonly record struct QueuedMessage(RaftResponderRequest Request, long PayloadBytes);
+
+        private readonly Channel<QueuedMessage> _channel;
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _loop;
         private readonly long _maxQueuedPayloadBytes;
@@ -40,9 +50,14 @@ internal sealed class RaftTransportDispatcher : IDisposable
         /// Approximate log-payload bytes currently queued (or in the in-flight batch) for this
         /// peer. Incremented at enqueue, decremented after the batch containing the message has
         /// been handed to the transport — the queue AND the in-flight batch both retain the
-        /// payload lists, so both count against the budget.
+        /// payload lists, so both count against the budget. Both sides use the per-message count
+        /// taken at enqueue (<see cref="QueuedMessage.PayloadBytes"/>), never a recount of the list,
+        /// so the counter returns to zero whatever happens to the list while the message waits.
         /// </summary>
         private long _queuedPayloadBytes;
+
+        /// <summary>Messages whose payload alone exceeded the frame budget; single-reader counter.</summary>
+        private long _oversizedMessages;
 
         /// <summary>Total entry-carrying messages dropped since the worker started; monotonic, for the episode log.</summary>
         private long _droppedMessages;
@@ -61,7 +76,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
         /// frame being built. It opens the next frame, so the byte cap never reorders a peer's
         /// queue. Only the single reader touches it.
         /// </summary>
-        private RaftResponderRequest _carry;
+        private QueuedMessage _carry;
         private bool _hasCarry;
 
         // Send context, kept so manual mode can perform a flush without a running loop.
@@ -88,7 +103,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
             _communication = communication;
             _manualExecution = manualExecution;
 
-            _channel = Channel.CreateUnbounded<RaftResponderRequest>(
+            _channel = Channel.CreateUnbounded<QueuedMessage>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
             if (manualExecution)
@@ -116,7 +131,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
             if (!_manualExecution)
                 return 0;
 
-            List<RaftResponderRequest> batch = new(MaxBatchSize);
+            List<QueuedMessage> batch = new(MaxBatchSize);
             int sent = 0;
 
             while (FillBatch(batch) > 0)
@@ -134,22 +149,23 @@ internal sealed class RaftTransportDispatcher : IDisposable
         /// <see cref="RaftConfiguration.GrpcMaxMessageBytes"/> is the ceiling for that case, and
         /// holding it back would stall its partition. Returns the frame's message count.
         /// </summary>
-        private int FillBatch(List<RaftResponderRequest> batch)
+        private int FillBatch(List<QueuedMessage> batch)
         {
             batch.Clear();
             long batchBytes = 0;
 
             if (_hasCarry)
             {
+                NoteIfOversized(_carry);
                 batch.Add(_carry);
-                batchBytes = PayloadBytes(_carry);
+                batchBytes = _carry.PayloadBytes;
                 _carry = default;
                 _hasCarry = false;
             }
 
-            while (batch.Count < MaxBatchSize && _channel.Reader.TryRead(out RaftResponderRequest item))
+            while (batch.Count < MaxBatchSize && _channel.Reader.TryRead(out QueuedMessage item))
             {
-                long itemBytes = PayloadBytes(item);
+                long itemBytes = item.PayloadBytes;
 
                 if (batch.Count > 0 && _maxBatchPayloadBytes > 0 && itemBytes > 0
                     && batchBytes + itemBytes > _maxBatchPayloadBytes)
@@ -159,6 +175,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                     break;
                 }
 
+                NoteIfOversized(item);
                 batch.Add(item);
                 batchBytes += itemBytes;
             }
@@ -167,10 +184,32 @@ internal sealed class RaftTransportDispatcher : IDisposable
         }
 
         /// <summary>
+        /// Names a message whose payload alone exceeds the frame budget. It ships by itself (see
+        /// <see cref="FillBatch"/>), so the receiver's limit is its only ceiling — and when that limit
+        /// refuses it, the receiver tears the stream down while this side sees only a completed-call
+        /// write error. Warned on the first occurrence and every thousandth after, so a workload
+        /// whose entries outgrow the budget is attributable from the sender's own log.
+        /// </summary>
+        private void NoteIfOversized(in QueuedMessage item)
+        {
+            if (_maxBatchPayloadBytes <= 0 || item.PayloadBytes <= _maxBatchPayloadBytes)
+                return;
+
+            long count = ++_oversizedMessages;
+            if (count != 1 && count % 1000 != 0)
+                return;
+
+            AppendLogsRequest? append = item.Request.AppendLogsRequest;
+            _logger.LogWarning(
+                "[RaftTransportDispatcher/{Endpoint}] A single AppendLogs message for partition {Partition} carries {PayloadBytes} payload bytes in {Entries} entries, over the {MaxBytes}-byte frame budget (MaxOutboundBatchBytes); it ships alone and the receiver's GrpcMaxMessageBytes is its only ceiling (occurrence {Count})",
+                _endpoint, append?.Partition ?? -1, item.PayloadBytes, append?.Logs?.Count ?? 0, _maxBatchPayloadBytes, count);
+        }
+
+        /// <summary>
         /// Sends one batch and releases its byte reservation, mirroring the loop's own
         /// try/catch/finally so a failed send never strands the reservation.
         /// </summary>
-        private async Task<int> SendBatchAsync(List<RaftResponderRequest> batch)
+        private async Task<int> SendBatchAsync(List<QueuedMessage> batch)
         {
             try
             {
@@ -252,20 +291,24 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 Interlocked.Add(ref _queuedPayloadBytes, payloadBytes);
             }
 
-            if (!_channel.Writer.TryWrite(request) && payloadBytes > 0)
+            if (!_channel.Writer.TryWrite(new QueuedMessage(request, payloadBytes)) && payloadBytes > 0 && _maxQueuedPayloadBytes > 0)
                 Interlocked.Add(ref _queuedPayloadBytes, -payloadBytes); // channel completed during shutdown
         }
 
         /// <summary>
         /// Releases the byte reservation of a dispatched (or drained) batch and closes the drop
         /// episode once the backlog has fallen to half the budget — hysteresis so a queue hovering
-        /// at the boundary does not emit a Warning per message.
+        /// at the boundary does not emit a Warning per message. Releases what <see cref="Enqueue"/>
+        /// reserved for each message, not a recount of its (possibly cleared) log list.
         /// </summary>
-        private void ReleaseBatchBytes(List<RaftResponderRequest> batch)
+        private void ReleaseBatchBytes(List<QueuedMessage> batch)
         {
+            if (_maxQueuedPayloadBytes <= 0)
+                return;
+
             long total = 0;
             for (int i = 0; i < batch.Count; i++)
-                total += PayloadBytes(batch[i]);
+                total += batch[i].PayloadBytes;
 
             if (total == 0)
                 return;
@@ -306,8 +349,8 @@ internal sealed class RaftTransportDispatcher : IDisposable
             ILogger<IRaft> logger,
             CancellationToken token)
         {
-            ChannelReader<RaftResponderRequest> reader = _channel.Reader;
-            List<RaftResponderRequest> batch = new(MaxBatchSize);
+            ChannelReader<QueuedMessage> reader = _channel.Reader;
+            List<QueuedMessage> batch = new(MaxBatchSize);
 
             while (true)
             {
@@ -386,17 +429,18 @@ internal sealed class RaftTransportDispatcher : IDisposable
         }
 
         /// <summary>Records the dispatcher queue wait of each stamped message about to be sent.</summary>
-        private static void RecordDispatchStage(List<RaftResponderRequest> messages)
+        private static void RecordDispatchStage(List<QueuedMessage> messages)
         {
-            foreach (RaftResponderRequest message in messages)
+            foreach (QueuedMessage queued in messages)
             {
+                RaftResponderRequest message = queued.Request;
                 long ticks = message.AppendLogsRequest?.DispatchStageTicks ?? message.CompleteAppendLogsRequest?.DispatchStageTicks ?? 0;
                 RoundStageInstrumentation.Record(RoundStage.TransportDispatch, ticks);
             }
         }
 
         private static async Task Send(
-            List<RaftResponderRequest> messages,
+            List<QueuedMessage> messages,
             RaftManager manager,
             RaftNode node,
             ICommunication communication,
@@ -406,7 +450,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 RecordDispatchStage(messages);
             if (messages.Count == 1)
             {
-                await SendSingle(messages[0], manager, node, communication).ConfigureAwait(false);
+                await SendSingle(messages[0].Request, manager, node, communication).ConfigureAwait(false);
                 return;
             }
 
@@ -421,8 +465,9 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
             try
             {
-                foreach (RaftResponderRequest msg in messages)
+                foreach (QueuedMessage queued in messages)
                 {
+                    RaftResponderRequest msg = queued.Request;
                     BatchRequestsRequestItem item = GrpcCommunicationPool.RentBatchRequestsRequestItem();
 
                     switch (msg.Type)

@@ -70,6 +70,60 @@ public sealed class TestGrpcMessageSizeLimits
     }
 
     /// <summary>
+    /// The Kahuna.Server shape (1.14.7): gRPC registered with a plain <c>AddGrpc()</c>, never with
+    /// <see cref="GrpcCommunicationExtensions.AddKommanderGrpc"/>, so the Raft service received at
+    /// the 4 MB library default while the sender framed up to 4 MiB of payload plus framing — every
+    /// full frame was refused and tore the replication stream down (CamusDB fault soak, 2026-10-30).
+    /// Mapping the routes must raise the per-service limit to the configured value, for the Raft
+    /// service only.
+    /// </summary>
+    [Fact]
+    public void EnsureRaftReceiveLimit_RaisesThePerServiceLimit_WhenTheHostRegisteredPlainAddGrpc()
+    {
+        using RaftManager manager = BuildManager(_ => { });
+
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddSingleton<IRaft>(manager);
+        services.AddGrpc();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+
+        Assert.Equal(GrpcCommunicationExtensions.GrpcLibraryDefaultMaxReceiveMessageBytes, GrpcCommunicationExtensions.ResolveRaftReceiveLimit(provider));
+
+        int inForce = GrpcCommunicationExtensions.EnsureRaftReceiveLimit(provider);
+
+        Assert.Equal(manager.Configuration.GrpcMaxMessageBytes, inForce);
+        Assert.Equal(manager.Configuration.GrpcMaxMessageBytes, GrpcCommunicationExtensions.ResolveRaftReceiveLimit(provider));
+        Assert.Equal(
+            manager.Configuration.GrpcMaxMessageBytes,
+            provider.GetRequiredService<IOptions<GrpcServiceOptions<RaftService>>>().Value.MaxReceiveMessageSize);
+
+        // The host's other services keep the limit the host chose (the library default here).
+        Assert.Equal(
+            GrpcCommunicationExtensions.GrpcLibraryDefaultMaxReceiveMessageBytes,
+            provider.GetRequiredService<IOptions<GrpcServiceOptions>>().Value.MaxReceiveMessageSize);
+    }
+
+    /// <summary>A host that registered with <c>AddKommanderGrpc</c> already has the limit: nothing to raise.</summary>
+    [Fact]
+    public void EnsureRaftReceiveLimit_WithAddKommanderGrpc_LeavesTheLimitAlone()
+    {
+        const int limit = 24 * 1024 * 1024;
+        using RaftManager manager = BuildManager(c => c.GrpcMaxMessageBytes = limit);
+
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddSingleton<IRaft>(manager);
+        services.AddKommanderGrpc();
+
+        using ServiceProvider provider = services.BuildServiceProvider();
+
+        Assert.Equal(limit, GrpcCommunicationExtensions.EnsureRaftReceiveLimit(provider));
+        Assert.Equal(limit, GrpcCommunicationExtensions.ResolveRaftReceiveLimit(provider));
+    }
+
+    /// <summary>
     /// A host with no <see cref="IRaft"/> keeps the library default — which is the 4 MB that
     /// equalled one default backfill batch. Pinned so a change to the default is a deliberate one.
     /// </summary>
