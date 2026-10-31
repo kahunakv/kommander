@@ -827,18 +827,29 @@ public sealed class RaftPartitionStateMachine
                 {
                     // Drain settled proposals on the heartbeat cadence. Under load ReplicateLogs already
                     // sweeps; this covers the idle tail — a leader that stopped proposing would otherwise
-                    // retain its last batch's log payloads and, because a non-empty map blocks the quiesce
-                    // gate below, never quiesce. Once drained, proposals.ActiveCount reaches 0 and the
-                    // quiesce check can fire in this same tick.
+                    // retain its last batch's log payloads until the next leadership change. Memory only:
+                    // the quiesce gate below does not wait for this drain.
                     if (proposals.ActiveCount > 0)
                         proposals.PruneSettled(nowTicks);
 
                     // When quiescence is on and the partition has been idle longer than QuiesceAfter,
                     // send a quiesce marker to followers and stop heartbeating.  Followers switch to
                     // SWIM-based election gating once they receive the marker.
+                    //
+                    // The proposal condition is "nothing short of quorum", NOT "the registry is empty".
+                    // A settled proposal stays registered for ProposalRegistry.SettledRetention (30 s)
+                    // so its caller can still look it up by ticket, and PruneSettled above only drops
+                    // it after that window. Gating on the registry count therefore kept every range
+                    // that had taken a single write non-quiesced for 30 s after it, whatever
+                    // QuiesceAfter said (1.5 s by default) — leader and followers alike, since the
+                    // followers only quiesce on this leader's marker — while a never-written sibling
+                    // range quiesced on schedule. Only an unresolved proposal needs this leader awake:
+                    // SendHeartbeat hosts its retry (RetryUnresolved), and a quiesced leader sends none.
+                    // Whether the followers have LEARNED a settled commit is HasLaggingPeer's question
+                    // (their reported frontier against LocalCommittedIndex), not this one.
                     if (host.Configuration.EnableQuiescence
                         && !coreState.Quiesced
-                        && proposals.ActiveCount == 0
+                        && !proposals.HasUnresolvedProposal()
                         && coreState.LastProposalAtTicks != 0
                         && !heartbeats.HasLaggingPeer()
                         && (MonotonicElapsed(coreState.LastProposalAtTicks, nowTicks) >= host.Configuration.QuiesceAfter))

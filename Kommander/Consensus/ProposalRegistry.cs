@@ -210,7 +210,11 @@ internal sealed class ProposalRegistry
 
     /// <summary>
     /// Whether any proposal is still short of quorum. Gates the checkpoint path, which must not
-    /// interleave with an unresolved proposal.
+    /// interleave with an unresolved proposal, and the leader's quiesce decision: an unresolved
+    /// proposal is retried from the heartbeat, which a quiesced leader no longer sends. This is
+    /// deliberately not <see cref="ActiveCount"/>: a settled proposal stays registered for
+    /// <see cref="SettledRetention"/> so its ticket remains answerable, and a gate on the count
+    /// kept every written range non-quiesced for that whole window.
     /// </summary>
     public bool HasUnresolvedProposal()
     {

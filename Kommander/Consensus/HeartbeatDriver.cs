@@ -139,8 +139,8 @@ internal sealed class HeartbeatDriver
 
         // Raft leaders retry replication until it succeeds; the live-propose broadcast alone is
         // one-shot. Riding the heartbeat keeps the retry paced, and a partition with unresolved
-        // proposals can never quiesce (the quiesce gate requires activeProposals empty), so this
-        // site is always reached while anything needs retrying.
+        // proposals can never quiesce (the quiesce gate requires ProposalRegistry.HasUnresolvedProposal
+        // to be false), so this site is always reached while anything needs retrying.
         if (coreState.NodeState == RaftNodeState.Leader)
         {
             proposals.RetryUnresolved(nowTicks);

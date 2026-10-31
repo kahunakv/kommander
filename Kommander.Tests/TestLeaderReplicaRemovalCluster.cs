@@ -25,9 +25,11 @@ namespace Kommander.Tests;
 /// leader is made to differ from the range leader. The second disables the hand-off (the pre-fix
 /// behaviour) and asserts the quiesced survivors still elect a new leader promptly, because a
 /// leader that left the replica set is vacated regardless of SWIM.</para>
-/// <para>No write lands on the range before the removal: with this configuration a range that
-/// took a write did not quiesce again within the test's patience, and the quiesced state is the
-/// incident's precondition. Writes are issued after the removal only, to prove the range serves.</para>
+/// <para>A write lands on the range before the removal, as on any range in use, and the quiesced
+/// state — the incident's precondition — must re-engage after it. (The quiesce gate once held a
+/// written range awake for 30 s, the settled-proposal retention, so these tests had to skip the
+/// seed write; see TestQuiescenceAfterWriteCluster.) Writes after the removal prove the range
+/// serves.</para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestLeaderReplicaRemovalCluster
@@ -262,7 +264,12 @@ public sealed class TestLeaderReplicaRemovalCluster
                 };
             }
 
-            // The incident's precondition: the range is idle and its followers are quiesced.
+            // The range has taken a write, as a range in use has.
+            RaftReplicationResult seed = await rangeLeader.ReplicateLogs(
+                partitionId, "leader-removal", Encoding.UTF8.GetBytes("before-removal"), cancellationToken: ct);
+            Assert.True(seed.Success, $"Seed write before the removal failed: {seed.Status}");
+
+            // The incident's precondition: the range is idle again and its followers are quiesced.
             RaftManager[] followers = FollowersOf(nodes, partitionId, rangeLeader);
             Assert.Equal(2, followers.Length);
             await WaitForCondition(() => followers.All(n => n.IsPartitionQuiesced(partitionId)), ct, timeoutMs: 10_000);
@@ -327,6 +334,11 @@ public sealed class TestLeaderReplicaRemovalCluster
 
             foreach (RaftManager n in nodes)
                 n.SystemCoordinator.HandOffPartitionLeadershipOverride = (_, _, _, _) => Task.FromResult(RaftOperationStatus.Success);
+
+            // The range has taken a write, as a range in use has; it must still quiesce after it.
+            RaftReplicationResult seed = await rangeLeader.ReplicateLogs(
+                partitionId, "leader-removal", Encoding.UTF8.GetBytes("before-removal"), cancellationToken: ct);
+            Assert.True(seed.Success, $"Seed write before the removal failed: {seed.Status}");
 
             await WaitForCondition(() => survivors.All(n => n.IsPartitionQuiesced(partitionId)), ct, timeoutMs: 10_000);
 

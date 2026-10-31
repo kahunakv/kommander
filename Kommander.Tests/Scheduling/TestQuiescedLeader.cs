@@ -234,6 +234,89 @@ public class TestQuiescedLeader
         Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce); // still probing the silent peer
     }
 
+    // ── A settled proposal inside its retention window does not block quiescence ──
+
+    /// <summary>
+    /// The 2026-10-18 in-process diagnostic: a range that took ONE write never quiesced again
+    /// within the observer's patience — leader and followers alike, since the followers only
+    /// quiesce on the leader's marker — while its never-written sibling range kept quiescing. The
+    /// quiesce gate required the proposal registry to be EMPTY, but a settled proposal stays
+    /// registered for <c>ProposalRegistry.SettledRetention</c> (30 s) so its ticket remains
+    /// answerable, so every written range stayed awake for 30 s after each write whatever
+    /// <c>QuiesceAfter</c> said. Here the proposal is committed, the peer has reported the
+    /// committed frontier, and the monotonic clock is pinned so the settled proposal is still
+    /// at the very start of its retention window: the leader must quiesce anyway.
+    /// </summary>
+    [Fact]
+    public async Task Leader_SettledProposalInsideRetention_StillQuiesces()
+    {
+        CapturingTestHost host = MakeHost();
+        using MinimalWalFacadeL wal = new();
+        MinimalReplySinkL sink = new();
+        RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
+        sm.SetPostToExecutor(_ => { });
+
+        (RaftOperationStatus status, HLCTimestamp ticket) =
+            sm.ReplicateLogs([new RaftLog { LogType = "write", LogData = [1] }], autoCommit: true);
+        Assert.Equal(RaftOperationStatus.Pending, status); // accepted; the local write is queued
+
+        // The leader's own Proposed write lands, the peer acks the batch (quorum: the auto-commit
+        // advances the committed frontier to 1 and enqueues the commit marker), the marker lands.
+        await sm.CompleteWalOperationAsync(new(host.PartitionId, OperationId: 1L, Term: -1L,
+            MinLogIndex: -1L, MaxLogIndex: 1L, WALWriteOperationType.LeaderPropose, RaftOperationStatus.Success));
+        await sm.CompleteAppendLogsAsync(host.Peer, ticket, RaftOperationStatus.Success, committedIndex: 0, responseTerm: 1);
+        await sm.CompleteWalOperationAsync(new(host.PartitionId, OperationId: 1L, Term: -1L,
+            MinLogIndex: 1L, MaxLogIndex: 1L, WALWriteOperationType.LeaderCommit, RaftOperationStatus.Success));
+
+        // The peer has learned the commit: its heartbeat ack reports the committed frontier.
+        await AckHeartbeatAsync(sm, host, host.Peer, committedIndex: 1);
+        host.ClearObservations();
+
+        // The precondition that made the old gate fail: the settled proposal is still registered.
+        Assert.Equal(RaftProposalTicketState.Committed, sm.CheckTicketCompletion(ticket).state);
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Contains(host.CapturedAppendLogs, r => r.Quiesce);
+        Assert.True(sm.Quiesced);
+    }
+
+    // ── A proposal still short of quorum keeps the leader awake ───────────────
+
+    /// <summary>
+    /// The guard the fix above must keep. An unresolved proposal is retried from the heartbeat
+    /// (<c>ProposalRegistry.RetryUnresolved</c>), and a quiesced leader sends no heartbeat, so a
+    /// leader with a proposal short of quorum must not quiesce however idle it looks. The peer
+    /// has made first contact (so the lag gate is not what holds the leader) but never acks the
+    /// batch.
+    /// </summary>
+    [Fact]
+    public async Task Leader_UnresolvedProposal_DoesNotQuiesce()
+    {
+        CapturingTestHost host = MakeHost();
+        using MinimalWalFacadeL wal = new();
+        MinimalReplySinkL sink = new();
+        RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
+        sm.SetPostToExecutor(_ => { });
+
+        (RaftOperationStatus status, _) =
+            sm.ReplicateLogs([new RaftLog { LogType = "write", LogData = [1] }], autoCommit: true);
+        Assert.Equal(RaftOperationStatus.Pending, status); // accepted; the local write is queued
+        await sm.CompleteWalOperationAsync(new(host.PartitionId, OperationId: 1L, Term: -1L,
+            MinLogIndex: -1L, MaxLogIndex: 1L, WALWriteOperationType.LeaderPropose, RaftOperationStatus.Success));
+
+        await AckHeartbeatAsync(sm, host, host.Peer, committedIndex: 0);
+        host.ClearObservations();
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.DoesNotContain(host.CapturedAppendLogs, r => r.Quiesce);
+        Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce); // still heartbeating, so still retrying
+        Assert.False(sm.Quiesced);
+    }
+
     // ── Follower receiving quiesce-flagged AppendLogs becomes quiesced ────────
 
     [Fact]

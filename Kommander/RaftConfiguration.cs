@@ -870,8 +870,11 @@ public class RaftConfiguration
     public bool EnableQuiescence { get; set; } = true;
 
     /// <summary>
-    /// How long a partition must remain idle (no proposals, no in-flight replication)
-    /// before the leader quiesces it and suppresses further per-partition heartbeats.
+    /// How long a partition must remain idle (no new proposals, none still short of quorum,
+    /// every peer at the leader's committed frontier) before the leader quiesces it and
+    /// suppresses further per-partition heartbeats. Measured from the last proposal, so a
+    /// written range quiesces this long after its last write; settled proposals kept for
+    /// ticket lookup do not extend the wait.
     /// Approximately 3× <see cref="HeartbeatInterval"/> is a safe default (1500 ms).
     /// While quiesced, followers gate elections on SWIM node state rather than the
     /// per-partition heartbeat timer — see <see cref="EnableQuiescence"/>.

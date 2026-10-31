@@ -253,8 +253,9 @@ internal sealed class RaftPartitionCoreState
     /// HLC timestamp of the last real proposal enqueued on this leader.
     /// Zero until the first proposal arrives after winning election.
     /// Used to determine when the partition has been idle long enough to quiesce:
-    /// once <c>now - LastProposalAt &gt; QuiesceAfter</c> and no proposals are in flight,
-    /// the leader sends a quiesce marker and stops heartbeating.
+    /// once <c>now - LastProposalAt &gt; QuiesceAfter</c> and no proposal is short of quorum
+    /// (settled proposals retained for ticket lookup do not count), the leader sends a quiesce
+    /// marker and stops heartbeating.
     /// </summary>
     public HLCTimestamp LastProposalAt;
 
