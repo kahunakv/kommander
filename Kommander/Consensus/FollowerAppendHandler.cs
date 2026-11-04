@@ -281,6 +281,22 @@ internal sealed class FollowerAppendHandler
             return;
         }
 
+        // ── Lost-synced-writes quarantine: the leader's frontier as evidence ──────────────
+        // An empty heartbeat carries the leader's own contiguous frontier in the Log Matching pair
+        // (HeartbeatDriver). While this partition is quarantined by its storage's lost-synced-writes
+        // verdict, a frontier equal to ours proves — by the Log Matching Property — that our log is
+        // the leader's whole log, stale prefix or not, so the quarantine may lift without waiting
+        // for a write to pass the stale frontier. A leader that predates the field sends 0 and
+        // proves nothing; the frontier and term conditions still lift the quarantine then.
+        if (coreState.LostSyncedWritesTermBar >= 0
+            && logs is not { Count: > 0 }
+            && prevLogIndex > 0
+            && prevLogIndex == wal.GetPresentIndex()
+            && prevLogTerm == wal.GetPresentTerm())
+        {
+            coreState.LostSyncedWritesLeaderConfirmed = true;
+        }
+
         // Log Matching Property check: the follower must hold an entry at prevLogIndex whose
         // term equals prevLogTerm before it can safely append the incoming batch.
         //

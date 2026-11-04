@@ -261,6 +261,58 @@ internal sealed class RaftPartitionCoreState
     }
 
     /// <summary>
+    /// For a <see cref="RaftPartitionStorageState.LostAcknowledgedEntries"/> that came from the backend's
+    /// lost-synced-writes verdict (<see cref="RaftRestoreStorageVerdict.LogTermBar"/>): the term of the
+    /// surviving frontier at restore. The quarantine lifts when the presence frontier passes
+    /// <see cref="LostAcknowledgedThrough"/> (set to one above the surviving frontier) <em>or</em> when the
+    /// frontier's term rises above this bar — a leader's own entry at a newer term proves the log is
+    /// that leader's prefix even when its log is shorter than the stale one. -1 for the watermark verdict.
+    /// </summary>
+    public long LostSyncedWritesTermBar
+    {
+        get => Volatile.Read(ref lostSyncedWritesTermBar);
+        set => Volatile.Write(ref lostSyncedWritesTermBar, value);
+    }
+
+    private long lostSyncedWritesTermBar = -1;
+
+    /// <summary>The backend's reason for the lost-synced-writes verdict, for the health probe and the log lines; null for the watermark verdict.</summary>
+    public string? LostSyncedWritesReason
+    {
+        get => Volatile.Read(ref lostSyncedWritesReason);
+        set => Volatile.Write(ref lostSyncedWritesReason, value);
+    }
+
+    private string? lostSyncedWritesReason;
+
+    /// <summary>
+    /// Set by the follower append path while the lost-synced-writes quarantine holds: the leader's
+    /// empty heartbeat carried a frontier equal to this partition's, which proves the log is the
+    /// leader's whole log (Log Matching Property). The third way the quarantine lifts, and the one a
+    /// quiet partition needs.
+    /// </summary>
+    public volatile bool LostSyncedWritesLeaderConfirmed;
+
+    /// <summary>
+    /// True once the lost-entries quarantine's repair condition holds: the live frontier is past the
+    /// watermark (or past the surviving frontier, for the lost-synced-writes verdict), or its term
+    /// is above the verdict's bar, or the leader's heartbeat confirmed the frontier as its own
+    /// (<see cref="LostSyncedWritesLeaderConfirmed"/>). The gates read it so they open on the very
+    /// tick the repair lands.
+    /// </summary>
+    public bool LostAcknowledgedEntriesRepaired(IRaftWalFacade wal)
+    {
+        if (wal.GetPresentIndex() >= LostAcknowledgedThrough)
+            return true;
+
+        long bar = LostSyncedWritesTermBar;
+        if (bar < 0)
+            return false;
+
+        return LostSyncedWritesLeaderConfirmed || wal.GetPresentTerm() > bar;
+    }
+
+    /// <summary>
     /// Set while the application-floor repair is outstanding: the restore refused consumer replay
     /// because the application's durable floor sat below the compaction floor, so committed applies are
     /// held and the tick asks the leader for a whole-partition snapshot until one installs. Kept apart
@@ -281,12 +333,14 @@ internal sealed class RaftPartitionCoreState
         {
             case RaftPartitionStorageState.LostAcknowledgedEntries:
             {
-                long present = wal.GetPresentIndex();
-                long acknowledged = LostAcknowledgedThrough;
-                if (present >= acknowledged)
+                if (LostAcknowledgedEntriesRepaired(wal))
                     break;
 
-                reason = $"the log is contiguous through {present} but this node had acknowledged ids through {acknowledged} as durably held; it must not lead or vote until the leader has replicated past that watermark";
+                long present = wal.GetPresentIndex();
+                long bar = LostSyncedWritesTermBar;
+                reason = bar >= 0
+                    ? $"the storage engine lost synced writes and the surviving log (contiguous through {present}, term {wal.GetPresentTerm()}) may be a stale prefix; it must not lead or vote until a leader has replicated past {present}, appended an entry from a term above {bar}, or confirmed this frontier as its own"
+                    : $"the log is contiguous through {present} but this node had acknowledged ids through {LostAcknowledgedThrough} as durably held; it must not lead or vote until the leader has replicated past that watermark";
                 return true;
             }
 

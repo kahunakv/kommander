@@ -117,6 +117,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public string? GetStorageFailStopReason() => wal.GetStorageFailStopReason();
 
+    public ValueTask<bool> MarkLostSyncedWritesReconciledAsync() => ValueTask.FromResult(wal.MarkLostSyncedWritesReconciled());
+
     public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
         ValueTask.FromResult(wal.LoadHardState());
 }

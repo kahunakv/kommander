@@ -489,8 +489,29 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' fail-stopped on a storage corruption: every write is refused and the engine is not reopened; the partitions on it step down and stop voting and acknowledging. Repair is operational — move the damaged directory aside and let the node rebuild from its peers: {Message}")]
     public static partial void LogCritRocksDbWalCorruptionFailStop(this ILogger<IRaft> logger, string path, string message);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "RocksDB WAL at '{Path}': the sync ledger '{Ledger}' belongs to another engine (ledger identity {LedgerIdentity}, engine identity {EngineIdentity}); it was reset to the replayed sequence and the lost-synced-writes check starts over from this open")]
+    public static partial void LogWarnRocksDbWalSyncLedgerForeign(this ILogger<IRaft> logger, string path, string ledger, Guid ledgerIdentity, Guid engineIdentity);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "RocksDB WAL at '{Path}': the sync ledger '{Ledger}' holds no readable record (every written slot fails its checksum, which no crash produces); it was reset to the replayed sequence, so a tail lost before this open cannot be detected")]
+    public static partial void LogWarnRocksDbWalSyncLedgerUnreadable(this ILogger<IRaft> logger, string path, string ledger);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "RocksDB WAL at '{Path}': created the sync ledger '{Ledger}' attesting sequence {Sequence}; from now on a log file truncated after its fsync is detected at the next open")]
+    public static partial void LogInfoRocksDbWalSyncLedgerCreated(this ILogger<IRaft> logger, string path, string ledger, long sequence);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' lost synced writes: the sync ledger '{Ledger}' attests sequence {Attested} as durable, but the engine replayed only through sequence {Replayed} ({Missing} synced operations are missing{Detail}). A log file was truncated or lost after its fsync, and the rows, watermarks, terms and votes it carried are gone with it. Every partition on this engine is quarantined (verdict {Verdict}) until a leader reconciles its log; the hard state is restored from the hard-state ledger where it is ahead")]
+    public static partial void LogCritRocksDbWalLostSyncedWrites(this ILogger<IRaft> logger, string path, string ledger, long attested, long replayed, long missing, string detail, long verdict);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "RocksDB WAL at '{Path}': restored the hard state of partition {Partition} from the hard-state ledger (term {Term}, vote {VotedFor}); the engine held term {EngineTerm}, vote {EngineVotedFor}: the engine's log lost the synced hard-state write")]
+    public static partial void LogWarnRocksDbWalHardStateRestored(this ILogger<IRaft> logger, string path, int partition, long term, string? votedFor, long engineTerm, string? engineVotedFor);
+
     [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}] Restore found acknowledged entries missing: this node had acknowledged ids through {AcknowledgedThrough} as durably held, but the log on disk is contiguous only through {PresentThrough} (a synced tail truncated or lost after its fsync; RocksDB opens such a file short). {Consequence}")]
     public static partial void LogCritLostAcknowledgedEntries(this ILogger<IRaft> logger, string endpoint, int partition, long acknowledgedThrough, long presentThrough, string consequence);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}] Restore found the storage engine lost synced writes: the surviving log is contiguous through {PresentThrough} at term {PresentTerm} and may be a stale prefix whose acknowledged tail, commit markers and vote are gone ({Reason}). {Consequence}")]
+    public static partial void LogCritLostSyncedWrites(this ILogger<IRaft> logger, string endpoint, int partition, long presentThrough, long presentTerm, string reason, string consequence);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Lost synced writes repaired: a leader reconciled the log (contiguous through {PresentThrough} at term {PresentTerm}, verdict bar term {TermBar}); the reconciliation is recorded and this partition votes and campaigns again")]
+    public static partial void LogInfoLostSyncedWritesRepaired(this ILogger<IRaft> logger, string endpoint, int partition, long presentThrough, long presentTerm, long termBar);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Lost acknowledged entries repaired: the log is contiguous through {PresentThrough}, past the acknowledged watermark {AcknowledgedThrough}; this partition votes and campaigns again")]
     public static partial void LogInfoLostAcknowledgedEntriesRepaired(this ILogger<IRaft> logger, string endpoint, int partition, long acknowledgedThrough, long presentThrough);

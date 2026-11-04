@@ -357,6 +357,14 @@ public interface IRaftWalFacade
     string? GetStorageFailStopReason() => null;
 
     /// <summary>
+    /// Records that this partition reconciled the backend's lost-synced-writes verdict (the one its
+    /// restore turned into a <see cref="RaftRestoreStorageVerdict"/> with a <c>LogTermBar</c>), so the
+    /// next restart does not quarantine it for the same event. Called when the quarantine lifts.
+    /// False means the record did not land and the state machine keeps the quarantine. Default true.
+    /// </summary>
+    ValueTask<bool> MarkLostSyncedWritesReconciledAsync() => ValueTask.FromResult(true);
+
+    /// <summary>
     /// Loads the persisted hard state, or <see langword="null"/> when none exists yet (fresh node or a
     /// legacy WAL predating hard state), in which case the caller infers the term from the log tail. The
     /// default returns <see langword="null"/> so fakes preserve their prior behaviour.

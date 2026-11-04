@@ -65,10 +65,13 @@ internal sealed class BackfillSender
     /// Appends logs to a specific node in the cluster.
     /// <paramref name="prevLogIndex"/> and <paramref name="prevLogTerm"/> are the Log Matching
     /// anchors: the id and term of the entry immediately preceding the first entry in
-    /// <paramref name="logs"/>.  Both default to 0 (no anchor check) for heartbeats and live
-    /// proposals where the leader knows the follower is in sync; they are set for backfill batches
-    /// so a divergent follower can reject with <see cref="RaftOperationStatus.LogMismatch"/> and
-    /// enable leader-side backtracking via <c>nextIndex</c>.
+    /// <paramref name="logs"/>.  Both default to 0 (no anchor check) for live proposals where the
+    /// leader knows the follower is in sync; they are set for backfill batches so a divergent
+    /// follower can reject with <see cref="RaftOperationStatus.LogMismatch"/> and enable leader-side
+    /// backtracking via <c>nextIndex</c>. An EMPTY heartbeat carries them too — the leader's own log
+    /// tail (<c>HeartbeatDriver</c>): the follower's Log Matching check skips entry-less appends, and
+    /// a follower quarantined by a lost-synced-writes verdict reads the pair as evidence that its
+    /// frontier is the leader's whole log.
     /// </summary>
     /// <param name="node"></param>
     /// <param name="timestamp"></param>
@@ -88,7 +91,12 @@ internal sealed class BackfillSender
         AppendLogsRequest request;
 
         if (logs is null || logs.Count == 0)
-            request = new(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint) { Quiesce = quiesce };
+            request = new(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint)
+            {
+                Quiesce = quiesce,
+                PrevLogIndex = prevLogIndex,
+                PrevLogTerm = prevLogTerm,
+            };
         else if (tracker.IsBackfillPaused(node.Endpoint))
         {
             // The peer reported a saturated WAL queue within the backoff window. A live entry sent now is

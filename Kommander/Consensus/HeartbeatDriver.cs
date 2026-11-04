@@ -159,6 +159,19 @@ internal sealed class HeartbeatDriver
         // Allocated lazily — a healthy round backfills nobody.
         BackfillRoundBatches? backfillRound = null;
 
+        // This leader's contiguous frontier (the §5.4.1 pair, tracked on the propose path and the
+        // append path alike), carried by every EMPTY heartbeat in the Log Matching fields. An
+        // entry-less heartbeat skips the follower's Log Matching check, so the pair costs nothing
+        // there — two in-memory reads, no WAL access; what it buys is evidence for a follower
+        // quarantined by its storage's lost-synced-writes verdict: a frontier equal to this one is,
+        // by the Log Matching Property, this leader's whole log, and the follower may vote and lead
+        // again without waiting for a write to pass its stale frontier — a quiet partition (the
+        // system partition, most of the time) would otherwise stay quarantined until its next entry.
+        long frontierIndex = wal.GetPresentIndex();
+        long frontierTerm = frontierIndex > 0 ? wal.GetPresentTerm() : 0;
+        if (frontierTerm <= 0)
+            frontierIndex = 0;
+
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
@@ -333,7 +346,7 @@ internal sealed class HeartbeatDriver
                 // Caraxes soak wedged a 3-voter cluster permanently that way.
             }
 
-            sender.AppendLogToNode(node, coreState.LastHeartbeat, null);
+            sender.AppendLogToNode(node, coreState.LastHeartbeat, null, prevLogIndex: Math.Max(frontierIndex, 0), prevLogTerm: Math.Max(frontierTerm, 0));
         }
     }
 

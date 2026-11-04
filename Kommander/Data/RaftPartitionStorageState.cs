@@ -17,14 +17,19 @@ public enum RaftPartitionStorageState
     Restoring,
 
     /// <summary>
-    /// The restore found the log shorter than what this node had acknowledged as durably held
-    /// (the persisted acknowledged-presence watermark sits above the contiguous log on disk): a
-    /// synced tail was truncated or lost after the leader may have counted it toward a commit. The
-    /// partition neither votes nor campaigns until the leader has replicated past the watermark
-    /// again (or a snapshot install covers it); it keeps acknowledging the entries it really holds,
-    /// which is truthful and safe. Self-healing with a replication factor above one; a single-voter
-    /// partition stays leaderless until the operator acts (see
-    /// <see cref="RaftConfiguration.LostAcknowledgedEntriesPolicy"/>).
+    /// The restore found that this node may have lost entries it acknowledged as durably held, in one
+    /// of two ways: the persisted acknowledged-presence watermark sits above the contiguous log on
+    /// disk (rows removed under a surviving watermark), or the storage engine's sync ledger attested
+    /// writes its log no longer holds (<see cref="WAL.IWAL.GetLostSyncedWritesReason"/>: a log file
+    /// truncated or lost after its fsync, which cuts the watermark together with the rows, so every
+    /// partition on that engine is suspect and its surviving log may be a stale prefix). The
+    /// partition neither votes nor campaigns until a leader has repaired it — replicated past the
+    /// watermark or the surviving frontier, appended an entry from a newer term, or confirmed the
+    /// frontier as its own; it keeps acknowledging the entries it really holds, which is truthful and
+    /// safe. Self-healing with a replication factor above one; a single-voter partition stays
+    /// leaderless until the operator acts (see
+    /// <see cref="RaftConfiguration.LostAcknowledgedEntriesPolicy"/>). The health reason names which
+    /// of the two verdicts it is.
     /// </summary>
     LostAcknowledgedEntries,
 

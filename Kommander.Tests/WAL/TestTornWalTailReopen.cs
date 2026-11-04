@@ -15,9 +15,11 @@ namespace Kommander.Tests.WAL;
 /// that never returns, and the next fault takes the cluster below quorum.</para>
 ///
 /// <para>The kill is staged on disk rather than by killing a process: the test snapshots the live data
-/// directory while the WAL is still open (so the log file still holds the records — a clean dispose
-/// would flush them to SST files and retire the log), then cuts bytes off the tail of that snapshot's
-/// log file. That is byte-for-byte the shape a SIGKILL leaves.</para>
+/// directory while the WAL is still open, then cuts bytes off the tail of that snapshot's log file.
+/// The record it cuts was written <b>without</b> a sync, so it is byte-for-byte what a SIGKILL leaves:
+/// a record the engine appended but never fsynced, and that the sync ledger therefore never attested.
+/// Cutting a record that <em>was</em> synced is a different event — a file truncated after its fsync —
+/// which the ledger reports as lost synced writes; <see cref="TestRocksDbSyncLedger"/> covers it.</para>
 ///
 /// <para>The second test is the counterweight: damage in the middle of the log must still be refused.
 /// Tolerating a torn tail must not become tolerating bit-rot.</para>
@@ -43,14 +45,15 @@ public sealed class TestTornWalTailReopen
             try
             {
                 // Two separate writes, so the log file holds two separate records. Cutting the tail
-                // must cost the second write only.
+                // must cost the second write only. The second is unsynced: it is the record a kill
+                // interrupts, appended to the file but never fsynced and never acknowledged.
                 Assert.Equal(
                     RaftOperationStatus.Success,
                     wal.Write([(Partition, [Log(1), Log(2), Log(3), Log(4)])]));
 
                 Assert.Equal(
                     RaftOperationStatus.Success,
-                    wal.Write([(Partition, [Log(5)])]));
+                    wal.Write([(Partition, [Log(5)])], sync: false));
 
                 // Snapshot while open: this is the on-disk state a kill leaves behind.
                 CopyDirectory(Path.Combine(live, "wal"), Path.Combine(crashed, "wal"));
@@ -67,10 +70,13 @@ public sealed class TestTornWalTailReopen
 
             List<long> ids = reopened.ReadLogs(Partition).Select(l => l.Id).ToList();
 
-            // The prefix that was fsynced before the kill survives whole.
+            // The prefix that was fsynced before the kill survives whole, and the torn unsynced
+            // record is not damage: the engine is healthy and accepts writes.
             Assert.Equal([1L, 2L, 3L, 4L], ids);
             Assert.Equal(4, reopened.GetMaxLog(Partition));
             Assert.Equal(4, reopened.GetCurrentTerm(Partition));
+            Assert.Null(reopened.FailStopReason);
+            Assert.Equal(RaftOperationStatus.Success, reopened.Write([(Partition, [Log(5)])]));
         }
         finally
         {

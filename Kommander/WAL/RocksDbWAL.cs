@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Diagnostics;
 using Kommander.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
@@ -104,6 +105,49 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>The on-disk directory of this engine: <c>{path}/{revision}</c>.</summary>
     private readonly string enginePath;
+
+    /// <summary>
+    /// The sync ledger beside the engine (<see cref="RocksDbSyncLedger"/>): attests, outside the
+    /// engine's own log, the highest sequence a synchronous write of this process completed. Opened
+    /// with the engine, verified against it at every open and reopen, and written after every
+    /// synchronous write once <see cref="syncLedgerReady"/> is set.
+    /// </summary>
+    private readonly RocksDbSyncLedger syncLedger;
+
+    /// <summary>
+    /// False until the constructor has bound the ledger to the engine (adopted or initialised it).
+    /// The synchronous writes the constructor itself issues (format version, identity) are covered
+    /// by the binding, which attests the whole replayed sequence.
+    /// </summary>
+    private volatile bool syncLedgerReady;
+
+    /// <summary>
+    /// Metadata key holding this engine directory's identity: a GUID written once, at the first open
+    /// that found none. The sync ledger records it, so a ledger copied from another directory is
+    /// recognised and reset instead of believed.
+    /// </summary>
+    private const string EngineIdentityKey = "raft_engine_identity";
+
+    /// <summary>
+    /// The hard-state ledger beside the engine (<see cref="RocksDbHardStateLedger"/>): the last term
+    /// and vote per partition, appended after every <see cref="PersistHardState"/> and merged back
+    /// into the engine at open where it is ahead — the vote a truncated log forgot.
+    /// </summary>
+    private readonly RocksDbHardStateLedger hardStateLedger;
+
+    /// <summary>
+    /// Metadata key of the persisted lost-synced-writes verdict: "<c>id\nreason</c>". Written when the
+    /// sync ledger is found ahead of the engine at open, and never removed: each partition records the
+    /// id it reconciled under <see cref="ReconciledKey"/>, so a restart before the reconciliation
+    /// re-quarantines and a later event (a higher id) quarantines again.
+    /// </summary>
+    private const string LostSyncedWritesKey = "raft_lost_synced_writes";
+
+    /// <summary>The id of the current lost-synced-writes verdict, or -1 when the engine never reached one. Cached from <see cref="LostSyncedWritesKey"/>.</summary>
+    private long lostSyncedWritesVerdict = -1;
+
+    /// <summary>The reason text of the current verdict; see <see cref="lostSyncedWritesVerdict"/>.</summary>
+    private string? lostSyncedWritesReason;
     
     private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
 
@@ -347,17 +391,18 @@ public class RocksDbWAL : IWAL, IDisposable
             // unconditionally for non-recycled logs; Recovery.SkipAnyCorruptedRecords is the mode that
             // would swallow it, and it is not used here). The one case the mode cannot tell from a torn
             // write is a file truncated AFTER its fsync: the engine opens short and the node would
-            // believe its shorter log. That is what the acknowledged-presence watermark is for (see
-            // IWAL.Write's three-argument overload): a restore whose contiguous frontier falls below
-            // what this node acknowledged quarantines the partition instead of voting from it.
+            // believe its shorter log. Nothing inside that log can expose it — the acknowledged-presence
+            // watermark and the hard state share the log with the rows and are cut with them — so the
+            // sync ledger beside the engine (RocksDbSyncLedger) attests the last synced sequence from
+            // outside the log, and an open whose replay stops below it fail-stops the engine.
             .SetWalRecoveryMode(Recovery.TolerateCorruptedTailRecords);
 
         // Record the number and synced size of every closed write-ahead log in the MANIFEST and verify
         // them at open: a log file that is missing, or shorter than the size it was synced at, fails the
         // open with a Corruption status instead of replaying short and silently losing the rows it held.
         // Only CLOSED logs are tracked (RocksDB does not record the live log's synced size, for
-        // performance), so the active log's tail is covered by the acknowledged-presence watermark
-        // above, not by this. Enabling it on an existing directory is safe: tracking starts with the
+        // performance), so the active log's tail is covered by the sync ledger (RocksDbSyncLedger),
+        // not by this. Enabling it on an existing directory is safe: tracking starts with the
         // next log the engine closes, and untracked logs are simply not verified.
         Native.Instance.rocksdb_options_set_track_and_verify_wals_in_manifest(dbOptions.Handle, 1);
 
@@ -470,20 +515,67 @@ public class RocksDbWAL : IWAL, IDisposable
 
         WarnIfSharedBudgetStarvesFlushUnit(sharedResources, tuning);
 
-        if (firstTime)
-            SetMetaData("version", FormatVersion);
-        else
+        RocksDbSyncLedger.ReadStatus ledgerStatus;
+        RocksDbSyncLedger.Record ledgerRecord;
+        RocksDbSyncLedger openedSyncLedger;
+        RocksDbHardStateLedger openedHardStateLedger;
+        try
         {
-            string? currentVersion = GetMetaData("version");
+            openedSyncLedger = RocksDbSyncLedger.Open(completePath, out ledgerStatus, out ledgerRecord);
+        }
+        catch
+        {
+            db.Dispose();
+            throw;
+        }
 
-            if (!string.Equals(currentVersion, FormatVersion, StringComparison.Ordinal))
+        try
+        {
+            openedHardStateLedger = RocksDbHardStateLedger.Open(completePath);
+        }
+        catch
+        {
+            openedSyncLedger.Dispose();
+            db.Dispose();
+            throw;
+        }
+
+        syncLedger = openedSyncLedger;
+        hardStateLedger = openedHardStateLedger;
+
+        try
+        {
+            // What the engine replayed from its files, read before any write of this open: the sync
+            // ledger is compared with exactly this.
+            long replayed = (long)db.GetLatestSequenceNumber();
+
+            string? currentVersion = firstTime ? null : GetMetaData("version");
+
+            // The ledger proves the directory was initialised, so a missing format version means the
+            // live log was emptied or lost after its records were synced — not an older layout.
+            bool directoryErased = !firstTime && currentVersion is null && ledgerStatus == RocksDbSyncLedger.ReadStatus.Valid;
+
+            if (!firstTime && !directoryErased && !string.Equals(currentVersion, FormatVersion, StringComparison.Ordinal))
             {
-                db.Dispose();
                 throw new InvalidOperationException(
                     $"RocksDB WAL format version '{currentVersion ?? "<missing>"}' is not compatible with '{FormatVersion}'. " +
                     "Create a fresh WAL directory or migrate the existing data before opening it."
                 );
             }
+
+            if (firstTime || directoryErased)
+                SetMetaData("version", FormatVersion);
+
+            LoadLostSyncedWritesVerdict();
+            RestoreHardStateFromLedger();
+            BindSyncLedger(ledgerStatus, in ledgerRecord, replayed, directoryErased);
+        }
+        catch
+        {
+            hardStateLedger.Dispose();
+            syncLedger.Dispose();
+            db.Dispose();
+            throw;
         }
     }
 
@@ -795,11 +887,16 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            db.Put(EngineCanaryKey, BitConverter.GetBytes(tickSource.GetTimestamp()), metadataColumnFamily, SynchronousWriteOptions);
+            PutAttested(EngineCanaryKey, BitConverter.GetBytes(tickSource.GetTimestamp()), metadataColumnFamily, SynchronousWriteOptions);
             return true;
         }
         catch (RocksDbException)
         {
+            return false;
+        }
+        catch (IOException)
+        {
+            // The sync ledger could not attest the canary: the volume is not taking durable writes.
             return false;
         }
     }
@@ -844,6 +941,10 @@ public class RocksDbWAL : IWAL, IDisposable
             metadataColumnFamily = db.GetColumnFamily("metadata");
             engineClosed = false;
             EngineReopenCount++;
+
+            // The reopened engine replayed its files again, and the ledger's attestation must still
+            // be covered: a volume that lost synced writes while the process ran shows here.
+            VerifySyncLedgerAfterReopen();
 
             KommanderMetrics.RecordWalEngineReopen(succeeded: true);
 
@@ -940,6 +1041,323 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>Test-visible fail-stop reason, mirroring <see cref="IWAL.GetFailStopReason"/>.</summary>
     internal string? FailStopReason => Volatile.Read(ref corruptionFailure)?.Message;
+
+    // ── Sync ledger and hard-state ledger: lost synced writes ─────────────────────────────────
+    //
+    // Every column family shares one RocksDB log, and the engine records a log's synced size only
+    // once that log is closed. A live log truncated after its fsync therefore replays short and opens
+    // clean, and every proof kept inside the log — the acknowledged-presence watermark, the term and
+    // the vote — is cut with the rows it was meant to protect. The kommander-jepsen lost-tail run of
+    // 2026-11-04 showed the consequence: four partitions reported Healthy after losing 24 to 44
+    // acknowledged entries each, the node granted a second vote in a term it had already led, and two
+    // leaders committed different values at 146 indices.
+    //
+    // Two files beside the engine keep the proofs outside the log. RocksDbSyncLedger attests, after
+    // every synchronous write and before that write is reported successful, the sequence of the batch;
+    // at open, a ledger ahead of what the engine replayed is the evidence, recorded as a persisted
+    // verdict that quarantines every partition on the engine (IWAL.GetLostSyncedWritesReason) until a
+    // leader has reconciled it. RocksDbHardStateLedger holds the last term and vote per partition and
+    // is merged back into the engine at open where it is ahead, so the quarantine can never lift onto
+    // a forgotten vote. The engine itself keeps running: its files are consistent, only stale, and the
+    // repair is replication from a leader — which is why this is a quarantine and not the Corruption
+    // fail-stop (a damaged block is not repaired by replication; a lost tail is).
+
+    /// <summary>
+    /// Writes <paramref name="batch"/> and, when <paramref name="options"/> are the synchronous options,
+    /// attests the batch's last sequence in the sync ledger before returning. Every engine write goes
+    /// through here or through <see cref="PutAttested"/> / <see cref="RemoveAttested"/>, so no
+    /// synchronous write escapes the ledger. A ledger failure throws <see cref="IOException"/>, which
+    /// the write cores report as a failed write: the rows are on disk, but the promise they would back
+    /// is not covered, so the caller must not make it — the same outcome as a crash between the fsync
+    /// and the reply, which every caller already handles.
+    /// </summary>
+    private void WriteAttested(WriteBatch batch, WriteOptions options)
+    {
+        db.Write(batch, options);
+
+        if (ReferenceEquals(options, SynchronousWriteOptions))
+            AttestBatch(batch);
+    }
+
+    /// <summary>A single put through <see cref="WriteAttested"/> when synchronous; a plain put otherwise.</summary>
+    private void PutAttested(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ColumnFamilyHandle columnFamily, WriteOptions options)
+    {
+        if (!ReferenceEquals(options, SynchronousWriteOptions))
+        {
+            db.Put(key, value, columnFamily, options);
+            return;
+        }
+
+        using WriteBatch batch = new();
+        batch.Put(key, value, cf: columnFamily);
+        WriteAttested(batch, options);
+    }
+
+    /// <summary>A single delete through <see cref="WriteAttested"/> when synchronous; a plain delete otherwise.</summary>
+    private void RemoveAttested(byte[] key, ColumnFamilyHandle columnFamily, WriteOptions options)
+    {
+        if (!ReferenceEquals(options, SynchronousWriteOptions))
+        {
+            db.Remove(key, cf: columnFamily, writeOptions: options);
+            return;
+        }
+
+        using WriteBatch batch = new();
+        batch.Delete(key, cf: columnFamily);
+        WriteAttested(batch, options);
+    }
+
+    /// <summary>
+    /// Attests the last sequence of a batch the engine has just written synchronously. The sequence is
+    /// read from the batch's own header, which RocksDB fills in during the write (a fixed64 sequence
+    /// followed by a fixed32 count), never from the engine's latest sequence: a concurrent
+    /// <em>unsynced</em> write may have raised that past what this fsync covered, and attesting it would
+    /// make the next open report a loss that never happened. Inert until the constructor has bound the
+    /// ledger; the binding attests everything written before it.
+    /// </summary>
+    private void AttestBatch(WriteBatch batch)
+    {
+        if (!syncLedgerReady)
+            return;
+
+        IntPtr header = Native.Instance.rocksdb_writebatch_data(batch.Handle, out UIntPtr size);
+        if ((ulong)size < 12)
+            return;
+
+        long first = Marshal.ReadInt64(header);
+        int count = Marshal.ReadInt32(header, 8);
+        if (count <= 0)
+            return;
+
+        syncLedger.Attest(first + count - 1);
+    }
+
+    /// <summary>
+    /// Binds the sync ledger to the engine at open. A ledger that belongs to this engine and attests no
+    /// more than the engine replayed is adopted; one ahead of the replay is the lost-synced-writes
+    /// verdict (<see cref="RecordLostSyncedWritesVerdict"/>) and is reset to the engine afterwards;
+    /// one from another engine is reset; a missing one is created. <paramref name="replayed"/> is the
+    /// engine's sequence before any write of this open.
+    /// </summary>
+    private void BindSyncLedger(RocksDbSyncLedger.ReadStatus status, in RocksDbSyncLedger.Record record, long replayed, bool directoryErased)
+    {
+        Guid? engineIdentity = ReadEngineIdentity();
+
+        switch (status)
+        {
+            case RocksDbSyncLedger.ReadStatus.Valid when engineIdentity is not null && record.Identity != engineIdentity.Value:
+                logger.LogWarnRocksDbWalSyncLedgerForeign(enginePath, syncLedger.FilePath, record.Identity, engineIdentity.Value);
+                syncLedger.Initialize(engineIdentity.Value, (long)db.GetLatestSequenceNumber(), afterGeneration: record.Generation);
+                break;
+
+            case RocksDbSyncLedger.ReadStatus.Valid when directoryErased || engineIdentity is null || record.Sequence > replayed:
+            {
+                // Writes the ledger attested are not in the files the engine replayed. A ledger over a
+                // directory without an identity is the same event (the ledger is created only after the
+                // identity's synced put), and so is a directory whose format version is gone.
+                string detail = directoryErased
+                    ? "; the format version and the engine identity written at the first open are gone as well"
+                    : engineIdentity is null ? "; the engine identity this ledger was created for is gone as well" : "";
+
+                RecordLostSyncedWritesVerdict(record.Sequence, replayed, detail);
+
+                engineIdentity ??= WriteEngineIdentity();
+                syncLedger.Initialize(engineIdentity.Value, (long)db.GetLatestSequenceNumber(), afterGeneration: record.Generation);
+                break;
+            }
+
+            case RocksDbSyncLedger.ReadStatus.Valid:
+                syncLedger.Adopt(in record);
+
+                // Everything the engine replayed came from the disk, so it is durable now, and so are
+                // the writes of this open; attesting it also covers writes a previous process life
+                // never synced but that reached the disk.
+                syncLedger.Attest((long)db.GetLatestSequenceNumber());
+                break;
+
+            case RocksDbSyncLedger.ReadStatus.Unreadable:
+                logger.LogWarnRocksDbWalSyncLedgerUnreadable(enginePath, syncLedger.FilePath);
+                goto default;
+
+            default:
+            {
+                engineIdentity ??= WriteEngineIdentity();
+                long latest = (long)db.GetLatestSequenceNumber();
+                syncLedger.Initialize(engineIdentity.Value, latest);
+                logger.LogInfoRocksDbWalSyncLedgerCreated(enginePath, syncLedger.FilePath, latest);
+                break;
+            }
+        }
+
+        syncLedgerReady = true;
+    }
+
+    /// <summary>
+    /// Persists the lost-synced-writes verdict (a new id above the previous one, so partitions that
+    /// reconciled an earlier event are quarantined again) with one Critical line naming the two
+    /// sequences. The engine keeps accepting writes: the Raft layer quarantines each partition and
+    /// lifts it once a leader has reconciled the log (<see cref="MarkLostSyncedWritesReconciled"/>).
+    /// </summary>
+    private void RecordLostSyncedWritesVerdict(long attested, long replayed, string detail)
+    {
+        long verdict = Math.Max(lostSyncedWritesVerdict, 0) + 1;
+        string reason =
+            $"the write-ahead log lost synced writes: the sync ledger '{syncLedger.FilePath}' attests sequence {attested} as durable, " +
+            $"but the engine replayed only through sequence {replayed} ({attested - replayed} synced operations are missing{detail}). " +
+            "A log file was truncated or lost after its fsync, and the rows, watermarks, terms and votes it carried are gone with it";
+
+        if (!SetMetaData(LostSyncedWritesKey, $"{verdict}\n{reason}"))
+            throw new RaftException($"RocksDB WAL at '{enginePath}' could not record its lost-synced-writes verdict; the open is refused.");
+
+        Volatile.Write(ref lostSyncedWritesReason, reason);
+        Volatile.Write(ref lostSyncedWritesVerdict, verdict);
+
+        KommanderMetrics.RecordWalLostSyncedWrites();
+        logger.LogCritRocksDbWalLostSyncedWrites(enginePath, syncLedger.FilePath, attested, replayed, attested - replayed, detail, verdict);
+    }
+
+    /// <summary>Loads a verdict persisted by an earlier open, so partitions that never reconciled it stay quarantined.</summary>
+    private void LoadLostSyncedWritesVerdict()
+    {
+        string? raw = GetMetaData(LostSyncedWritesKey);
+        if (raw is null)
+            return;
+
+        int newline = raw.IndexOf('\n');
+        if (newline < 0 || !long.TryParse(raw.AsSpan(0, newline), out long verdict))
+            return;
+
+        lostSyncedWritesReason = raw[(newline + 1)..];
+        lostSyncedWritesVerdict = verdict;
+    }
+
+    private static string ReconciledKey(int partitionId) => $"raft_reconciled_lost_synced_writes_p{partitionId}";
+
+    /// <inheritdoc/>
+    public string? GetLostSyncedWritesReason(int partitionId)
+    {
+        long verdict = Volatile.Read(ref lostSyncedWritesVerdict);
+        if (verdict < 0)
+            return null;
+
+        string? reconciled = GetMetaData(ReconciledKey(partitionId));
+        if (reconciled is not null && long.TryParse(reconciled, out long done) && done >= verdict)
+            return null;
+
+        return Volatile.Read(ref lostSyncedWritesReason);
+    }
+
+    /// <inheritdoc/>
+    public bool MarkLostSyncedWritesReconciled(int partitionId)
+    {
+        long verdict = Volatile.Read(ref lostSyncedWritesVerdict);
+        return verdict < 0 || SetMetaData(ReconciledKey(partitionId), verdict.ToString());
+    }
+
+    /// <summary>
+    /// Re-runs the ledger comparison after <see cref="ReopenEngine"/> replayed the files again. A loss
+    /// found here happened while the process ran, on a volume that already failed once: that is a
+    /// storage fault to fail-stop on, not a stale directory to reconcile.
+    /// </summary>
+    private void VerifySyncLedgerAfterReopen()
+    {
+        long attested = syncLedger.AttestedSequence;
+        long replayed = (long)db.GetLatestSequenceNumber();
+
+        if (attested <= replayed)
+            return;
+
+        LatchCorruption(new RaftException(
+            $"the write-ahead log lost synced writes while the process ran: the sync ledger '{syncLedger.FilePath}' attests sequence {attested} " +
+            $"as durable, but the engine reopened after a storage failure replayed only through sequence {replayed}. " +
+            "This node must not vote or lead from this directory: move it aside and let the node rebuild from its peers."));
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The engine's put first (synchronous under <c>syncWrites</c>), then the hard-state ledger's
+    /// record and its fsync. Reported durable only when both landed: a vote the ledger does not hold
+    /// is a vote a truncated log can forget, which is exactly the double vote this guards against.
+    /// </remarks>
+    public bool PersistHardState(int partitionId, long currentTerm, string? votedFor)
+    {
+        if (!SetMetaData(RaftHardStateCodec.Key(partitionId), RaftHardStateCodec.Encode(currentTerm, votedFor)))
+            return false;
+
+        try
+        {
+            hardStateLedger.Append(partitionId, currentTerm, votedFor);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("PersistHardState({PartitionId}, {Term}, {VotedFor}): the hard-state ledger rejected the record: {Message}",
+                partitionId, currentTerm, votedFor, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Writes back, at open, every partition's hard state that the hard-state ledger holds ahead of the
+    /// engine: a higher term, or a vote in the same term that the engine lacks. The ledger is appended
+    /// only after the engine's put returned, so it is ahead only when the engine lost that put. Runs
+    /// before the Raft layer reads the hard state, and before the sync ledger is bound, so the
+    /// write-back is attested with everything else this open wrote.
+    /// </summary>
+    private void RestoreHardStateFromLedger()
+    {
+        foreach ((int partitionId, RocksDbHardStateLedger.Entry entry) in hardStateLedger.Snapshot())
+        {
+            bool has = RaftHardStateCodec.TryDecode(GetMetaData(RaftHardStateCodec.Key(partitionId)), out long engineTerm, out string? engineVote);
+
+            bool ahead = !has
+                || entry.Term > engineTerm
+                || (entry.Term == engineTerm && engineVote is null && entry.VotedFor is not null);
+
+            if (!ahead)
+                continue;
+
+            if (!SetMetaData(RaftHardStateCodec.Key(partitionId), RaftHardStateCodec.Encode(entry.Term, entry.VotedFor)))
+                throw new RaftException($"RocksDB WAL at '{enginePath}' could not restore the hard state of partition {partitionId} from the hard-state ledger; the open is refused.");
+
+            logger.LogWarnRocksDbWalHardStateRestored(enginePath, partitionId, entry.Term, entry.VotedFor, has ? engineTerm : -1, engineVote);
+        }
+    }
+
+    private Guid? ReadEngineIdentity() =>
+        GetMetaData(EngineIdentityKey) is { } text && Guid.TryParseExact(text, "N", out Guid identity) ? identity : null;
+
+    private Guid WriteEngineIdentity()
+    {
+        Guid identity = Guid.NewGuid();
+
+        if (!SetMetaData(EngineIdentityKey, identity.ToString("N")))
+            throw new RaftException($"RocksDB WAL at '{enginePath}' could not write its engine identity; the open is refused.");
+
+        return identity;
+    }
+
+    /// <summary>Test seam: the sequence the sync ledger attests as durable.</summary>
+    internal long SyncLedgerAttestedSequence => syncLedger.AttestedSequence;
+
+    /// <summary>Test seam: the sync ledger file's path.</summary>
+    internal string SyncLedgerPath => syncLedger.FilePath;
+
+    /// <summary>Test seam: the hard-state ledger file's path.</summary>
+    internal string HardStateLedgerPath => hardStateLedger.FilePath;
+
+    /// <summary>Test seam: the id of the current lost-synced-writes verdict, or -1.</summary>
+    internal long LostSyncedWritesVerdict => Volatile.Read(ref lostSyncedWritesVerdict);
+
+    /// <summary>Test seam: the engine's latest sequence number.</summary>
+    internal long EngineLatestSequence
+    {
+        get
+        {
+            using EngineLease lease = AcquireEngine();
+            return (long)db.GetLatestSequenceNumber();
+        }
+    }
 
     /// <summary>
     /// Bytes/second RocksDB is currently throttling writers to, or 0 when no slowdown is active.
@@ -1195,6 +1613,20 @@ public class RocksDbWAL : IWAL, IDisposable
     /// unrecoverable error this recovery region exists for. Throws the engine's error to the caller.
     /// </summary>
     internal void FlushMemTablesForTesting() => FlushMemTablesForTesting(wait: false);
+
+    /// <summary>
+    /// Test seam: flushes only the metadata column family, synchronously — the flush
+    /// <see cref="NoteShardBytesWritten"/> schedules in production. It closes the live log for the
+    /// metadata CF while the shard rows stay in it, which is the shape the lost-tail tests need.
+    /// </summary>
+    internal void FlushMetadataForTesting()
+    {
+        using EngineLease lease = AcquireEngine();
+
+        FlushOptions flushOptions = new();
+        Native.Instance.rocksdb_flushoptions_set_wait(flushOptions.Handle, 1);
+        Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, metadataColumnFamily.Handle);
+    }
 
     /// <summary>
     /// Test-only flush with an explicit wait flag. <paramref name="wait"/> = true blocks until the
@@ -1509,7 +1941,7 @@ public class RocksDbWAL : IWAL, IDisposable
                                 partitionId, log.Id, currentFloor, firstMissing);
                     }
 
-                    db.Write(checkpointBatch, effectiveOptions);
+                    WriteAttested(checkpointBatch, effectiveOptions);
                     RaiseMaxLogCache(partitionId, log.Id);
 
                     return RaftOperationStatus.Success;
@@ -1530,8 +1962,8 @@ public class RocksDbWAL : IWAL, IDisposable
                     {
                         // The whole commit is one small metadata put instead of a full-payload row
                         // rewrite — the write-amplification fix this frontier exists for.
-                        db.Put(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(advanced.ToString()),
-                               metadataColumnFamily, effectiveOptions);
+                        PutAttested(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(advanced.ToString()),
+                                    metadataColumnFamily, effectiveOptions);
                         RaiseCommitFrontierCache(partitionId, advanced);
                         CommitMarkersAbsorbed++;
                         return RaftOperationStatus.Success;
@@ -1544,7 +1976,7 @@ public class RocksDbWAL : IWAL, IDisposable
                         using WriteBatch commitBatch = new();
                         PutLogToBatch(commitBatch, partitionId, log, columnFamilyHandle);
                         PutCommitFrontierToBatch(commitBatch, partitionId, advanced);
-                        db.Write(commitBatch, effectiveOptions);
+                        WriteAttested(commitBatch, effectiveOptions);
                         RaiseCommitFrontierCache(partitionId, advanced);
                         RaiseMaxLogCache(partitionId, log.Id);
                         return RaftOperationStatus.Success;
@@ -1566,7 +1998,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 try
                 {
                     WriteLogEntry(valueBuffer, partitionId, log, logTypeByteCount);
-                    db.Put(buffer, valueBuffer, columnFamilyHandle, effectiveOptions);
+                    PutAttested(buffer, valueBuffer, columnFamilyHandle, effectiveOptions);
                 }
                 finally
                 {
@@ -1746,7 +2178,9 @@ public class RocksDbWAL : IWAL, IDisposable
 
             // The acknowledged-presence watermarks land in the same batch as the rows they describe, so
             // "this node reported id N as durably held" and "the row for N is on disk" become true in
-            // one atomic step — a torn tail can lose both or neither.
+            // one atomic step — a torn tail can lose both or neither. That same atomicity is why the
+            // watermark cannot expose a truncation of the live log by itself (the cut takes both); the
+            // sync ledger attests this batch's sequence from outside the log right after the write.
             if (acknowledgedPresence is not null)
             {
                 foreach ((int partitionId, long value) in acknowledgedPresence)
@@ -1756,7 +2190,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
 
-            db.Write(writeBatch, effectiveOptions);
+            WriteAttested(writeBatch, effectiveOptions);
 
             if (frontierAdvances is not null)
             {
@@ -2756,7 +3190,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // returns, and a vote that reached the candidate but not the disk let a node grant a second
             // candidate the same term after a power loss — two leaders in one term. Metadata writes are
             // rare (one per vote, one per term adoption, one per HLC slack window), so the fsync is cheap.
-            db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), metadataColumnFamily, writeOptions);
+            PutAttested(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), metadataColumnFamily, writeOptions);
 
             if (syncWrites)
                 Interlocked.Increment(ref syncMetadataWrites);
@@ -3132,9 +3566,9 @@ public class RocksDbWAL : IWAL, IDisposable
             try
             {
                 if (value < 0)
-                    db.Remove(AckedPresenceKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                    RemoveAttested(AckedPresenceKey(partitionId), metadataColumnFamily, writeOptions);
                 else
-                    db.Put(AckedPresenceKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), metadataColumnFamily, writeOptions);
+                    PutAttested(AckedPresenceKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), metadataColumnFamily, writeOptions);
 
                 ackedPresenceCache[partitionId] = Math.Max(value, -1);
                 return true;
@@ -3702,10 +4136,10 @@ public class RocksDbWAL : IWAL, IDisposable
         using EngineLease lease = AcquireEngine();
 
         if (value <= 0)
-            db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+            RemoveAttested(CommitFrontierKey(partitionId), metadataColumnFamily, writeOptions);
         else
-            db.Put(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()),
-                   metadataColumnFamily, writeOptions);
+            PutAttested(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()),
+                        metadataColumnFamily, writeOptions);
 
         commitFrontierCache[partitionId] = Math.Max(value, 0);
     }
@@ -3787,7 +4221,6 @@ public class RocksDbWAL : IWAL, IDisposable
             // tombstones that each had to flush and compact. The iterator probe below only decides
             // whether any log row exists at all (to pick the batch vs standalone metadata delete).
             using WriteBatch writeBatch = new();
-            int staged = 0;
 
             using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
             {
@@ -3809,7 +4242,6 @@ public class RocksDbWAL : IWAL, IDisposable
                     BuildPartitionUpperBoundKey(rangeEnd, partitionId);
 
                     writeBatch.DeleteRange(rangeBegin, (ulong)rangeBegin.Length, rangeEnd, (ulong)rangeEnd.Length, columnFamilyHandle);
-                    staged = 1;
                 }
             }
 
@@ -3824,22 +4256,14 @@ public class RocksDbWAL : IWAL, IDisposable
             lock (CommitFrontierLock(partitionId))
             {
                 // The acknowledged-presence watermark goes too: the partition is wiped on purpose, and a
-                // stale watermark would make the next occupant of the id restore as a loss.
-                if (staged > 0)
-                {
-                    writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
-                    writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
-                    writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
-                    writeBatch.Delete(AckedPresenceKey(partitionId), cf: metadataColumnFamily);
-                    db.Write(writeBatch, writeOptions);
-                }
-                else
-                {
-                    db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                    db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                    db.Remove(CompactionFloorKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                    db.Remove(AckedPresenceKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
-                }
+                // stale watermark would make the next occupant of the id restore as a loss. One batch
+                // whether or not rows were staged: the metadata deletes are the same four either way.
+                writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(AckedPresenceKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(Encoding.UTF8.GetBytes(ReconciledKey(partitionId)), cf: metadataColumnFamily);
+                WriteAttested(writeBatch, writeOptions);
 
                 compactionFloorCache.TryRemove(partitionId, out _);
                 commitFrontierCache.TryRemove(partitionId, out _);
@@ -3949,7 +4373,7 @@ public class RocksDbWAL : IWAL, IDisposable
             }
 
             if (staged > 0 || clampFrontier || clampFloor || clampAck)
-                db.Write(writeBatch, writeOptions);
+                WriteAttested(writeBatch, writeOptions);
 
             // Rows above the cut are gone; the surviving max is somewhere at or below it.
             if (staged > 0)
@@ -4074,7 +4498,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     if (clampAck)
                         PutAckedPresenceToBatch(writeBatch, partitionId, clampedAck);
 
-                    db.Write(writeBatch, writeOptions);
+                    WriteAttested(writeBatch, writeOptions);
 
                     if (clampAck)
                         ackedPresenceCache[partitionId] = clampedAck;
@@ -4247,7 +4671,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
             OnAfterBoundaryScanForTesting?.Invoke();
 
-            db.Write(writeBatch, effectiveOptions);
+            WriteAttested(writeBatch, effectiveOptions);
 
             if (clampFrontier)
                 commitFrontierCache[partitionId] = snapshotIndex;
@@ -4409,7 +4833,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
 
                 // The floor is durable before any file below it is dropped (see the region comment).
-                db.Write(writeBatch, writeOptions);
+                WriteAttested(writeBatch, writeOptions);
                 compactionFloorCache[partitionId] = newFloor;
                 LastCompactionWriteCount = 1;
 
@@ -4771,6 +5195,8 @@ public class RocksDbWAL : IWAL, IDisposable
             engineGuard.ExitWriteLock();
         }
 
+        hardStateLedger.Dispose();
+        syncLedger.Dispose();
         writeGuard.Dispose();
         engineGuard.Dispose();
     }

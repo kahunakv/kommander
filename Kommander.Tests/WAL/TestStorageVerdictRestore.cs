@@ -13,8 +13,13 @@ namespace Kommander.Tests.WAL;
 /// A whole node restarting on a RocksDB directory whose on-disk shape carries a storage verdict —
 /// the way a fault campaign leaves it — and what the node does about it:
 /// <list type="bullet">
-///   <item>rows missing below the acknowledged-presence watermark (a synced tail truncated after its
-///   fsync): the partition reports <see cref="RaftPartitionStorageState.LostAcknowledgedEntries"/>
+///   <item>the live log file truncated after its fsync, as the kommander-jepsen <c>lost-tail</c>
+///   fault leaves it: the sync ledger attests more than the engine replayed, the engine fail-stops,
+///   the partition reports <see cref="RaftPartitionStorageState.EngineFailed"/> from its first verdict
+///   and never elects itself. The watermark inside the log went with the rows, so this is the only
+///   check that fires on real file damage;</item>
+///   <item>rows missing below the acknowledged-presence watermark while the watermark itself survives
+///   (the API-level shape): the partition reports <see cref="RaftPartitionStorageState.LostAcknowledgedEntries"/>
 ///   and, as the only voter, never elects itself; with
 ///   <see cref="LostAcknowledgedEntriesPolicy.AcceptAndLog"/> it runs, and the rewritten watermark
 ///   keeps a second restart healthy;</item>
@@ -35,6 +40,119 @@ public sealed class TestStorageVerdictRestore
     {
         ILoggerFactory loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Warning));
         logger = loggerFactory.CreateLogger<IRaft>();
+    }
+
+    /// <summary>
+    /// The feature's reproduction: a node that led, acknowledged entries and persisted its vote, then
+    /// had its live RocksDB log cut in half on disk. Before the sync ledger the node reopened clean
+    /// (the watermark and the vote were cut with the rows) and reported Healthy; now every partition on
+    /// the engine restores quarantined with the lost-synced-writes reason, the only voter never leads
+    /// from the stale log, and a restart before any reconciliation quarantines again. Under
+    /// <see cref="LostAcknowledgedEntriesPolicy.AcceptAndLog"/> the node runs and records the
+    /// reconciliation, so the strict policy finds nothing on the restart after that.
+    /// </summary>
+    [Fact]
+    public async Task LiveLogTruncatedAfterFsync_IsQuarantined_NeverSelfElects_AndStaysQuarantinedAcrossRestarts()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            const int total = 24;
+            long acknowledgedMax;
+
+            // Phase 1: a healthy single-voter node leads and acknowledges entries into its live log.
+            RaftManager healthy = MakeNode(dir, LostAcknowledgedEntriesPolicy.Quarantine);
+            try
+            {
+                await JoinAsync(healthy);
+                await WaitForConditionAsync(() => healthy.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+
+                byte[] data = "Hello World"u8.ToArray();
+                for (int i = 1; i <= total; i++)
+                {
+                    RaftReplicationResult r = await healthy.ReplicateLogs(UserPartition, "Greeting", data, cancellationToken: TestContext.Current.CancellationToken);
+                    Assert.True(r.Success, $"replicate {i} failed: {r.Status}");
+                }
+
+                acknowledgedMax = healthy.WalAdapter.GetMaxLog(UserPartition);
+            }
+            finally
+            {
+                healthy.Dispose();
+            }
+
+            // The damage: the live log cut in half, as the lost-tail fault leaves it.
+            string engineDir = Path.Combine(dir, "node1");
+            FileInfo log = new DirectoryInfo(engineDir).GetFiles("*.log").OrderByDescending(f => f.Name, StringComparer.Ordinal).First();
+            using (FileStream stream = File.Open(log.FullName, FileMode.Open, FileAccess.Write))
+                stream.SetLength(stream.Length / 2);
+
+            // Phase 2: the restart. The rows really are gone, the verdict is reported for the user
+            // partition, and the node never elects itself.
+            RaftManager victim = MakeNode(dir, LostAcknowledgedEntriesPolicy.Quarantine);
+            try
+            {
+                Assert.True(victim.WalAdapter.GetMaxLog(UserPartition) < acknowledgedMax,
+                    "the truncation did not remove any acknowledged row; the test did not reproduce the fault");
+
+                await TryJoinAsync(victim, seconds: 5);
+
+                RaftPartitionStorageHealth health = await WaitForVerdictAsync(victim);
+                Assert.Equal(RaftPartitionStorageState.LostAcknowledgedEntries, health.State);
+                Assert.Contains("lost synced writes", health.Reason);
+                Assert.Equal(-1, health.AcknowledgedThrough);
+
+                await Task.Delay(TestTimeouts.Scale(1500), TestContext.Current.CancellationToken);
+                Assert.False(await victim.AmILeaderQuick(UserPartition));
+                Assert.Equal(RaftPartitionStorageState.LostAcknowledgedEntries, victim.GetPartitionStorageHealth(UserPartition)?.State);
+            }
+            finally
+            {
+                victim.Dispose();
+            }
+
+            // Phase 3: the verdict is persisted, so a plain restart quarantines again.
+            RaftManager again = MakeNode(dir, LostAcknowledgedEntriesPolicy.Quarantine);
+            try
+            {
+                await TryJoinAsync(again, seconds: 5);
+                Assert.Equal(RaftPartitionStorageState.LostAcknowledgedEntries, (await WaitForVerdictAsync(again)).State);
+            }
+            finally
+            {
+                again.Dispose();
+            }
+
+            // Phase 4: the operator accepts the loss; the node runs and records the reconciliation.
+            RaftManager accepting = MakeNode(dir, LostAcknowledgedEntriesPolicy.AcceptAndLog);
+            try
+            {
+                await JoinAsync(accepting);
+                await WaitForConditionAsync(() => accepting.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                Assert.Equal(RaftPartitionStorageState.Healthy, accepting.GetPartitionStorageHealth(UserPartition)?.State);
+            }
+            finally
+            {
+                accepting.Dispose();
+            }
+
+            // Phase 5: the strict policy finds nothing on the next restart.
+            RaftManager strict = MakeNode(dir, LostAcknowledgedEntriesPolicy.Quarantine);
+            try
+            {
+                await JoinAsync(strict);
+                await WaitForConditionAsync(() => strict.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                Assert.Equal(RaftPartitionStorageState.Healthy, strict.GetPartitionStorageHealth(UserPartition)?.State);
+            }
+            finally
+            {
+                strict.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteTempDir(dir);
+        }
     }
 
     [Fact]
@@ -258,6 +376,27 @@ public sealed class TestStorageVerdictRestore
             new InMemoryCommunication(),
             new HybridLogicalClock(),
             logger);
+    }
+
+    /// <summary>
+    /// A join that may not complete: with every partition quarantined, a single voter never elects a
+    /// system leader and the join waits for one. The verdict is readable regardless.
+    /// </summary>
+    private static async Task TryJoinAsync(RaftManager node, int seconds)
+    {
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TestTimeouts.Scale(TimeSpan.FromSeconds(seconds)));
+        await node.UpdateNodes();
+        try
+        {
+            await node.JoinCluster(cts.Token);
+        }
+        catch (OperationCanceledException) when (!TestContext.Current.CancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (TimeoutException)
+        {
+        }
     }
 
     private static async Task JoinAsync(RaftManager node)

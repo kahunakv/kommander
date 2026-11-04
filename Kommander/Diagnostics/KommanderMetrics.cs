@@ -100,6 +100,18 @@ public static class KommanderMetrics
 
     internal static void RecordWalEngineFailStop() => WalEngineFailStopsTotal.Add(1);
 
+    /// <summary>
+    /// Opens at which the storage engine's sync ledger attested writes the engine's log no longer held
+    /// (a log file truncated or lost after its fsync). Every partition on that engine is quarantined
+    /// until a leader reconciles it. Any non-zero value is a storage fault worth an operator's look.
+    /// </summary>
+    internal static readonly Counter<long> WalLostSyncedWritesTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.lost_synced_writes_total",
+            description: "Engine opens that found the sync ledger ahead of the replayed log: synced writes were lost.");
+
+    internal static void RecordWalLostSyncedWrites() => WalLostSyncedWritesTotal.Add(1);
+
     // ── Partition storage integrity ───────────────────────────────────────────
 
     /// <summary>

@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.13.0</Version>
+    <Version>1.13.1</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -96,6 +96,8 @@
     <Compile Remove="Communication\Grpc\GrpcCommunicationExtensions.cs" />
     <Compile Remove="Communication\Rest\RestCommunicationExtensions.cs" />
     <Compile Remove="WAL\RocksDbWAL.cs" />
+    <Compile Remove="WAL\RocksDbSyncLedger.cs" />
+    <Compile Remove="WAL\RocksDbHardStateLedger.cs" />
     <Compile Remove="WAL\RocksDbSharedResources.cs" />
     <Compile Remove="WAL\RocksDbWalTuning.cs" />
     <Compile Remove="WAL\SqliteWAL.cs" />

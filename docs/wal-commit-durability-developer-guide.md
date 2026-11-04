@@ -441,7 +441,7 @@ RocksDB verifies a checksum on every block it reads and every log record it repl
 with `paranoid_checks`, `verify_sst_unique_id_in_manifest` and now `track_and_verify_wals_in_manifest`.
 That last option records each **closed** write-ahead log's number and synced size in the MANIFEST: a
 closed log that is missing or shorter than recorded fails the open instead of replaying short. The live
-log is deliberately not tracked by RocksDB, which is the gap the watermark below closes.
+log is deliberately not tracked by RocksDB, which is the gap the sync ledger below closes.
 
 Two corrections to common assumptions:
 
@@ -457,10 +457,10 @@ Two corrections to common assumptions:
 
 ### The acknowledged-presence watermark
 
-The one shape the engine cannot tell from a torn write is a file truncated **after** its fsync: the
-engine opens short, and the node would believe its shorter log. With `syncWrites` an acknowledged entry
-is fsynced, so the Raft layer knows exactly what it promised: the contiguous presence frontier it reports
-in every ack.
+With `syncWrites` an acknowledged entry is fsynced, so the Raft layer knows exactly what it promised: the
+contiguous presence frontier it reports in every ack. The watermark is the durable statement of that
+promise, kept next to the rows, and it catches the shapes where rows go missing under a surviving
+watermark: a damaged or restored shard, and the API-level fault injections the tests use.
 
 Every log-carrying WAL operation therefore carries `WALWriteOperation.AcknowledgedPresence`, the
 frontier the partition will have once that batch and everything queued before it have landed
@@ -486,6 +486,81 @@ On restore, after every frontier seed (checkpoint, compaction floor, soft floor)
 compares the watermark with the reconstructed contiguous frontier. A watermark above it means rows this
 node promised — and the leader may have counted toward a commit — are gone.
 
+**What the watermark cannot see.** Every column family of a RocksDB engine shares one log file, and the
+watermark lands in the same batch as the rows. A live log truncated **after** its fsync — the one shape
+`TolerateCorruptedTailRecords` cannot tell from a torn write — therefore removes the watermark together
+with the rows it covers, and the surviving watermark always matches the surviving rows. The storage
+review of 2026-11-04 proved this at the WAL level (every truncation of the live log reopened "clean")
+and in a five-node cluster: the victim reported `Healthy` on four partitions that had each lost 24 to 44
+acknowledged entries, the same cut removed its term and vote, it granted a second vote in a term it had
+already led, and two leaders committed different values at 146 indices. The two ledgers below are the
+answer: a proof that must survive the loss of the log cannot live inside the log.
+
+### The sync ledger: a truncated live log
+
+`RocksDbSyncLedger` is a two-slot, 1 KiB file beside the engine (`.kommander-sync-ledger`) that
+attests, **outside the log**, the highest RocksDB sequence number a synchronous write of this process
+completed. After every synchronous engine write — rows, watermark, hard state, frontier, floor, every
+one goes through `RocksDbWAL.WriteAttested` — the sequence of that batch is read from the batch's own
+header (RocksDB fills it in during the write; the engine's *latest* sequence is never used, because a
+concurrent unsynced write may have raised it past what this fsync covered), written to the other slot,
+and fsynced before the write is reported successful. Concurrent writers group-commit the ledger: the
+first one through the gate writes the highest pending sequence for everybody.
+
+At open, the ledger is compared with the sequence the engine replayed. The ledger can never be ahead
+of what the engine fsynced (it is written after), so a ledger ahead of the replay is proof that synced
+writes are gone: a log file truncated or lost after its fsync. The engine then **records a verdict**
+(metadata key `raft_lost_synced_writes`, a monotonic id plus the reason naming both sequences), resets
+the ledger to the engine, and **keeps running**: its files are consistent, only stale, and the repair is
+replication from a leader — which is why this is a quarantine and not the `Corruption` fail-stop. Every
+partition on the engine is suspect (the lost tail may have held any partition's rows, markers or vote),
+so `IWAL.GetLostSyncedWritesReason(partition)` answers the reason for each one until that partition
+records its reconciliation (`MarkLostSyncedWritesReconciled`, metadata key
+`raft_reconciled_lost_synced_writes_p{partition}`). A crash before the reconciliation quarantines again;
+a later event carries a higher id and quarantines partitions that reconciled the earlier one.
+
+The ledger carries the engine's identity (`raft_engine_identity`), so a ledger copied from another
+directory is reset, not believed; a torn slot is skipped in favour of the other; both slots unreadable
+(not a crash shape) is treated as no ledger, with a warning. A directory from before the ledger is
+upgraded at its next open. A torn **unsynced** record — the residue of a real kill — was never attested
+and reopens healthy. With `syncWrites` off nothing is attested, because nothing is promised.
+
+Cost: one extra device round trip per synchronous engine write (an in-place sector write plus
+`fdatasync`, grouped across concurrent writers), on top of the engine's own fsync. The ledger uses the
+same primitive as the engine's log on each platform, not the full-device flush `FileStream.Flush(true)`
+issues on macOS.
+
+### The hard-state ledger: a forgotten vote
+
+`IWAL.PersistHardState` is a synchronous metadata put, so a granted vote is on disk before the reply
+leaves — in the same log as the rows. The same truncation removes it, and the node restarts with an
+older term and no vote. `RocksDbHardStateLedger` (`.kommander-hard-state`, append-only, one record and
+one fsync per hard-state write, replayed at open, compacted when large) keeps the last term and vote per
+partition outside the log. At open, a partition whose ledger entry is ahead of the engine's — a higher
+term, or a vote in the same term the engine lacks — gets it written back before the Raft layer reads it.
+The ledger is appended only after the engine's put returned, so it is ahead only when the engine lost
+the put; the quarantine below can therefore never lift onto a forgotten vote.
+
+### How the quarantine lifts after a lost tail
+
+The surviving log may be a *stale prefix*: the cut can revert a leader's truncation as well as remove
+appended rows, so the same ids may hold entries from an older term, and there is no watermark to reach.
+The restore records the surviving frontier and its term (`RaftRestoreStorageVerdict.LogTermBar`), and
+the partition votes and campaigns again once any of three facts proves its log is a leader's prefix:
+
+- a leader has **replicated past the surviving frontier** (the consistency check at the frontier passed,
+  or the stale tail was truncated and replaced on the way);
+- the frontier's **term rose above the bar** — a leader's own entry at a newer term, which is what a
+  leader with a shorter log than the stale one appends;
+- the leader's **empty heartbeat confirmed the frontier as its own**: every empty heartbeat carries the
+  leader's contiguous frontier in the Log Matching fields (`HeartbeatDriver` reads its tracked frontier,
+  no WAL access; `BackfillSender.AppendLogToNode` puts it on the entry-less request), and a frontier
+  equal to it is, by the Log Matching Property, the leader's whole log. This is the condition a quiet partition needs —
+  the system partition, most of the time — which would otherwise stay quarantined until its next entry.
+
+The election gates open on the live condition; the tick records the reconciliation in the backend and
+only then reports `Healthy`, so a probe that reads `Healthy` can be acted on safely.
+
 ### Quarantine, not silence
 
 The restore reports a `RaftRestoreStorageVerdict`; the state machine turns it into one of the
@@ -494,7 +569,7 @@ readiness probe:
 
 | State | What happened | What the partition withholds | How it ends |
 |---|---|---|---|
-| `LostAcknowledgedEntries` | Watermark above the restored frontier | Votes, pre-votes, candidacy, leadership transfers. Acks continue: they are truthful. | On its own, once the leader has replicated past the watermark (or a snapshot covers it). A single-voter partition stays leaderless until the operator restores the data or sets `LostAcknowledgedEntriesPolicy.AcceptAndLog`, which logs the lost range at `Critical`, rewrites the watermark to the surviving log, and is audited as a disabled safety fence at startup. |
+| `LostAcknowledgedEntries` | Watermark above the restored frontier, **or** the engine's lost-synced-writes verdict (the health reason says which) | Votes, pre-votes, candidacy, leadership transfers. Acks continue: they are truthful. | On its own, once the leader has replicated past the watermark (or a snapshot covers it); for the engine's verdict, once a leader has replicated past the surviving frontier, appended an entry from a newer term, or confirmed the frontier through an empty heartbeat, after which the partition records the reconciliation. A single-voter partition stays leaderless until the operator restores the data or sets `LostAcknowledgedEntriesPolicy.AcceptAndLog`, which logs the loss at `Critical`, rewrites the watermark (or records the reconciliation), and is audited as a disabled safety fence at startup. |
 | `ApplicationFloorBelowCompaction` | `IApplicationDurabilityProvider` reports a floor with `floor + 1 < compactionFloor`: the entries the application still needs were compacted (its store was wiped, restored, or rolled back) | Consumer replay and live applies (a suffix applied onto a store without its prefix is a corrupt store), candidacy, transfers. It keeps voting: its Raft log is complete. | The tick asks the leader for a whole-partition snapshot (`RequestReseedAsync`) and repeats the request until one installs; any installed snapshot clears it. A provider floor of `-1` is "no opinion" by contract and does not trigger this; a provider for an empty store must report `0`. |
 | `EngineFailed` | The engine fail-stopped on a `Corruption` status | Everything: a leader steps down with a step-down notice, and the partition neither votes, campaigns nor acknowledges | Never, for this process. The operator moves the damaged directory aside and the node rebuilds from its peers. |
 | `RestoreFailed` | The WAL restore threw and the executor stopped the partition | Everything (the partition is not running) | Operator. |
@@ -520,13 +595,17 @@ machine polls it on its tick and moves the partition to `EngineFailed`.
 
 ### What an operator sees
 
+- `Critical` — `RocksDB WAL at '…' lost synced writes: the sync ledger '…' attests sequence A as durable, but the engine replayed only through sequence R …` (the engine, once per event)
+- `Critical` — `Restore found the storage engine lost synced writes: the surviving log is contiguous through P at term T …` (each partition)
+- `Warning` — `… restored the hard state of partition N from the hard-state ledger (term T, vote V) …`
 - `Critical` — `Restore found acknowledged entries missing: … acknowledged ids through A … contiguous only through P …`
 - `Critical` — `The application's durable floor F is below the WAL compaction floor C …`
 - `Critical` — `RocksDB WAL at '…' fail-stopped on a storage corruption …` / `… refused to open …`
 - `Warning`, at most every 30 s per partition — `Storage quarantine holds this replica's candidacy …` /
   `… denies vote to …`
-- `Information` — `Lost acknowledged entries repaired …` / `Application floor repaired …`
-- Metrics: `raft.storage.lost_acknowledged_entries_total{outcome=quarantined|accepted}`,
+- `Information` — `Lost synced writes repaired: a leader reconciled the log …` / `Lost acknowledged entries repaired …` / `Application floor repaired …`
+- Metrics: `raft.wal.lost_synced_writes_total` (engine opens that found the ledger ahead of the replay),
+  `raft.storage.lost_acknowledged_entries_total{outcome=quarantined|accepted}` (both verdicts),
   `raft.storage.application_floor_below_compaction_total`,
   `raft.storage.quarantine_transitions_total{state,direction}`, `raft.wal.engine_fail_stops_total`.
 
@@ -569,7 +648,11 @@ Kommander/
 └─ WAL/
       ├─ IWAL.cs                    Write(logs)  and  Write(logs, sync)  (the sync-off primitive)
       ├─ RocksDbWAL.cs              SetSync(true/false); engine recovery after a latched storage error
-│                                   (engineGuard, TryRecoverEngineAfterFailure, ReopenEngine)
+│                                   (engineGuard, TryRecoverEngineAfterFailure, ReopenEngine);
+│                                   WriteAttested + BindSyncLedger (the lost-synced-writes verdict),
+│                                   PersistHardState + RestoreHardStateFromLedger
+      ├─ RocksDbSyncLedger.cs       the two-slot attestation of the last synced sequence, outside the log
+      ├─ RocksDbHardStateLedger.cs  the append-only term/vote ledger, outside the log
       ├─ SqliteWAL.cs               PRAGMA synchronous FULL / OFF toggle
       └─ InMemoryWAL.cs             no fsync — the non-durable control
 
@@ -580,6 +663,11 @@ Kommander.Tests/
 ├─ WAL/RecoveryReSupplyClusterTests.cs        a regressed follower re-converges via leader re-supply
 ├─ WAL/TestRocksDbWalEnospcRecovery.cs        full-disk episode on a real small volume: writes recover
 │                                              in-process, a cluster elects again after space returns
+├─ WAL/TestRocksDbSyncLedger.cs               real file damage against the ledgers: truncated, cut, flushed,
+│                                              deleted live logs; the forgotten vote; the counterweights
+├─ WAL/TestStorageVerdictRestore.cs           a single voter on a truncated live log: quarantined across
+│                                              restarts, accepted by policy, healthy after
+└─ WAL/TestLostAcknowledgedEntriesCluster.cs  a follower's live log cut on disk, repaired by the leader
 └─ Scheduler/TestFairWalScheduler.cs          group commit + linger behaviour
 ```
 
@@ -641,6 +729,9 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~F
 - **`CommittedCheckpoint`** — the always-durable recovery anchor; certifies the prefix below it.
 - **Commit frontier** — the highest contiguous committed id a node knows (`commitIndex`).
 - **Re-supply** — the leader re-shipping the still-committed tail to a follower whose frontier regressed.
+- **Sync ledger / hard-state ledger** — the two files beside a RocksDB engine that keep, outside its log,
+  the last synced sequence and the last term and vote per partition; see "Storage corruption and lost
+  writes".
 - **`autoCommit` path** — the single-round propose-and-commit path the fast path applies to.
 
 ---

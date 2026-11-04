@@ -120,12 +120,17 @@ public interface IWAL : IDisposable
     /// scheduler in submission order). A batch may carry a watermark for a partition it stages no
     /// rows for (the scheduler's regression correction after a failed write).
     /// <para><b>Why it exists.</b> With <c>syncWrites</c> an acknowledged entry is fsynced, so a short
-    /// record at the tail of the engine's log was never acknowledged — unless the file was truncated
-    /// <em>after</em> the fsync, which the engine cannot tell from a torn write. The watermark is the
-    /// durable statement of what the node promised: a restore whose contiguous frontier falls below it
-    /// has lost acknowledged entries and must not vote or lead until the leader has replicated past it
+    /// record at the tail of the engine's log was never acknowledged. The watermark is the durable
+    /// statement of what the node promised: a restore whose contiguous frontier falls below it has lost
+    /// acknowledged entries and must not vote or lead until the leader has replicated past it
     /// (<see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>). Written in the same
     /// batch as the rows it describes, it costs no fsync of its own.</para>
+    /// <para><b>What it cannot see.</b> Because it lands in the same batch, and every column family of
+    /// a RocksDB engine shares one log file, a log truncated <em>after</em> its fsync removes the
+    /// watermark together with the rows it covers, and the surviving watermark always matches the
+    /// surviving rows. That shape is detected by the backend's sync ledger instead
+    /// (<see cref="GetLostSyncedWritesReason"/>); the watermark covers the shapes where the rows are
+    /// removed but the metadata survives (a damaged or restored shard, the API-level fault injections).</para>
     /// <para>The value is <b>assigned</b>, not maximised: the scheduler folds operations in
     /// per-partition FIFO order and the Raft layer's presence frontier only ever moves down through
     /// a correction the backend must honour. Every path that removes rows must clamp the watermark
@@ -166,6 +171,28 @@ public interface IWAL : IDisposable
     /// (never fail-stops), which is right for backends that have no such fault class.
     /// </summary>
     public string? GetFailStopReason() => null;
+
+    /// <summary>
+    /// Non-null while <paramref name="partitionId"/> has not reconciled a <b>lost-synced-writes</b>
+    /// verdict: at its last open the backend found, from a record it keeps outside its log (the sync
+    /// ledger of <see cref="RocksDbWAL"/>), that the log replayed short of writes it had fsynced — a
+    /// log file truncated or lost after its fsync, which the engine opens as if the lost records had
+    /// never existed. Every partition on the engine is suspect, because the lost tail may have held
+    /// any partition's rows, watermark, term or vote; the string is the backend's reason, naming the
+    /// sequences. The Raft layer quarantines the partition like a watermark loss
+    /// (<see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>) until a leader has
+    /// reconciled its log, then calls <see cref="MarkLostSyncedWritesReconciled"/> so the next restart
+    /// does not report the same event again. The verdict is persisted by the backend, so a crash
+    /// before the reconciliation re-quarantines. Default null: the backend keeps no such record.
+    /// </summary>
+    public string? GetLostSyncedWritesReason(int partitionId) => null;
+
+    /// <summary>
+    /// Records, durably, that <paramref name="partitionId"/> reconciled the current lost-synced-writes
+    /// verdict (see <see cref="GetLostSyncedWritesReason"/>). Returns <see langword="false"/> when the
+    /// backend could not persist it; the caller keeps the quarantine and retries. Default succeeds.
+    /// </summary>
+    public bool MarkLostSyncedWritesReconciled(int partitionId) => true;
 
     /// <summary>Returns the largest log id persisted for <paramref name="partitionId"/>, or 0 if empty.</summary>
     public long GetMaxLog(int partitionId);
@@ -235,12 +262,7 @@ public interface IWAL : IDisposable
     /// vote must not be sent when the grant could not be recorded.</para>
     /// </summary>
     public bool PersistHardState(int partitionId, long currentTerm, string? votedFor)
-        // Encoded as "term" (no vote) or "term\nvotedFor". The separator is omitted when there is no vote
-        // so the value never ends in a trailing '\n' — some backends (SQLite) strip trailing newlines on
-        // read, which would otherwise corrupt the round-trip. Endpoints never contain '\n'.
-        => SetMetaData(
-            $"raft_hardstate_p{partitionId}",
-            string.IsNullOrEmpty(votedFor) ? currentTerm.ToString() : $"{currentTerm}\n{votedFor}");
+        => SetMetaData(RaftHardStateCodec.Key(partitionId), RaftHardStateCodec.Encode(currentTerm, votedFor));
 
     /// <summary>
     /// Reads the persisted hard state for <paramref name="partitionId"/>. Returns <see langword="false"/>
@@ -249,28 +271,7 @@ public interface IWAL : IDisposable
     /// <see langword="null"/> when the persisted vote is empty (term adopted without a granted vote).
     /// </summary>
     public bool TryGetHardState(int partitionId, out long currentTerm, out string? votedFor)
-    {
-        currentTerm = 0;
-        votedFor = null;
-
-        string? raw = GetMetaData($"raft_hardstate_p{partitionId}");
-        if (string.IsNullOrEmpty(raw))
-            return false;
-
-        int newline = raw.IndexOf('\n');
-        if (newline < 0)
-        {
-            // No separator → term only, no recorded vote (also covers backends that strip a trailing '\n').
-            return long.TryParse(raw, out currentTerm);
-        }
-
-        if (!long.TryParse(raw.AsSpan(0, newline), out currentTerm))
-            return false;
-
-        string vote = raw[(newline + 1)..];
-        votedFor = string.IsNullOrEmpty(vote) ? null : vote;
-        return true;
-    }
+        => RaftHardStateCodec.TryDecode(GetMetaData(RaftHardStateCodec.Key(partitionId)), out currentTerm, out votedFor);
 
     /// <summary>
     /// Persists the partition's durable HLC high-water mark: an upper bound (in HLC physical

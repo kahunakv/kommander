@@ -1261,15 +1261,17 @@ public class RaftConfiguration
     public bool AllowLegacySnapshotSenders { get; set; }
 
     /// <summary>
-    /// What a partition does when its WAL restore finds the log shorter than what this node had
+    /// What a partition does when its WAL restore finds that this node may have lost entries it had
     /// acknowledged as durably held — the persisted acknowledged-presence watermark above the
-    /// contiguous log on disk, the shape a synced tail truncated after its fsync leaves (see
+    /// contiguous log on disk, or the storage engine's sync ledger attesting writes the log no longer
+    /// holds (a log file truncated after its fsync; see
     /// <see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>). The default,
     /// <see cref="Kommander.LostAcknowledgedEntriesPolicy.Quarantine"/>, withholds the partition's
-    /// votes and candidacy until the leader has replicated past the watermark, which is automatic with
-    /// a replication factor above one. <see cref="Kommander.LostAcknowledgedEntriesPolicy.AcceptAndLog"/>
-    /// is the operator's way out for a single-voter partition that would otherwise stay leaderless: the
-    /// loss is logged at Critical and accepted. Audited as a disabled safety fence at startup.
+    /// votes and candidacy until a leader has repaired the log, which is automatic with a replication
+    /// factor above one. <see cref="Kommander.LostAcknowledgedEntriesPolicy.AcceptAndLog"/> is the
+    /// operator's way out for a single-voter partition that would otherwise stay leaderless: the loss
+    /// is logged at Critical and accepted (the watermark is rewritten, or the engine's verdict is
+    /// recorded as reconciled). Audited as a disabled safety fence at startup.
     /// </summary>
     public LostAcknowledgedEntriesPolicy LostAcknowledgedEntriesPolicy { get; set; } = LostAcknowledgedEntriesPolicy.Quarantine;
 

@@ -2732,7 +2732,28 @@ public sealed class RaftPartitionStateMachine
             return;
 
         if (verdict.State == RaftPartitionStorageState.LostAcknowledgedEntries)
-            coreState.LostAcknowledgedThrough = verdict.AcknowledgedThrough;
+        {
+            if (verdict.LogTermBar >= 0)
+            {
+                // The lost-synced-writes verdict: no watermark to reach (it went with the tail), so
+                // the frontier must pass what survived, or its term must rise above the bar.
+                coreState.LostAcknowledgedThrough = verdict.PresentThrough + 1;
+                coreState.LostSyncedWritesTermBar = verdict.LogTermBar;
+                coreState.LostSyncedWritesReason = verdict.Reason;
+            }
+            else
+                coreState.LostAcknowledgedThrough = verdict.AcknowledgedThrough;
+        }
+
+        if (verdict.State == RaftPartitionStorageState.EngineFailed)
+        {
+            // The engine was already fail-stopped when the restore ran: record the reason the tick
+            // would otherwise fetch, so the election gates and the health probe explain themselves
+            // from this turn on (ObserveStorageIntegrityAsync skips a partition already in this state).
+            string reason = wal.GetStorageFailStopReason() ?? "the storage engine fail-stopped before the restore completed";
+            coreState.StorageFailReason = reason;
+            logger.LogCritPartitionStorageEngineFailed(host.LocalEndpoint, host.PartitionId, coreState.NodeState, reason);
+        }
 
         EnterStorageState(verdict.State);
     }
@@ -2778,11 +2799,34 @@ public sealed class RaftPartitionStateMachine
             // The leader replicated past the watermark (or a snapshot covered it): this log is a prefix
             // of the leader's again and may vote and lead. The gates already opened on the live frontier;
             // this flips the state for the health probe and says so once.
-            if (present >= acknowledged)
+            if (coreState.LostAcknowledgedEntriesRepaired(wal))
             {
-                logger.LogInfoLostAcknowledgedEntriesRepaired(host.LocalEndpoint, host.PartitionId, acknowledged, present);
+                long bar = coreState.LostSyncedWritesTermBar;
+                if (bar >= 0)
+                {
+                    // The lost-synced-writes verdict is persisted by the backend; record the
+                    // reconciliation so the next restart does not quarantine this event again. If the
+                    // record does not land the gates stay open (the live frontier proves the repair),
+                    // the state stays for the probe, and the next tick retries.
+                    if (!await wal.MarkLostSyncedWritesReconciledAsync().ConfigureAwait(false))
+                    {
+                        logger.LogWarning(
+                            "[{Endpoint}/{Partition}] Lost synced writes repaired by replication, but the reconciliation could not be recorded; retrying on the next tick",
+                            host.LocalEndpoint, host.PartitionId);
+                        return;
+                    }
+
+                    long presentTerm = wal.GetPresentTerm();
+                    logger.LogInfoLostSyncedWritesRepaired(host.LocalEndpoint, host.PartitionId, present, presentTerm, bar);
+                }
+                else
+                    logger.LogInfoLostAcknowledgedEntriesRepaired(host.LocalEndpoint, host.PartitionId, acknowledged, present);
+
                 ExitStorageState(RaftPartitionStorageState.LostAcknowledgedEntries);
                 coreState.LostAcknowledgedThrough = -1;
+                coreState.LostSyncedWritesTermBar = -1;
+                coreState.LostSyncedWritesReason = null;
+                coreState.LostSyncedWritesLeaderConfirmed = false;
 
                 if (coreState.ApplicationFloorRepairPending)
                     EnterStorageState(RaftPartitionStorageState.ApplicationFloorBelowCompaction);
@@ -2822,6 +2866,24 @@ public sealed class RaftPartitionStateMachine
             {
                 long present = wal.GetPresentIndex();
                 long acknowledged = coreState.LostAcknowledgedThrough;
+                long bar = coreState.LostSyncedWritesTermBar;
+                if (bar >= 0)
+                {
+                    // The lost-synced-writes flavour stays reported until the tick has RECORDED the
+                    // reconciliation in the backend (ObserveStorageIntegrityAsync exits the state only
+                    // after that): a probe that read Healthy from the live frontier alone could be
+                    // acted on — the node restarted — before the record landed, and the restart
+                    // would quarantine the same event again. The election gates open on the live
+                    // frontier regardless; only the report waits.
+                    string progress = coreState.LostAcknowledgedEntriesRepaired(wal)
+                        ? "a leader has reconciled the log, and the reconciliation is being recorded"
+                        : $"votes and candidacy are withheld until a leader replicates past it, appends an entry from a term above {bar}, or confirms this frontier as its own";
+                    return new RaftPartitionStorageHealth(
+                        RaftPartitionStorageState.LostAcknowledgedEntries,
+                        $"{coreState.LostSyncedWritesReason}; the surviving log is contiguous through {present} at term {wal.GetPresentTerm()}; {progress}",
+                        AcknowledgedThrough: -1,
+                        PresentThrough: present);
+                }
                 if (present < acknowledged)
                     return new RaftPartitionStorageHealth(
                         RaftPartitionStorageState.LostAcknowledgedEntries,

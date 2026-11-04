@@ -857,7 +857,61 @@ public sealed class RaftWriteAhead
         long presentThrough = presentIndex - 1;
         RaftPartitionStorageState verdictState = RaftPartitionStorageState.Healthy;
 
-        if (acknowledgedThrough > presentThrough)
+        long logTermBar = -1;
+        string? lostSyncedReason = null;
+
+        if (walAdapter.GetFailStopReason() is not null)
+        {
+            // The engine fail-stopped at open (a Corruption status). Nothing this partition could
+            // append, vote or promise would become durable, so the verdict is the fail-stop from the
+            // first executor turn — not left to the tick, which would leave a vote window between the
+            // restore and the first storage observation.
+            verdictState = RaftPartitionStorageState.EngineFailed;
+        }
+        else if (walAdapter.GetLostSyncedWritesReason(partition.PartitionId) is { } lostSynced)
+        {
+            // ── Lost synced writes ────────────────────────────────────────────────────────────
+            // The backend's record outside its log (the sync ledger) attested writes the log no
+            // longer holds: a file truncated or lost after its fsync, which the engine opened as if
+            // the records had never existed. The watermark comparison below cannot see this shape —
+            // the watermark landed in the same batch as the rows and was cut with them, so the
+            // surviving watermark always matches the surviving rows. Every partition on the engine
+            // is suspect: the lost tail may have held this partition's rows, its commit markers, or
+            // the vote it granted (the hard state is restored from its own ledger by the backend).
+            // The surviving log is a stale prefix, so the quarantine cannot end at a watermark; it
+            // ends once a leader has replicated past the surviving frontier or appended an entry from
+            // a term above the frontier's term, either of which proves the log is that leader's
+            // prefix, and the partition then records the reconciliation so the next restart does not
+            // report the same event again.
+            bool accepted = manager.Configuration.LostAcknowledgedEntriesPolicy == LostAcknowledgedEntriesPolicy.AcceptAndLog;
+            KommanderMetrics.RecordLostAcknowledgedEntries(partition.PartitionId, accepted);
+
+            if (accepted)
+            {
+                manager.Logger.LogCritLostSyncedWrites(
+                    manager.LocalEndpoint, partition.PartitionId, presentThrough, presentTerm, lostSynced,
+                    "LostAcknowledgedEntriesPolicy is AcceptAndLog: the loss is accepted, the reconciliation is recorded, and the "
+                    + "partition runs normally from the surviving log.");
+
+                if (!walAdapter.MarkLostSyncedWritesReconciled(partition.PartitionId))
+                    manager.Logger.LogWarning(
+                        "[{Endpoint}/{Partition}] Could not record the lost-synced-writes reconciliation; the next restart reports the same loss again",
+                        manager.LocalEndpoint, partition.PartitionId);
+            }
+            else
+            {
+                verdictState = RaftPartitionStorageState.LostAcknowledgedEntries;
+                logTermBar = Math.Max(presentTerm, 0);
+                lostSyncedReason = lostSynced;
+                manager.Logger.LogCritLostSyncedWrites(
+                    manager.LocalEndpoint, partition.PartitionId, presentThrough, presentTerm, lostSynced,
+                    "This partition will neither vote nor campaign until a leader has replicated past the surviving frontier or "
+                    + "appended an entry from a newer term; it keeps acknowledging what it really holds, so with a replication "
+                    + "factor above one the repair is automatic. A single-voter partition stays leaderless until the operator "
+                    + "restores the data or sets LostAcknowledgedEntriesPolicy to AcceptAndLog.");
+            }
+        }
+        else if (acknowledgedThrough > presentThrough)
         {
             bool accepted = manager.Configuration.LostAcknowledgedEntriesPolicy == LostAcknowledgedEntriesPolicy.AcceptAndLog;
             KommanderMetrics.RecordLostAcknowledgedEntries(partition.PartitionId, accepted);
@@ -890,7 +944,9 @@ public sealed class RaftWriteAhead
 
         restoreStorageVerdict = new RaftRestoreStorageVerdict(
             verdictState, acknowledgedThrough, presentThrough, restoreDurablyApplied, restoreCompactionFloor,
-            ApplicationReplayRefused: restoreApplicationFloorBelowCompaction);
+            ApplicationReplayRefused: restoreApplicationFloorBelowCompaction,
+            LogTermBar: logTermBar,
+            Reason: lostSyncedReason);
 
         // ── Seed the durable frontier and the published commit index from the disk ──────────
         // Everything reconstructed above was read from the disk, so it IS the durable state: the
@@ -2532,6 +2588,13 @@ public sealed class RaftWriteAhead
     /// healthy. One volatile read; polled by the state machine's tick.
     /// </summary>
     public string? GetStorageFailStopReason() => walAdapter.GetFailStopReason();
+
+    /// <summary>
+    /// Records in the backend that this partition reconciled the lost-synced-writes verdict its restore
+    /// reported (<see cref="IWAL.MarkLostSyncedWritesReconciled"/>). Called by the state machine when
+    /// the quarantine lifts; false means the record did not land and the quarantine stays.
+    /// </summary>
+    public bool MarkLostSyncedWritesReconciled() => walAdapter.MarkLostSyncedWritesReconciled(partition.PartitionId);
 
     /// <summary>
     /// Reads this partition's persisted hard state, or <see langword="null"/> when none has been written
