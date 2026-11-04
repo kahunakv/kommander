@@ -78,6 +78,16 @@ internal sealed class HeartbeatDriver
     /// </summary>
     private readonly LiveReplicaRetentionBudget retentionBudget = new();
 
+    /// <summary>
+    /// The snapshot sender, for the index each peer with a transfer in flight is being seeded at
+    /// (<see cref="SnapshotSender.TryGetSeedingIndex"/>): the retention floor holds from there while the
+    /// install runs, whatever the peer's last reported position says.
+    /// </summary>
+    private readonly SnapshotSender snapshotSender;
+
+    /// <summary>The last budget the published floor was raised to for a seeded peer, for the log line's edge (0 = none).</summary>
+    private long lastSeededHoldBudget;
+
     public HeartbeatDriver(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -85,6 +95,7 @@ internal sealed class HeartbeatDriver
         ReplicationTracker tracker,
         ProposalRegistry proposals,
         BackfillSender sender,
+        SnapshotSender snapshotSender,
         RaftPartitionLogThrottle logThrottle,
         ILogger<IRaft> logger)
     {
@@ -94,8 +105,27 @@ internal sealed class HeartbeatDriver
         this.tracker = tracker;
         this.proposals = proposals;
         this.sender = sender;
+        this.snapshotSender = snapshotSender;
         this.logThrottle = logThrottle;
         this.logger = logger;
+    }
+
+    /// <summary>
+    /// Adopts the live-replica retention budget the previous leader was publishing, read from this node's
+    /// own WAL where it arrived on the predecessor's AppendLogs (<see cref="IRaftWalFacade.GetLiveReplicaRetentionBudget"/>),
+    /// so this leader's first rounds hold the log as deep as its predecessor did instead of restarting at
+    /// the configured minimum until its own commit history fills the window. Called once per election,
+    /// on the executor; a budget of 0 (none received, or stale) adopts nothing.
+    /// </summary>
+    public void InheritRetentionBudget(long budget, long nowTicks)
+    {
+        if (budget <= 0)
+            return;
+
+        retentionBudget.Inherit(budget, nowTicks);
+
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInfoInheritedRetentionBudget(host.LocalEndpoint, host.PartitionId, coreState.NodeState, budget);
     }
 
     /// <summary>
@@ -452,6 +482,14 @@ internal sealed class HeartbeatDriver
     ///   plus restore came back below it into a snapshot.</item>
     ///   <item>Learners count too — a placement learner mid-catch-up is exactly the replica whose
     ///   backfill the floor must keep servable.</item>
+    ///   <item>A peer being seeded by snapshot holds from the index it is seeded at (+1), and a peer
+    ///   whose confirmed install is still on record holds at its need, both exempt from the budget
+    ///   clamp: the published budget is raised to cover them. An install's duration is the leader's
+    ///   own doing, and compacting past a follower because its install outlasted the budget is what
+    ///   turned every slow install into a re-install loop (CamusDB fault soak, 2026-11-04).</item>
+    ///   <item>A node that wins an election inherits the budget its predecessor was publishing
+    ///   (<see cref="InheritRetentionBudget"/>) until its own commit history fills the window, so a
+    ///   leader change mid-install does not reset the depth to the configured minimum.</item>
     /// </list>
     /// Runs on the executor thread; the WAL side applies the budget clamp and a staleness window,
     /// so this publisher needs no step-down hook — a leader that stops beating stops holding.
@@ -466,10 +504,20 @@ internal sealed class HeartbeatDriver
 
         // Sampled every round, whether or not a peer holds the floor this round, so the window has
         // history when one starts to.
+        long commitIndex = wal.GetCommitIndex();
         long windowEntries = retentionBudget.Observe(
-            nowTicks, wal.GetCommitIndex(), host.Configuration.CompactionLiveReplicaLagWindow);
+            nowTicks, commitIndex, host.Configuration.CompactionLiveReplicaLagWindow);
         long budget = LiveReplicaRetentionBudget.Compose(
             host.Configuration.CompactionLiveReplicaLagBudget, windowEntries, host.Configuration.CompactionLiveReplicaLagCap);
+
+        // The lowest index a peer being seeded by snapshot, or just seeded and catching up from its
+        // install, still needs. The WAL clamps the published floor to the budget below the checkpoint;
+        // that clamp is what compacted past a follower whose install took longer than the budget was
+        // deep (a CamusDB fault soak: a 130 s install at 8,600 entries/s, a 1,000,000-entry budget, the
+        // first backfill after the install non-contiguous, another install, and so on until the node
+        // ran out of memory). A seeded peer's need is therefore exempt from the clamp, by raising the
+        // published budget to cover it (below).
+        long seededNeed = long.MaxValue;
 
         foreach (RaftNode node in nodes)
         {
@@ -497,6 +545,14 @@ internal sealed class HeartbeatDriver
                     continue;
             }
 
+            // A transfer in flight to this peer: it will hold the log from the seeding index once the
+            // install lands, whatever position it last reported (none at all while the install holds its
+            // executor, or a stale one from before the transfer). The need is the index after the
+            // boundary; nothing below it is ever served to this peer again. Held for as long as the
+            // transfer is in flight, which the sender bounds by its own step and acknowledgement deadlines.
+            bool seeding = snapshotSender.TryGetSeedingIndex(node.Endpoint, out long seedingIndex);
+            long seedingNeed = seeding ? seedingIndex + 1 : long.MaxValue;
+
             // DURABLE, contiguous evidence only, in this order of preference:
             //   1. the peer's reported durable commit frontier (every term-valid ack carries it): the
             //      highest id its disk has answered for with no hole below — the position it can be
@@ -522,6 +578,24 @@ internal sealed class HeartbeatDriver
                     position = match;
             }
 
+            // A peer being seeded needs nothing below the index it is seeded at, whatever position it last
+            // reported (none at all while the install holds its executor, or the stale one from before the
+            // transfer — millions of entries below the boundary, in the soak that motivated this). The
+            // install replaces everything below the boundary; holding from the stale position would keep
+            // all of it for nothing. So its need is the seeding index + 1, exempt from the budget, and the
+            // unknown-position rule below does not apply to it.
+            if (seeding)
+            {
+                if (seedingNeed < floor)
+                    floor = seedingNeed;
+                if (seedingNeed < seededNeed)
+                    seededNeed = seedingNeed;
+
+                if (position > 0)
+                    unreportedSince.Remove(node.Endpoint);
+
+                continue;
+            }
 
             if (position <= 0)
             {
@@ -569,9 +643,35 @@ internal sealed class HeartbeatDriver
             if (tracker.TryGetNextIndex(node.Endpoint, out long nextIndex) && nextIndex > 0 && nextIndex < needed)
                 needed = nextIndex;
 
+            // A peer whose confirmed install is still on record is closing the lag the install handed it,
+            // from the log; its need stays exempt from the budget clamp until it has: the lag is the
+            // leader's own making, and the alternative is the install again.
+            if (tracker.TryGetSnapshotSeed(node.Endpoint, out _) && needed < seededNeed)
+                seededNeed = needed;
+
             if (needed < floor)
                 floor = needed;
         }
+
+        // Raise the published budget so the WAL's clamp (checkpoint minus the budget) cannot rise above
+        // the seeded need: the checkpoint is at most the commit index, so a budget of commit − need + 1
+        // keeps every entry from the need. The cap still bounds it: a peer that cannot close a gap of
+        // CompactionLiveReplicaLagCap entries is left to the snapshot path, as before.
+        long rateBudget = budget;
+        if (seededNeed != long.MaxValue && commitIndex >= seededNeed)
+        {
+            long seededBudget = commitIndex - seededNeed + 1;
+            if (seededBudget > budget)
+            {
+                budget = seededBudget;
+                KommanderMetrics.RecordSeededPeerRetentionHold(host.PartitionId);
+
+                if (lastSeededHoldBudget == 0 && logger.IsEnabled(LogLevel.Information))
+                    logger.LogInfoSeededPeerRetentionHold(host.LocalEndpoint, host.PartitionId, coreState.NodeState, budget, seededNeed, rateBudget);
+            }
+        }
+
+        lastSeededHoldBudget = budget > rateBudget ? budget : 0;
 
         wal.SetLiveReplicaRetentionFloor(floor, budget);
 

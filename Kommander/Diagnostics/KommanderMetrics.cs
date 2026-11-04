@@ -343,6 +343,46 @@ public static class KommanderMetrics
         BackfillWalStallPausesTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Entry-carrying AppendEntries a follower refused at its receive path because a whole-partition
+    /// snapshot install held its partition executor (<c>RaftOperationStatus.FollowerInstallingSnapshot</c>).
+    /// Each one would otherwise have waited behind the install in the executor's unbounded queue.
+    /// </summary>
+    internal static readonly Counter<long> AppendsRefusedWhileInstallingTotal =
+        Meter.CreateCounter<long>(
+            "raft.follower.appends_refused_while_installing_total",
+            description: "Entry-carrying appends a follower refused without queueing because a snapshot install held its partition executor.");
+
+    internal static void RecordAppendRefusedWhileInstalling(int partitionId) =>
+        AppendsRefusedWhileInstallingTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Entry-carrying sends (live proposals and backfill batches) a leader withheld from a peer it is
+    /// seeding by snapshot: the peer cannot apply them before the install, and queueing them there is
+    /// what ran a follower out of memory mid-install.
+    /// </summary>
+    internal static readonly Counter<long> SeedingPeerSendsSkippedTotal =
+        Meter.CreateCounter<long>(
+            "raft.backfill.seeding_peer_sends_skipped_total",
+            description: "Entry-carrying sends withheld from a peer the leader is seeding by snapshot; they resume from the installed boundary.");
+
+    internal static void RecordSeedingPeerSendSkipped(int partitionId) =>
+        SeedingPeerSendsSkippedTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Heartbeat rounds in which the leader raised the live-replica retention budget it publishes so the
+    /// WAL keeps every entry from the index a peer is being seeded at (or was just seeded at and is
+    /// catching up from), past the rate-scaled budget: the first backfill after an install must be
+    /// contiguous whatever the install took.
+    /// </summary>
+    internal static readonly Counter<long> SeededPeerRetentionHoldsTotal =
+        Meter.CreateCounter<long>(
+            "raft.compaction.seeded_peer_retention_holds_total",
+            description: "Heartbeat rounds whose published retention budget was raised to keep the log from a peer's snapshot install boundary.");
+
+    internal static void RecordSeededPeerRetentionHold(int partitionId) =>
+        SeededPeerRetentionHoldsTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Refused-backfill escalations that did NOT start a snapshot transfer because the peer reports
     /// a durable-write stall. One per refused heartbeat while the stall lasts; the deferral logs once
     /// per episode.

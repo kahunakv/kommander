@@ -45,8 +45,34 @@ internal sealed class LiveReplicaRetentionBudget
     /// <summary>The newest sample; meaningful only while <see cref="samples"/> is not empty.</summary>
     private (long Ticks, long CommitIndex) newest;
 
+    /// <summary>
+    /// A depth inherited from the previous leader at election, and when. A fresh leader has no commit
+    /// history of its own: its window answers the configured minimum for a full window's length, and a
+    /// replica its predecessor was holding the log for — one mid-install, or just installed and catching
+    /// up — was compacted past in that gap (a CamusDB fault soak: the successor's first retained entry
+    /// sat exactly one million entries below its checkpoint while the follower needed 125,000 more).
+    /// The inherited depth stands in until the window has history of its own.
+    /// </summary>
+    private long inheritedEntries;
+
+    private long inheritedAtTicks;
+
     /// <summary>Number of retained samples (tests).</summary>
     internal int SampleCount => samples.Count;
+
+    /// <summary>The inherited depth still standing in, 0 when none (tests).</summary>
+    internal long InheritedEntries => inheritedEntries;
+
+    /// <summary>
+    /// Adopts <paramref name="entries"/> as the window's answer until <paramref name="window"/> of the
+    /// next <see cref="Observe"/> calls has elapsed from <paramref name="nowTicks"/>, or the window's own
+    /// history exceeds it. A non-positive value clears any inherited depth.
+    /// </summary>
+    public void Inherit(long entries, long nowTicks)
+    {
+        inheritedEntries = Math.Max(0, entries);
+        inheritedAtTicks = nowTicks;
+    }
 
     /// <summary>
     /// Records the commit index observed at <paramref name="nowTicks"/> (Stopwatch ticks) and returns
@@ -54,6 +80,22 @@ internal sealed class LiveReplicaRetentionBudget
     /// window is disabled, or when the history is too short to tell.
     /// </summary>
     public long Observe(long nowTicks, long commitIndex, TimeSpan window)
+    {
+        long observed = ObserveHistory(nowTicks, commitIndex, window);
+
+        if (inheritedEntries <= 0)
+            return observed;
+
+        if (window <= TimeSpan.Zero || nowTicks - inheritedAtTicks >= ToTicks(window))
+        {
+            inheritedEntries = 0;
+            return observed;
+        }
+
+        return Math.Max(observed, inheritedEntries);
+    }
+
+    private long ObserveHistory(long nowTicks, long commitIndex, TimeSpan window)
     {
         if (window <= TimeSpan.Zero || commitIndex < 0)
         {

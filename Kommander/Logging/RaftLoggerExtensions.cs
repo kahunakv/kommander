@@ -185,6 +185,18 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) — the follower is seeded and the leader's replication cursors advance to the boundary")]
     public static partial void LogWarnSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}] Refused {Count} entry-carrying append(s) from the leader while the snapshot install at index {Index} held the partition executor for {ElapsedMs} ms; none was queued, the leader paused its sends and resumes from the installed boundary")]
+    public static partial void LogInfoAppendsRefusedDuringInstall(this ILogger<IRaft> logger, string localEndpoint, int partitionId, long index, long count, long elapsedMs);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Skipping entry-carrying send to {Endpoint}: a snapshot transfer to it is in flight (seeding at index {Index}); entries resume from the installed boundary")]
+    public static partial void LogDebugSendSkippedForSeedingPeer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Retention budget raised to {Budget} entries so the log is kept from index {Hold} for a peer being seeded by snapshot or catching up from its install (rate budget {RateBudget})")]
+    public static partial void LogInfoSeededPeerRetentionHold(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long budget, long hold, long rateBudget);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Inherited a live-replica retention budget of {Budget} entries from the previous leader; it holds until this leader's own commit history covers the window")]
+    public static partial void LogInfoInheritedRetentionBudget(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long budget);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) (within the re-warn cooldown)")]
     public static partial void LogDebugSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 

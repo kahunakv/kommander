@@ -421,6 +421,35 @@ a re-seed request`, `Re-seed complete`, `Deferring candidacy: the application wi
 
 ---
 
+### While a follower is being seeded
+
+A snapshot transfer to a follower holds that follower's partition executor for the whole install, and
+nothing entry-carrying can be applied there before the installed state. Three rules keep an install
+from feeding on itself:
+
+- **The follower sheds entry-carrying appends while it installs.** `RaftPartition.AppendLogs` answers
+  them at the receive path with `FollowerInstallingSnapshot` (no position reported) instead of queueing
+  them behind the install in the executor's unbounded replication queue; heartbeats still queue. The
+  leader treats the status as a saturated WAL: entry-carrying sends to the peer pause for
+  `FollowerSaturationBackoff`, renewed by every refusal, and the install's confirmation advances the
+  peer's cursors to the installed boundary. `raft.follower.appends_refused_while_installing_total`
+  counts the refusals; one Information line per install sums them.
+- **The leader sends the peer nothing entry-carrying while its transfer is in flight.** The single
+  send choke point (`BackfillSender.AppendLogToNode`) and the batch path consult
+  `SnapshotSender.TryGetSeedingIndex`; a live proposal or a backfill batch to a peer being exported
+  to, streamed to, or awaited on is skipped (`raft.backfill.seeding_peer_sends_skipped_total`), and
+  the entries ship contiguously from the installed boundary afterwards.
+- **Retention holds from the seeding index, exempt from the budget.** The heartbeat round's floor
+  publisher holds a seeding peer's need at the index it is seeded at + 1 — whatever position it last
+  reported — and keeps a just-seeded peer's need (while its install is on record) exempt from the
+  rate-scaled budget clamp by raising the published budget to cover it (`commit − need + 1`, still
+  under `CompactionLiveReplicaLagCap`). The raised budget travels to the followers on every
+  AppendLogs, so they hold too, and a node that wins an election inherits the last budget it received
+  (`HeartbeatDriver.InheritRetentionBudget`) until its own commit history fills the window. Without
+  these, a 130 s install at 8,600 entries/s outlasted a 1,000,000-entry budget, the first backfill
+  after it was non-contiguous, and the leader re-installed in a loop (CamusDB fault soak, 2026-11-04).
+  `raft.compaction.seeded_peer_retention_holds_total` counts the rounds that raised the budget.
+
 ## Why the live path is *not* anchored
 
 This is the design decision people most often question, so it's worth stating plainly.
@@ -470,6 +499,11 @@ Tuning notes:
   `int.MaxValue` does **not** disable backfill; use `BackfillEnabled` for that.
 - **Lower `MaxBackfillEntriesPerRound`** → smaller, more frequent rounds (smoother, more rounds to
   converge). **Higher** → fewer, larger rounds (faster bulk catch-up, bigger messages).
+
+`FollowerSaturationBackoff` (default 1 s) also paces the leader after a `FollowerInstallingSnapshot`
+refusal; there is no separate setting, since the follower renews the refusal for as long as its install
+runs. The seeding retention hold needs no setting either: it is bounded by the transfer's own lifetime,
+the seeded-peer install record (`BackfillSeededCatchUpGraceCap`) and `CompactionLiveReplicaLagCap`.
 
 Compaction settings (`CompactEveryOperations`, `CompactNumberEntries`, `MaxEntriesPerCompaction`)
 indirectly affect backfill: aggressive compaction lowers the compaction floor faster, making the

@@ -280,7 +280,13 @@ internal sealed class ReplicationAckProcessor
             // might resolve; this one is the follower saying it has no room, so re-sending
             // immediately is what keeps it from ever having room. Pause entry-carrying backfill
             // to this peer for a window and let its queue drain.
-            if (status == RaftOperationStatus.FollowerWalSaturated)
+            // A follower whose partition executor is held by a snapshot install refuses entry-carrying
+            // appends the same way, for the same reason: nothing it is sent can be applied until the
+            // install ends, and queueing it there is what ran a follower out of memory mid-install. The
+            // pause renews on every refusal, so it lasts as long as the install does; the install's own
+            // completion then advances this peer's cursors to the installed boundary, and the heartbeat
+            // round's anchored backfill resumes from there.
+            if (status is RaftOperationStatus.FollowerWalSaturated or RaftOperationStatus.FollowerInstallingSnapshot)
                 tracker.PauseBackfill(endpoint, host.Configuration.FollowerSaturationBackoff);
 
             logThrottle.LogFailedAppendAck(status, endpoint, timestamp, committedIndex);

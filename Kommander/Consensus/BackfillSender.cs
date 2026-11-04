@@ -97,6 +97,22 @@ internal sealed class BackfillSender
                 PrevLogIndex = prevLogIndex,
                 PrevLogTerm = prevLogTerm,
             };
+        else if (snapshotSender.TryGetSeedingIndex(node.Endpoint, out long seedingIndex))
+        {
+            // A snapshot transfer to this peer is in flight: it is exporting, receiving chunks, or running the
+            // install, which holds its partition executor. Nothing entry-carrying can be applied there before
+            // the install ends, so an entry sent now either waits behind the install in the peer's queue
+            // (two million of them, in a CamusDB fault soak, on a node that then ran out of memory) or is
+            // refused as FollowerInstallingSnapshot. The log is held from the seeding index by the
+            // heartbeat round, so once the install lands the same entries ship contiguously from the
+            // installed boundary. Quorum is unaffected, as for a saturated peer.
+            KommanderMetrics.RecordSeedingPeerSendSkipped(host.PartitionId);
+
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSendSkippedForSeedingPeer(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, seedingIndex);
+
+            return false;
+        }
         else if (tracker.IsBackfillPaused(node.Endpoint))
         {
             // The peer reported a saturated WAL queue within the backoff window. A live entry sent now is
@@ -249,6 +265,15 @@ internal sealed class BackfillSender
         // a throttle attached to the heartbeat interval would not have caught it.
         if (tracker.IsBackfillPaused(node.Endpoint))
             return BackfillSendResult.SaturationPaused;
+
+        // A transfer in flight to this peer. The batch could not be applied before the install it ends in,
+        // and its read is the WAL range read this method exists to avoid for a peer that cannot take it;
+        // the escalation below would find the transfer already pending and do nothing either.
+        if (snapshotSender.TryGetSeedingIndex(node.Endpoint, out _))
+        {
+            KommanderMetrics.RecordSeedingPeerSendSkipped(host.PartitionId);
+            return BackfillSendResult.SaturationPaused;
+        }
 
         // Reported durable-write stall. The peer's acks say its storage engine has stopped answering:
         // an entry-carrying batch shipped now can only sit in its WAL queue (or be refused as

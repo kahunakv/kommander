@@ -3184,6 +3184,22 @@ public sealed class RaftWriteAhead
     internal long LiveReplicaRetentionFloor => Volatile.Read(ref liveReplicaRetentionFloor);
 
     /// <summary>
+    /// The live-replica retention budget as last published with the floor (see
+    /// <see cref="SetLiveReplicaRetentionFloor(long, long)"/>), or 0 once the publication is older than the
+    /// staleness window — the same window compaction applies, so a successor never inherits what a leader
+    /// that stopped beating long ago was holding.
+    /// </summary>
+    internal long GetFreshLiveReplicaRetentionBudget()
+    {
+        long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
+        if (publishedTicks == 0
+            || manager.Configuration.TickSource.GetTimestamp() - publishedTicks > liveReplicaFloorStalenessTicks)
+            return 0;
+
+        return Volatile.Read(ref liveReplicaRetentionBudget);
+    }
+
+    /// <summary>
     /// Effective retention floor actually applied by compaction (before composing with the
     /// checkpoint): the minimum of the legacy <see cref="SetMinRetainIndex"/> floor and the
     /// min-of-holds floor. <see cref="long.MaxValue"/> means no extra retention. Diagnostics/tests only.

@@ -128,6 +128,15 @@ internal sealed class SnapshotSender
     /// </summary>
     private readonly ConcurrentDictionary<string, long> awaitingInstallIndexes = new();
 
+    /// <summary>
+    /// Per follower with a transfer in flight, the lowest snapshot index that transfer will leave it at:
+    /// the index it exports, lowered to the index of an install it found already running there and
+    /// waits for. The leader's heartbeat round reads it to hold log retention from that index and to
+    /// withhold entry-carrying sends until the install ends. Set when the transfer starts, removed when
+    /// it ends however it ends; a peer with no entry here is not being seeded.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> seedingIndexes = new();
+
     /// <summary>Last Warning-level "waiting for an install already running" line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
     private readonly ConcurrentDictionary<string, long> lastWaitWarnTicks = new();
 
@@ -285,6 +294,8 @@ internal sealed class SnapshotSender
 
         if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, host.GetMonotonicTimestamp()))
         {
+            seedingIndexes[node.Endpoint] = snapshotIndex;
+
             if (forced)
                 forcedEndpoints[node.Endpoint] = 0;
             else
@@ -833,9 +844,19 @@ internal sealed class SnapshotSender
         finally
         {
             pendingSnapshotEndpoints.TryRemove(node.Endpoint, out _);
+            seedingIndexes.TryRemove(node.Endpoint, out _);
             forcedEndpoints.TryRemove(node.Endpoint, out _);
         }
     }
+
+    /// <summary>
+    /// Whether a transfer to <paramref name="endpoint"/> is in flight — exporting, streaming chunks, or
+    /// waiting for the follower's install — and, when one is, the index the follower will hold once it is
+    /// installed. Read by the leader's send path and its heartbeat round off the executor; the maps are
+    /// concurrent.
+    /// </summary>
+    internal bool TryGetSeedingIndex(string endpoint, out long snapshotIndex) =>
+        seedingIndexes.TryGetValue(endpoint, out snapshotIndex) && snapshotIndex > 0;
 
     /// <summary>
     /// The index the follower's boundary now covers: the one the install carried when the receiver
@@ -967,6 +988,11 @@ internal sealed class SnapshotSender
         AwaitedInstall awaited = new(pending.InstallSessionId, pending.InstallIndex);
         unresolvedInstalls[node.Endpoint] = awaited;
         awaitingInstallIndexes[node.Endpoint] = awaited.SnapshotIndex;
+
+        // The follower lands at the index of the install it is running, which can be an earlier attempt's,
+        // below the one this transfer was started for; the retention hold follows the lower of the two.
+        if (awaited.SnapshotIndex > 0)
+            seedingIndexes.AddOrUpdate(node.Endpoint, static (_, awaitedIndex) => awaitedIndex, static (_, current, awaitedIndex) => Math.Min(current, awaitedIndex), awaited.SnapshotIndex);
 
         if (!sentByThisTransfer)
             LogWaitingForRunningInstall(node.Endpoint, snapshotIndex, pending);

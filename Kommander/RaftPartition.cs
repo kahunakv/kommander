@@ -1,6 +1,8 @@
 
+using Kommander.Consensus;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
@@ -62,6 +64,21 @@ public sealed class RaftPartition : IDisposable
     private readonly RaftPartitionStateMachine stateMachine;
 
     private readonly RaftManager manager;
+
+    /// <summary>The partition host the state machine answers through; kept so the receive path can
+    /// answer an append without a round-trip through the executor.</summary>
+    private readonly IRaftPartitionHost host;
+
+    private readonly ILogger<IRaft> logger;
+
+    /// <summary>
+    /// 1 while a whole-partition snapshot install is queued for or running on the executor. Read by the
+    /// append receive path on the transport's threads, written by <see cref="InstallSnapshotAsync"/>.
+    /// </summary>
+    private int snapshotInstallRunning;
+
+    /// <summary>Entry-carrying appends refused during the current install (see <see cref="AppendLogs"/>).</summary>
+    private long appendsRefusedWhileInstalling;
 
     private readonly RaftWriteAhead walHandler;
 
@@ -210,7 +227,8 @@ public sealed class RaftPartition : IDisposable
             walAdapter
         );
 
-        IRaftPartitionHost host = new RaftPartitionHostAdapter(manager, this);
+        host = new RaftPartitionHostAdapter(manager, this);
+        this.logger = logger;
         IRaftWalFacade wal = new RaftWalFacadeAdapter(walHandler);
         stateMachine = new(host, wal, replySink, logger);
 
@@ -463,6 +481,21 @@ public sealed class RaftPartition : IDisposable
     /// <returns></returns>
     public void AppendLogs(AppendLogsRequest request)
     {
+        // A snapshot install holds the executor for its whole duration: nothing posted behind it runs
+        // until it ends, and an entry-carrying append could not be applied before the installed state
+        // anyway. Queueing such appends is unbounded — the executor's replication queue has no cap, and
+        // a leader streaming at its write rate filled it with two million entries during one install
+        // (a CamusDB fault soak), while the ones that landed in the WAL over the gap went to the same
+        // storage engine the install was purging. Answer the leader at once instead, from this thread,
+        // with a status it already backs off on; it resumes from the installed boundary once the install
+        // confirms. Heartbeats still queue: they carry the leader's identity and the retention floor,
+        // and they are answered when the install ends.
+        if (request.Logs is { Count: > 0 } && Volatile.Read(ref snapshotInstallRunning) == 1)
+        {
+            RefuseAppendWhileInstalling(request);
+            return;
+        }
+
         executor.Post(new(
             RaftRequestType.AppendLogs,
             request.Term,
@@ -747,8 +780,50 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     internal async Task<SnapshotInstallOutcome> InstallSnapshotAsync(SnapshotInstallRequest request)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.InstallSnapshot, request)).ConfigureAwait(false);
-        return response.Status == RaftOperationStatus.Success ? response.SnapshotOutcome : SnapshotInstallOutcome.Rejected;
+        // Raised before the install is queued, not when the executor reaches it: an append posted in
+        // between would only wait behind the install, so refusing it now loses nothing (see AppendLogs).
+        // One install runs per partition (the receiver refuses a second), so the flag is a plain latch.
+        Volatile.Write(ref snapshotInstallRunning, 1);
+        Interlocked.Exchange(ref appendsRefusedWhileInstalling, 0);
+        long startedTicks = manager.Configuration.TickSource.GetTimestamp();
+
+        try
+        {
+            RaftResponse response = await executor.Ask(new(RaftRequestType.InstallSnapshot, request)).ConfigureAwait(false);
+            return response.Status == RaftOperationStatus.Success ? response.SnapshotOutcome : SnapshotInstallOutcome.Rejected;
+        }
+        finally
+        {
+            Volatile.Write(ref snapshotInstallRunning, 0);
+
+            long refused = Interlocked.Exchange(ref appendsRefusedWhileInstalling, 0);
+            if (refused > 0 && logger.IsEnabled(LogLevel.Information))
+            {
+                long elapsedMs = (manager.Configuration.TickSource.GetTimestamp() - startedTicks) * 1000 / manager.Configuration.TickSource.Frequency;
+                logger.LogInfoAppendsRefusedDuringInstall(manager.LocalEndpoint, PartitionId, request.SnapshotIndex, refused, elapsedMs);
+            }
+        }
+    }
+
+    /// <summary>Whether a snapshot install currently holds this partition's executor (tests and diagnostics).</summary>
+    internal bool IsInstallingSnapshot => Volatile.Read(ref snapshotInstallRunning) == 1;
+
+    /// <summary>Entry-carrying appends refused so far during the running install (tests).</summary>
+    internal long AppendsRefusedWhileInstalling => Volatile.Read(ref appendsRefusedWhileInstalling);
+
+    // Answers an entry-carrying append refused during an install. The ack carries no position: every
+    // frontier is the executor's to read, and the leader treats -1 as "no report" — it leaves this peer's
+    // cursors and the retention floor where they are, which is what the install's own completion then
+    // advances. The responder queue is a channel, safe from this (transport) thread.
+    private void RefuseAppendWhileInstalling(AppendLogsRequest request)
+    {
+        Interlocked.Increment(ref appendsRefusedWhileInstalling);
+        KommanderMetrics.RecordAppendRefusedWhileInstalling(PartitionId);
+
+        host.EnqueueResponse(request.Endpoint, new(
+            RaftResponderRequestType.CompleteAppendLogs,
+            new(request.Endpoint),
+            FollowerAcks.BuildWithoutPosition(host, request.Term, request.Time, RaftOperationStatus.FollowerInstallingSnapshot)));
     }
 
     public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)

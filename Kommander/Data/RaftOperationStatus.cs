@@ -191,4 +191,17 @@ public enum RaftOperationStatus
     /// partition count drops.
     /// </summary>
     PartitionLimitReached = 28,
+
+    /// <summary>
+    /// The follower refused an entry-carrying AppendEntries because a whole-partition snapshot install
+    /// holds its partition executor. Nothing was queued: an append accepted now could only wait behind
+    /// the install, unbounded, and the ones that landed in its WAL over the gap the install closes were
+    /// written to the same storage engine the install was purging (a CamusDB fault soak queued two
+    /// million entries this way and ran the node out of memory). The leader treats it as it treats
+    /// <see cref="FollowerWalSaturated"/>: entry-carrying sends to the peer pause for
+    /// <c>FollowerSaturationBackoff</c>, <c>nextIndex</c> is left alone, and the install's own
+    /// completion advances the peer's cursors to the installed boundary. Heartbeats are still queued and
+    /// answered after the install.
+    /// </summary>
+    FollowerInstallingSnapshot = 29,
 }

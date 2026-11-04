@@ -369,4 +369,9 @@ enum GrpcRaftOperationStatus {
   // 24: a leadership transfer's target did not reach the leader's last index within
   // one election timeout; nothing was handed over and the leader is serving again
   TARGET_NOT_CAUGHT_UP = 24;
+  // 25–28 cross the wire as raw ints (TermMismatch, LeadershipNotConfirmed,
+  // StaleSystemConfiguration, PartitionLimitReached); proto3 passes unknown enum values through
+  // 29: an entry-carrying append refused because a snapshot install holds the follower's
+  // partition executor; the leader pauses entry-carrying sends to it as for a saturated WAL
+  FOLLOWER_INSTALLING_SNAPSHOT = 29;
 }

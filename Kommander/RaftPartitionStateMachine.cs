@@ -516,7 +516,7 @@ public sealed class RaftPartitionStateMachine
         sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logThrottle, logger);
         proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
 
-        heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
+        heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, snapshotSender, logThrottle, logger);
         readIndex = new ReadIndexCoordinator(host, coreState, replySink, logger, heartbeats.SendHeartbeat);
         applier = new LogApplicator(host, wal, coreState, proposals, readIndex, logger);
         applyLane = new FollowerApplyLane(host, wal, coreState, applier, () => postToExecutor);
@@ -1467,6 +1467,7 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
+        heartbeats.InheritRetentionBudget(wal.GetLiveReplicaRetentionBudget(), nowTicks);
         coreState.SeedLocalCommittedIndexOnPromotion(wal.GetCommitIndex());
         coreState.LiveCommitFloor = coreState.LocalCommittedIndex;
         host.Leader = host.LocalEndpoint;
@@ -1641,6 +1642,10 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
+
+        // The depth the previous leader was holding the log at, for a replica it was serving by backfill
+        // or seeding by snapshot, carries into this leadership's first rounds (see HeartbeatDriver).
+        heartbeats.InheritRetentionBudget(wal.GetLiveReplicaRetentionBudget(), nowTicks);
 
         // Reconcile the commit frontier with what this node has provably resolved before anything
         // reads it. A follower stint can leave the in-memory frontier below ids the node already

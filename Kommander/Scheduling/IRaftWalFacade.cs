@@ -317,6 +317,15 @@ public interface IRaftWalFacade
     void SetLiveReplicaRetentionFloor(long floor, long budget) => SetLiveReplicaRetentionFloor(floor);
 
     /// <summary>
+    /// The live-replica retention budget this node last received from a leader with
+    /// <see cref="SetLiveReplicaRetentionFloor(long, long)"/>, while that publication is fresh; 0 when
+    /// none was received or it has gone stale. A node that wins an election reads it so the depth its
+    /// predecessor was holding for a lagging replica carries over to its own first rounds instead of
+    /// restarting at the configured minimum. Default 0 for facades that do not track it.
+    /// </summary>
+    long GetLiveReplicaRetentionBudget() => 0;
+
+    /// <summary>
     /// Persists this partition's Raft hard state — the current term and the endpoint we last granted our
     /// vote to in that term. Durability rides the backend's existing WAL fsync cadence (no dedicated
     /// fsync), so the last vote/term can be lost on power failure. The default is a no-op so non-durable
