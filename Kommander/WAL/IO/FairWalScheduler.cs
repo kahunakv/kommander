@@ -1217,8 +1217,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                     // inserted into the ready-queue.  If the bounded queue is full,
                     // TryAdd returns false; leaving Scheduled=false lets the next
                     // Enqueue call re-schedule the partition rather than stranding it.
+                    // CA1416: BlockingCollection<T>.TryAdd is flagged unsupported on 'browser', but
+                    // the browser targets define KOMMANDER_THREAD_FREE and only run in manual mode
+                    // (the constructor refuses threaded mode), where the collection is used from one thread.
+#pragma warning disable CA1416
                     if (_readyPartitions.TryAdd(pid))
                         state.Scheduled = true;
+#pragma warning restore CA1416
                 }
             }
         }

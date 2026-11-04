@@ -2601,10 +2601,13 @@ public sealed class RaftPartitionStateMachine
         RaftNode? stepDownTarget = SelectStepDownTarget();
         long nowTicks = host.GetMonotonicTimestamp();
 
-        logger.LogCritical(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Storage fail-stop: the engine refuses every write — stepping down in term {CurrentTerm} and notifying {Successor}; this node will not campaign again until it is repaired and restarted. {Reason}",
-            host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm,
-            stepDownTarget?.Endpoint ?? "(no peer)", reason);
+        if (logger.IsEnabled(LogLevel.Critical))
+        {
+            logger.LogCritical(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Storage fail-stop: the engine refuses every write — stepping down in term {CurrentTerm} and notifying {Successor}; this node will not campaign again until it is repaired and restarted. {Reason}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm,
+                stepDownTarget?.Endpoint ?? "(no peer)", reason);
+        }
 
         await DemoteOnLocalStorageFaultAsync(stepDownTarget, currentTime, nowTicks).ConfigureAwait(false);
     }
