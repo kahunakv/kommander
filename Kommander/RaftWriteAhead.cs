@@ -95,6 +95,30 @@ public sealed class RaftWriteAhead
     /// </summary>
     private long restoreCompactionFloor;
 
+    /// <summary>
+    /// The application's durable floor as the provider reported it in Phase 1 (-1 = none / no
+    /// opinion), carried to Phase 2 for the storage verdict.
+    /// </summary>
+    private long restoreDurablyApplied = -1;
+
+    /// <summary>
+    /// Set in Phase 1 when the application's durable floor sits below the backend's compaction floor:
+    /// the entries in (floor, compactionFloor) that the application still needs were compacted, so
+    /// Phase 2 refuses consumer replay (delivering the surviving suffix onto a store missing its
+    /// prefix would corrupt the application's state) and the state machine holds live applies and
+    /// asks the leader for a snapshot — see <see cref="RaftPartitionStorageState.ApplicationFloorBelowCompaction"/>.
+    /// System-coordinator entries are exempt: the coordinator rebuilds from replay and the
+    /// checkpoint snapshot, and the application floor says nothing about them.
+    /// </summary>
+    private bool restoreApplicationFloorBelowCompaction;
+
+    /// <summary>
+    /// What the restore concluded about this partition's storage, for the state machine to act on
+    /// (<see cref="GetRestoreStorageVerdict"/>). <see cref="RaftRestoreStorageVerdict.None"/> until
+    /// Phase 2 has run. Written once on the executor, read once by the state machine right after.
+    /// </summary>
+    private RaftRestoreStorageVerdict restoreStorageVerdict = RaftRestoreStorageVerdict.None;
+
     private long proposeIndex = 1;
 
     private long commitIndex = 1;
@@ -562,6 +586,26 @@ public sealed class RaftWriteAhead
         // redelivered, on every read path (the widened and narrowed reads exclude them by
         // construction; the full reads skip them at delivery).
         restoreDeliveryFloor = durablyApplied;
+        restoreDurablyApplied = durablyApplied;
+
+        // The application needs every committed entry above its floor; the compaction floor says
+        // every id below it is gone. durablyApplied + 1 == compactionFloor is the boundary: the
+        // first entry the application lacks is the first one the WAL still holds. Below that the
+        // WAL cannot supply what the application lacks (its store was wiped, restored from an
+        // older copy, or rolled back — compaction itself is fenced at the provider's floor, so a
+        // monotonic provider never gets here), and replaying the surviving suffix would apply it
+        // onto a store missing its prefix. A floor of -1 is "no opinion" by the provider contract
+        // and is not a claim about the store; a provider for an empty store must answer 0.
+        if (durablyApplied >= 0 && durablyApplied + 1 < restoreCompactionFloor)
+        {
+            restoreApplicationFloorBelowCompaction = true;
+            KommanderMetrics.RecordApplicationFloorBelowCompaction(partition.PartitionId);
+            manager.Logger.LogCritApplicationFloorBelowCompaction(
+                manager.LocalEndpoint, partition.PartitionId, durablyApplied, restoreCompactionFloor,
+                "This replica will not campaign and asks its leader for a whole-partition snapshot, the only repair; "
+                + "it keeps voting, since its Raft log is complete. With no peer to ask (a single-voter partition) it "
+                + "stays unavailable until the application store is restored from a backup.");
+        }
 
         if (softFloorTerm > 0)
         {
@@ -798,6 +842,56 @@ public sealed class RaftWriteAhead
             SeedCommitFrontierFromSnapshot(restoredCheckpoint, Math.Max(checkpointTerm, 0));
         }
 
+        // ── Lost acknowledged entries ─────────────────────────────────────────────────────
+        // The backend persisted, in the same batch as every row write, the contiguous frontier this
+        // node went on to acknowledge to its leader (IWAL.Write, three-argument overload). Every
+        // seed above only raises the reconstructed frontier over certified prefixes, so after them
+        // presentIndex - 1 is the most the disk can attest. A watermark above it means rows this
+        // node promised as durably held — and the leader may have counted toward a commit — are not
+        // here: a synced tail truncated after its fsync, which the engine opens short as if it were a
+        // torn write. Voting from this log could elect a candidate that lacks a committed entry
+        // (Alagappan et al., FAST 2018), so the state machine quarantines the partition from the
+        // verdict below — unless the operator accepted the loss, in which case the watermark is
+        // rewritten to the surviving log so the next restart does not re-flag the same loss.
+        long acknowledgedThrough = walAdapter.GetAcknowledgedPresence(partition.PartitionId);
+        long presentThrough = presentIndex - 1;
+        RaftPartitionStorageState verdictState = RaftPartitionStorageState.Healthy;
+
+        if (acknowledgedThrough > presentThrough)
+        {
+            bool accepted = manager.Configuration.LostAcknowledgedEntriesPolicy == LostAcknowledgedEntriesPolicy.AcceptAndLog;
+            KommanderMetrics.RecordLostAcknowledgedEntries(partition.PartitionId, accepted);
+
+            if (accepted)
+            {
+                manager.Logger.LogCritLostAcknowledgedEntries(
+                    manager.LocalEndpoint, partition.PartitionId, acknowledgedThrough, presentThrough,
+                    "LostAcknowledgedEntriesPolicy is AcceptAndLog: the loss is accepted, the watermark is rewritten to the "
+                    + "surviving log, and the partition runs normally. The acknowledged entries above it are gone on this node.");
+
+                if (!walAdapter.SetAcknowledgedPresence(partition.PartitionId, presentThrough))
+                    manager.Logger.LogWarning(
+                        "[{Endpoint}/{Partition}] Could not rewrite the acknowledged-presence watermark to {Present}; the next restart reports the same loss again",
+                        manager.LocalEndpoint, partition.PartitionId, presentThrough);
+            }
+            else
+            {
+                verdictState = RaftPartitionStorageState.LostAcknowledgedEntries;
+                manager.Logger.LogCritLostAcknowledgedEntries(
+                    manager.LocalEndpoint, partition.PartitionId, acknowledgedThrough, presentThrough,
+                    "This partition will neither vote nor campaign until the leader has replicated past the watermark (or a "
+                    + "snapshot install covers it); it keeps acknowledging what it really holds, so with a replication factor "
+                    + "above one the repair is automatic. A single-voter partition stays leaderless until the operator "
+                    + "restores the data or sets LostAcknowledgedEntriesPolicy to AcceptAndLog.");
+            }
+        }
+        else if (restoreApplicationFloorBelowCompaction)
+            verdictState = RaftPartitionStorageState.ApplicationFloorBelowCompaction;
+
+        restoreStorageVerdict = new RaftRestoreStorageVerdict(
+            verdictState, acknowledgedThrough, presentThrough, restoreDurablyApplied, restoreCompactionFloor,
+            ApplicationReplayRefused: restoreApplicationFloorBelowCompaction);
+
         // ── Seed the durable frontier and the published commit index from the disk ──────────
         // Everything reconstructed above was read from the disk, so it IS the durable state: the
         // durable presence frontier starts at the contiguous present prefix, and the published
@@ -852,6 +946,7 @@ public sealed class RaftWriteAhead
         // no application payload (their state is restored via the snapshot transfer); entries at or above
         // the frontier are deferred to leader re-supply / re-commit.
         long softFloorSkipped = 0;
+        long replayRefused = 0;
 
         foreach (RaftLog log in logs)
         {
@@ -886,6 +981,17 @@ public sealed class RaftWriteAhead
             // must never reach a consumer, on restore or anywhere else.
             if (log.LogType == RaftSystemConfig.LeadershipBarrierLogType)
                 continue;
+
+            // Application floor below the compaction floor (see LoadRestoreLogsAsync): the consumer
+            // is missing entries the WAL no longer holds, so nothing is delivered to it — a suffix
+            // applied onto a store without its prefix is a corrupt store, and only the leader's
+            // snapshot can repair it. Coordinator entries on the system partition still replay.
+            if (restoreApplicationFloorBelowCompaction
+                && !(partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType))
+            {
+                replayRefused++;
+                continue;
+            }
 
             // Soft restore floor: the application durably applied every committed entry at or
             // below the floor, so consumer redelivery is skipped. The narrowed read excludes these
@@ -923,6 +1029,11 @@ public sealed class RaftWriteAhead
         if (softFloorSkipped > 0)
             manager.Logger.LogInfoRestoreSkippedBelowSoftFloor(
                 manager.LocalEndpoint, partition.PartitionId, softFloorSkipped, restoreDeliveryFloor);
+
+        if (replayRefused > 0)
+            manager.Logger.LogWarning(
+                "[{Endpoint}/{Partition}] Restore refused consumer replay of {Count} committed entries: the application floor {DurablyApplied} is below the compaction floor {CompactionFloor}, so the consumer waits for the leader's snapshot",
+                manager.LocalEndpoint, partition.PartitionId, replayRefused, restoreDurablyApplied, restoreCompactionFloor);
 
         if (partition.PartitionId == RaftSystemConfig.SystemPartition)
         {
@@ -1042,7 +1153,8 @@ public sealed class RaftWriteAhead
                 timestamp,
                 term: term,
                 autoCommit: autoCommit,
-                logIndex: proposeIndex
+                logIndex: proposeIndex,
+                acknowledgedPresence: ProjectPresenceAfter(ordered)
             );
 
             try
@@ -1232,12 +1344,15 @@ public sealed class RaftWriteAhead
 
     private WALWriteOperation EnqueueCommitPrepared(List<RaftLog> logs, long lastCommitIndex)
     {
+        // Markers over present rows: the presence frontier does not move, and the batch carries the
+        // frontier as it stands so the watermark is refreshed by every batch, not only by appends.
         WALWriteOperation operation = new(
             onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.LeaderCommit,
             (partition.PartitionId, logs),
-            logIndex: lastCommitIndex
+            logIndex: lastCommitIndex,
+            acknowledgedPresence: presentIndex - 1
         );
 
         manager.WalScheduler.Enqueue(operation);
@@ -1386,7 +1501,8 @@ public sealed class RaftWriteAhead
             onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.LeaderRollback,
-            (partition.PartitionId, logs)
+            (partition.PartitionId, logs),
+            acknowledgedPresence: presentIndex - 1
         );
 
         manager.WalScheduler.Enqueue(operation);
@@ -1582,6 +1698,80 @@ public sealed class RaftWriteAhead
     /// </summary>
     private bool IsHeld(long id) => id < presentIndex || pendingPresent.ContainsKey(id);
 
+    /// <summary>
+    /// The contiguous presence frontier this partition will have once <paramref name="logs"/> and
+    /// everything queued before them have landed — the value every log-carrying WAL operation carries
+    /// as <see cref="WALWriteOperation.AcknowledgedPresence"/>, so the backend can persist what this
+    /// node is about to acknowledge in the same batch as the rows. A dry run of
+    /// <see cref="AdvancePresenceFrontier"/> over the batch, with two deliberate omissions that keep
+    /// it conservative: ids buffered over a gap are not counted (the live drain absorbs them once the
+    /// gap fills; counting them here could claim an id the batch does not make contiguous), and the
+    /// term-inversion guard stops the run exactly where the live path refuses the entry. Never
+    /// exceeds the frontier the live path reaches, so a watermark can never report a loss that did
+    /// not happen; a lower value only narrows what the check can detect, which is the safe error.
+    /// Called before the operation is queued — enqueue can throw, and the live advance runs only
+    /// after it succeeded — so it must not mutate anything. Executor thread, like every reader of
+    /// the presence fields.
+    /// </summary>
+    private long ProjectPresenceAfter(IReadOnlyList<RaftLog> logs)
+    {
+        long next = presentIndex;
+        long nextTerm = presentTerm;
+
+        for (int i = 0; i < logs.Count; i++)
+        {
+            RaftLog log = logs[i];
+
+            if (log.Id < next)
+            {
+                // An overwrite of the frontier entry refreshes the term the next step compares
+                // against, exactly as the live path does.
+                if (log.Id == next - 1)
+                    nextTerm = log.Term;
+                continue;
+            }
+
+            if (log.Id > next)
+                continue;                   // over a gap: buffered live, not counted here
+
+            if (log.Term > 0 && nextTerm > 0 && log.Term < nextTerm)
+                break;                      // the live path refuses this entry (IsTermInverted)
+
+            next = log.Id + 1;
+            nextTerm = log.Term;
+        }
+
+        return next - 1;
+    }
+
+    /// <summary>
+    /// Queues a correction of the persisted acknowledged-presence watermark to <paramref name="value"/>
+    /// after a failed write regressed the presence frontier. Operations queued between the failed
+    /// write and its completion carried a projection that counted the failed range; they land before
+    /// this one in the partition's FIFO, and this one assigns the regressed value behind them. A full
+    /// queue only logs: the hazard is a crash before a later batch records the regressed frontier,
+    /// which would report the failed range as lost acknowledged entries — a liveness cost (a
+    /// quarantine the leader's re-ship lifts), never a safety one.
+    /// </summary>
+    private void EnqueueAcknowledgedPresenceCorrection(long value)
+    {
+        WALWriteOperation operation = new(
+            onComplete,
+            Interlocked.Increment(ref walOperationSequence),
+            WALWriteOperationType.AcknowledgedPresence,
+            (partition.PartitionId, []),
+            metadataValue: value);
+
+        try
+        {
+            manager.WalScheduler.Enqueue(operation);
+        }
+        catch (WAL.IO.BackpressureExceededException ex)
+        {
+            logger.LogWarnAcknowledgedPresenceCorrectionNotQueued(manager.LocalEndpoint, partition.PartitionId, value, ex.Message);
+        }
+    }
+
     private void AdvancePresenceFrontier(long id, long term)
     {
         if (id < presentIndex)
@@ -1709,6 +1899,10 @@ public sealed class RaftWriteAhead
             }
 
             presentTerm = termAtFrontier;
+
+            // Operations queued before this failure was known carried the optimistic frontier into
+            // the persisted acknowledged-presence watermark; put the regressed value behind them.
+            EnqueueAcknowledgedPresenceCorrection(presentIndex - 1);
         }
 
         if (commitRegressed || presenceRegressed)
@@ -2327,6 +2521,19 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// The storage verdict the last restore reached (see <see cref="RaftRestoreStorageVerdict"/>);
+    /// <see cref="RaftRestoreStorageVerdict.None"/> before Phase 2 has run. Read by the state machine
+    /// right after <see cref="CompleteRestoreAsync"/>, on the same executor turn.
+    /// </summary>
+    public RaftRestoreStorageVerdict GetRestoreStorageVerdict() => restoreStorageVerdict;
+
+    /// <summary>
+    /// The backend's fail-stop reason (<see cref="IWAL.GetFailStopReason"/>), or null while it is
+    /// healthy. One volatile read; polled by the state machine's tick.
+    /// </summary>
+    public string? GetStorageFailStopReason() => walAdapter.GetFailStopReason();
+
+    /// <summary>
     /// Reads this partition's persisted hard state, or <see langword="null"/> when none has been written
     /// yet (fresh node or legacy WAL). Used on restore to seed <c>currentTerm</c> and the vote record
     /// instead of inferring the term from the log tail.
@@ -2620,7 +2827,8 @@ public sealed class RaftWriteAhead
             term,
             logIndex: maxLogId,
             truncateFloor: acceptedFloor,
-            requiresSync: requiresSync
+            requiresSync: requiresSync,
+            acknowledgedPresence: ProjectPresenceAfter(logsToWrite)
         );
 
         try

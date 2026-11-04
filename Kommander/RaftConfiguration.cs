@@ -1261,6 +1261,19 @@ public class RaftConfiguration
     public bool AllowLegacySnapshotSenders { get; set; }
 
     /// <summary>
+    /// What a partition does when its WAL restore finds the log shorter than what this node had
+    /// acknowledged as durably held — the persisted acknowledged-presence watermark above the
+    /// contiguous log on disk, the shape a synced tail truncated after its fsync leaves (see
+    /// <see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>). The default,
+    /// <see cref="Kommander.LostAcknowledgedEntriesPolicy.Quarantine"/>, withholds the partition's
+    /// votes and candidacy until the leader has replicated past the watermark, which is automatic with
+    /// a replication factor above one. <see cref="Kommander.LostAcknowledgedEntriesPolicy.AcceptAndLog"/>
+    /// is the operator's way out for a single-voter partition that would otherwise stay leaderless: the
+    /// loss is logged at Critical and accepted. Audited as a disabled safety fence at startup.
+    /// </summary>
+    public LostAcknowledgedEntriesPolicy LostAcknowledgedEntriesPolicy { get; set; } = LostAcknowledgedEntriesPolicy.Quarantine;
+
+    /// <summary>
     /// Upper bound on ONE awaited step of an outbound snapshot transfer: the application export
     /// call, one stream read, one chunk send, or — while the leader waits for the follower to
     /// install what it staged — the time the install may go without reporting progress (the

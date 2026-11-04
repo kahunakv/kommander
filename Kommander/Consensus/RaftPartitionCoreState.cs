@@ -1,3 +1,4 @@
+using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Scheduling;
 using Kommander.Time;
@@ -216,6 +217,113 @@ internal sealed class RaftPartitionCoreState
     /// so a scenario can prove the pre-restore window was actually reached.
     /// </summary>
     public long AppendsAnsweredBeforeRestore;
+
+    // ── Storage integrity ─────────────────────────────────────────────────────────────────
+    // The verdicts a restore or the running engine can reach about this partition's storage, and
+    // what each withholds. Written on the executor (the restore turn, the tick); read by the election
+    // coordinator on every campaign and vote decision and, off-thread, by the health probe — hence
+    // the volatile accessors. A quarantine is never a reason to stop acknowledging what the node
+    // really holds: the acks are truthful, and withholding them would only stop the leader from
+    // repairing this replica.
+
+    private int storageState;
+
+    private long lostAcknowledgedThrough = -1;
+
+    private string? storageFailReason;
+
+    /// <summary>
+    /// This partition's storage verdict; see <see cref="RaftPartitionStorageState"/>. Healthy until a
+    /// restore or the tick says otherwise.
+    /// </summary>
+    public RaftPartitionStorageState StorageState
+    {
+        get => (RaftPartitionStorageState)Volatile.Read(ref storageState);
+        set => Volatile.Write(ref storageState, (int)value);
+    }
+
+    /// <summary>
+    /// For <see cref="RaftPartitionStorageState.LostAcknowledgedEntries"/>: the acknowledged-presence
+    /// watermark the restore found above the log, which the contiguous presence frontier must reach
+    /// again before the quarantine lifts. -1 otherwise.
+    /// </summary>
+    public long LostAcknowledgedThrough
+    {
+        get => Volatile.Read(ref lostAcknowledgedThrough);
+        set => Volatile.Write(ref lostAcknowledgedThrough, value);
+    }
+
+    /// <summary>For <see cref="RaftPartitionStorageState.EngineFailed"/>: the storage engine's message, naming the damaged file.</summary>
+    public string? StorageFailReason
+    {
+        get => Volatile.Read(ref storageFailReason);
+        set => Volatile.Write(ref storageFailReason, value);
+    }
+
+    /// <summary>
+    /// Set while the application-floor repair is outstanding: the restore refused consumer replay
+    /// because the application's durable floor sat below the compaction floor, so committed applies are
+    /// held and the tick asks the leader for a whole-partition snapshot until one installs. Kept apart
+    /// from <see cref="StorageState"/> because the lost-entries verdict takes the state when both hold,
+    /// and the apply hold must outlive that.
+    /// </summary>
+    public volatile bool ApplicationFloorRepairPending;
+
+    /// <summary>
+    /// True while the storage verdict withholds this replica's candidacy (and refuses a leadership
+    /// transfer to it), with the reason for the log line. A lost-entries quarantine lifts the moment the
+    /// contiguous presence frontier reaches the watermark again — judged here from the live frontier,
+    /// so the gate opens on the very tick the repair lands; the tick flips the state and logs it.
+    /// </summary>
+    public bool StorageWithholdsCandidacy(IRaftWalFacade wal, out string reason)
+    {
+        switch (StorageState)
+        {
+            case RaftPartitionStorageState.LostAcknowledgedEntries:
+            {
+                long present = wal.GetPresentIndex();
+                long acknowledged = LostAcknowledgedThrough;
+                if (present >= acknowledged)
+                    break;
+
+                reason = $"the log is contiguous through {present} but this node had acknowledged ids through {acknowledged} as durably held; it must not lead or vote until the leader has replicated past that watermark";
+                return true;
+            }
+
+            case RaftPartitionStorageState.ApplicationFloorBelowCompaction:
+                reason = "the application's durable floor is below the WAL compaction floor; this replica waits for the leader's snapshot and must not lead from an incomplete store";
+                return true;
+
+            case RaftPartitionStorageState.EngineFailed:
+                reason = $"the storage engine fail-stopped: {StorageFailReason}";
+                return true;
+        }
+
+        if (ApplicationFloorRepairPending)
+        {
+            reason = "the application's durable floor is below the WAL compaction floor; this replica waits for the leader's snapshot and must not lead from an incomplete store";
+            return true;
+        }
+
+        reason = "";
+        return false;
+    }
+
+    /// <summary>
+    /// True while the storage verdict denies this replica's votes, real and pre-votes alike (a pre-vote
+    /// grant is a promise to vote). Narrower than <see cref="StorageWithholdsCandidacy"/>: a replica
+    /// whose application floor fell below the compaction floor keeps voting, because its Raft log is
+    /// complete and only its application state is behind — withholding its vote would cost the
+    /// partition a voter for no safety gain.
+    /// </summary>
+    public bool StorageDeniesVote(IRaftWalFacade wal, out string reason)
+    {
+        if (StorageState is RaftPartitionStorageState.LostAcknowledgedEntries or RaftPartitionStorageState.EngineFailed)
+            return StorageWithholdsCandidacy(wal, out reason);
+
+        reason = "";
+        return false;
+    }
 
     /// <summary>
     /// When <see langword="true"/> this partition is quiesced: no per-partition heartbeats are

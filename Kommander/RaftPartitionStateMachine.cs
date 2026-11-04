@@ -591,6 +591,10 @@ public sealed class RaftPartitionStateMachine
 
         await wal.CompleteRestoreAsync(logs).ConfigureAwait(false);
 
+        // The restore reports; this turn decides. Done before the hard state is seeded so a vote request
+        // dispatched right after this turn already meets the quarantine.
+        ApplyRestoreStorageVerdict(wal.GetRestoreStorageVerdict());
+
         long tailTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
         if (tailTerm > coreState.CurrentTerm)
             coreState.CurrentTerm = tailTerm;
@@ -673,6 +677,11 @@ public sealed class RaftPartitionStateMachine
         // campaign (ElectionCoordinator).
         double pendingWriteAgeMs = wal.GetOldestPendingWriteAgeMs();
         logThrottle.ObserveWalStall(pendingWriteAgeMs, host.Configuration.WalStallWarnThreshold, nowTicks);
+
+        // Storage integrity: a fail-stopped engine is polled here (the backend cannot call up into a
+        // partition), a lost-entries quarantine lifts here once the leader has replicated past the
+        // watermark, and an outstanding application-floor repair asks the leader for a snapshot here.
+        await ObserveStorageIntegrityAsync().ConfigureAwait(false);
 
         // Read-index expiry runs in every node state, before any early return (including the
         // leader's quiesced one): on the leader it bounds rounds and chained waiters; on
@@ -2201,6 +2210,14 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // Same for a storage quarantine: the transfer would seat a log that lost acknowledged entries,
+        // a store missing its prefix, or a fail-stopped engine.
+        if (coreState.StorageWithholdsCandidacy(wal, out string storageHold))
+        {
+            logger.LogWarnTransferRefusedStorageQuarantine(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.Endpoint, request.Term, storageHold);
+            return;
+        }
+
         // Membership fence: only the current leader (necessarily a roster member) may hand us
         // leadership; a non-member must not be able to trigger a disruptive election.
         if (!host.IsMember(request.Endpoint))
@@ -2568,6 +2585,38 @@ public sealed class RaftPartitionStateMachine
 
         KommanderMetrics.WalStallStepDownsTotal.Add(1);
 
+        await DemoteOnLocalStorageFaultAsync(stepDownTarget, currentTime, nowTicks).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Storage fail-stop step-down: the engine under this leader's WAL refused every further write on
+    /// a <c>Corruption</c> status (<see cref="IRaftWalFacade.GetStorageFailStopReason"/>). Nothing this
+    /// leader accepts can commit any more, so it yields now, with the step-down notice that cuts the
+    /// failover to a round trip, and the storage quarantine keeps it from campaigning again for the life
+    /// of the process. Same demotion as the stall step-down; only the cause and the log line differ.
+    /// </summary>
+    private async Task StepDownOnStorageFailureAsync(string reason)
+    {
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        RaftNode? stepDownTarget = SelectStepDownTarget();
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        logger.LogCritical(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Storage fail-stop: the engine refuses every write — stepping down in term {CurrentTerm} and notifying {Successor}; this node will not campaign again until it is repaired and restarted. {Reason}",
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm,
+            stepDownTarget?.Endpoint ?? "(no peer)", reason);
+
+        await DemoteOnLocalStorageFaultAsync(stepDownTarget, currentTime, nowTicks).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The demotion shared by the step-downs for a local storage fault (a stalled write, a fail-stopped
+    /// engine): same-term voluntary demotion with the bookkeeping of <see cref="StepDownAsync"/>, every
+    /// waiting caller answered so it re-routes to the successor, and a step-down notice to
+    /// <paramref name="stepDownTarget"/> when there is one.
+    /// </summary>
+    private async Task DemoteOnLocalStorageFaultAsync(RaftNode? stepDownTarget, HLCTimestamp currentTime, long nowTicks)
+    {
         coreState.NodeState = RaftNodeState.Follower;
         host.Leader = "";
         coreState.LastHeartbeat = currentTime;
@@ -2621,19 +2670,171 @@ public sealed class RaftPartitionStateMachine
     {
         RaftResponse response = await snapshotInstaller.InstallSnapshotAsync(request).ConfigureAwait(false);
 
-        // The install this replica asked for landed: its projection is the leader's now, and the
-        // committed entries above the boundary can be delivered again.
-        if (reseedRequestedTicks != 0 && response.SnapshotOutcome == SnapshotInstallOutcome.Installed)
+        if (response.SnapshotOutcome == SnapshotInstallOutcome.Installed)
         {
-            reseedRequestedTicks = 0;
-            reseedRequestedFrom = "";
+            bool resume = false;
 
-            logger.LogWarnReseedComplete(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.SnapshotIndex);
+            // The install this replica asked for landed: its projection is the leader's now, and the
+            // committed entries above the boundary can be delivered again.
+            if (reseedRequestedTicks != 0)
+            {
+                reseedRequestedTicks = 0;
+                reseedRequestedFrom = "";
 
-            await ResumeCommittedAppliesAsync().ConfigureAwait(false);
+                logger.LogWarnReseedComplete(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.SnapshotIndex);
+                resume = true;
+            }
+
+            // Any installed snapshot replaces the application state whole, so it also completes the
+            // application-floor repair — whether this replica asked for it or the leader sent it on
+            // its own. The partition may campaign again.
+            if (coreState.ApplicationFloorRepairPending)
+            {
+                coreState.ApplicationFloorRepairPending = false;
+                if (coreState.StorageState == RaftPartitionStorageState.ApplicationFloorBelowCompaction)
+                    ExitStorageState(RaftPartitionStorageState.ApplicationFloorBelowCompaction);
+
+                logger.LogInfoApplicationFloorRepaired(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.SnapshotIndex);
+                resume = true;
+            }
+
+            if (resume)
+                await ResumeCommittedAppliesAsync().ConfigureAwait(false);
         }
 
         return response;
+    }
+
+    // ── storage integrity ──────────────────────────────────────────────────────────────────────
+    // The consensus consequences of a storage verdict: the restore (RaftWriteAhead) and the engine
+    // (IWAL.GetFailStopReason) report, and these turn the report into a quarantine the election
+    // coordinator enforces (RaftPartitionCoreState.StorageWithholdsCandidacy / StorageDeniesVote),
+    // an apply hold, a snapshot request, or a step-down. All on the executor turn.
+
+    /// <summary>
+    /// Turns the restore's storage verdict into state. A refused consumer replay holds live applies at
+    /// once — the first append after the restore would otherwise deliver onto the incomplete store —
+    /// and arms the snapshot request the tick sends once a leader is known. The lost-entries verdict
+    /// records the watermark the presence frontier must reach again.
+    /// </summary>
+    private void ApplyRestoreStorageVerdict(in RaftRestoreStorageVerdict verdict)
+    {
+        if (verdict.ApplicationReplayRefused)
+        {
+            coreState.ApplicationFloorRepairPending = true;
+            applier.SetConsumerAppliesHeld(true);
+        }
+
+        if (verdict.State == RaftPartitionStorageState.Healthy)
+            return;
+
+        if (verdict.State == RaftPartitionStorageState.LostAcknowledgedEntries)
+            coreState.LostAcknowledgedThrough = verdict.AcknowledgedThrough;
+
+        EnterStorageState(verdict.State);
+    }
+
+    private void EnterStorageState(RaftPartitionStorageState state)
+    {
+        coreState.StorageState = state;
+        KommanderMetrics.RecordStorageQuarantine(host.PartitionId, state, entered: true);
+    }
+
+    private void ExitStorageState(RaftPartitionStorageState state)
+    {
+        coreState.StorageState = RaftPartitionStorageState.Healthy;
+        KommanderMetrics.RecordStorageQuarantine(host.PartitionId, state, entered: false);
+    }
+
+    /// <summary>
+    /// The per-tick storage check (see <see cref="CheckPartitionLeadershipAsync"/>). One volatile read
+    /// in the healthy steady state.
+    /// </summary>
+    private async Task ObserveStorageIntegrityAsync()
+    {
+        // A fail-stopped engine refuses every write: nothing this partition appends, votes or proposes
+        // can become durable. Step down if leading; the quarantine does the rest for the life of the process.
+        if (coreState.StorageState != RaftPartitionStorageState.EngineFailed
+            && wal.GetStorageFailStopReason() is { } failStop)
+        {
+            coreState.StorageFailReason = failStop;
+            EnterStorageState(RaftPartitionStorageState.EngineFailed);
+            logger.LogCritPartitionStorageEngineFailed(host.LocalEndpoint, host.PartitionId, coreState.NodeState, failStop);
+
+            if (coreState.NodeState == RaftNodeState.Leader)
+                await StepDownOnStorageFailureAsync(failStop).ConfigureAwait(false);
+
+            return;
+        }
+
+        if (coreState.StorageState == RaftPartitionStorageState.LostAcknowledgedEntries)
+        {
+            long present = wal.GetPresentIndex();
+            long acknowledged = coreState.LostAcknowledgedThrough;
+
+            // The leader replicated past the watermark (or a snapshot covered it): this log is a prefix
+            // of the leader's again and may vote and lead. The gates already opened on the live frontier;
+            // this flips the state for the health probe and says so once.
+            if (present >= acknowledged)
+            {
+                logger.LogInfoLostAcknowledgedEntriesRepaired(host.LocalEndpoint, host.PartitionId, acknowledged, present);
+                ExitStorageState(RaftPartitionStorageState.LostAcknowledgedEntries);
+                coreState.LostAcknowledgedThrough = -1;
+
+                if (coreState.ApplicationFloorRepairPending)
+                    EnterStorageState(RaftPartitionStorageState.ApplicationFloorBelowCompaction);
+            }
+        }
+
+        // The application-floor repair: ask the leader for a whole-partition snapshot whenever no request
+        // is pending. RequestReseedAsync re-arms the bound; a request that expires without a snapshot
+        // keeps the apply hold (AbandonReseedRequestAsync) and lands here again on the next tick.
+        if (coreState.ApplicationFloorRepairPending
+            && reseedRequestedTicks == 0
+            && coreState.NodeState != RaftNodeState.Leader
+            && !string.IsNullOrEmpty(host.Leader)
+            && host.Leader != host.LocalEndpoint)
+        {
+            await RequestReseedAsync(null).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// This partition's storage verdict for <see cref="IRaft.GetPartitionStorageHealth"/>. Safe from
+    /// any thread: volatile fields and the presence frontier (one aligned long), so the answer may be a
+    /// transition stale but never torn. A lost-entries quarantine that the live frontier has already
+    /// repaired reads Healthy here before the tick has flipped the state.
+    /// </summary>
+    internal RaftPartitionStorageHealth GetStorageHealth()
+    {
+        if (wal.GetStorageFailStopReason() is { } failStop)
+            return new RaftPartitionStorageHealth(RaftPartitionStorageState.EngineFailed, failStop);
+
+        switch (coreState.StorageState)
+        {
+            case RaftPartitionStorageState.EngineFailed:
+                return new RaftPartitionStorageHealth(RaftPartitionStorageState.EngineFailed, coreState.StorageFailReason);
+
+            case RaftPartitionStorageState.LostAcknowledgedEntries:
+            {
+                long present = wal.GetPresentIndex();
+                long acknowledged = coreState.LostAcknowledgedThrough;
+                if (present < acknowledged)
+                    return new RaftPartitionStorageHealth(
+                        RaftPartitionStorageState.LostAcknowledgedEntries,
+                        $"the log is contiguous through {present} but this node had acknowledged ids through {acknowledged}; votes and candidacy are withheld until the leader replicates past the watermark",
+                        AcknowledgedThrough: acknowledged,
+                        PresentThrough: present);
+                break;
+            }
+        }
+
+        if (coreState.ApplicationFloorRepairPending)
+            return new RaftPartitionStorageHealth(
+                RaftPartitionStorageState.ApplicationFloorBelowCompaction,
+                "the application's durable floor is below the WAL compaction floor; consumer applies are held and the leader is asked for a snapshot");
+
+        return RaftPartitionStorageHealth.Healthy;
     }
 
     // ── re-seed: follower side ─────────────────────────────────────────────────────────────────
@@ -2700,11 +2901,22 @@ public sealed class RaftPartitionStateMachine
         return Task.CompletedTask;
     }
 
-    /// <summary>Drops a pending re-seed request and resumes committed applies where the hold froze them.</summary>
+    /// <summary>
+    /// Drops a pending re-seed request and resumes committed applies where the hold froze them — unless
+    /// the request was the application-floor repair, whose applies must stay held: the store is missing
+    /// entries the WAL no longer holds, and resuming would apply a suffix onto it. The tick repeats the
+    /// request instead.
+    /// </summary>
     private async Task AbandonReseedRequestAsync(string reason)
     {
         reseedRequestedTicks = 0;
         reseedRequestedFrom = "";
+
+        if (coreState.ApplicationFloorRepairPending)
+        {
+            logger.LogWarnStorageReseedRepeated(host.LocalEndpoint, host.PartitionId, coreState.NodeState, reason);
+            return;
+        }
 
         logger.LogWarnReseedExpiredOnFollower(
             host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.Configuration.ReseedRequestTimeout,

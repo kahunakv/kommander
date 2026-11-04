@@ -23,11 +23,12 @@ the idea up first, then walk the real flows, the configuration, and the code.
 10. [Why the fast path is safe](#why-the-fast-path-is-safe)
 11. [Configuration](#configuration)
 12. [Full disk (ENOSPC) and how the WAL recovers](#full-disk-enospc-and-how-the-wal-recovers)
-13. [Observability](#observability)
-14. [Code map](#code-map)
-15. [Invariants you must not break](#invariants-you-must-not-break)
-16. [Testing](#testing)
-17. [Glossary](#glossary)
+13. [Storage corruption and lost writes](#storage-corruption-and-lost-writes)
+14. [Observability](#observability)
+15. [Code map](#code-map)
+16. [Invariants you must not break](#invariants-you-must-not-break)
+17. [Testing](#testing)
+18. [Glossary](#glossary)
 
 ---
 
@@ -415,6 +416,119 @@ write-path failure retries the reopen.
 
 The library never stops the host process on its own. A deployment that prefers to fail fast after a
 bounded window should watch the metric and the `Warning` cadence and act from outside.
+
+---
+
+## Storage corruption and lost writes
+
+A full disk is transient; damage is not. This section covers what the RocksDB backend and the Raft
+layer do when the storage under them lies: a synced record that is gone after a restart, a block
+whose checksum no longer matches, an application store that was wiped or restored from an older copy
+under an intact WAL. The rule throughout is the one from protocol-aware recovery (Alagappan et al.,
+FAST 2018): a replica that cannot prove it still holds what it promised must not vote or lead from
+what it has, and must say so where an operator and the host's readiness probe can see it.
+
+### The term and the vote are fsynced
+
+`IWAL.PersistHardState` is written with the backend's sync write options (`RocksDbWAL.SetMetaDataCore`).
+It used to ride the next log fsync, so a granted vote could reach the candidate and not the disk: after
+a power loss the node would grant a second candidate the same term, and two leaders could commit
+conflicting entries in it. Elections are rare, so one fsync per vote costs nothing measurable.
+
+### What the engine already refuses
+
+RocksDB verifies a checksum on every block it reads and every log record it replays, and the WAL opens
+with `paranoid_checks`, `verify_sst_unique_id_in_manifest` and now `track_and_verify_wals_in_manifest`.
+That last option records each **closed** write-ahead log's number and synced size in the MANIFEST: a
+closed log that is missing or shorter than recorded fails the open instead of replaying short. The live
+log is deliberately not tracked by RocksDB, which is the gap the watermark below closes.
+
+Two corrections to common assumptions:
+
+- `TolerateCorruptedTailRecords` tolerates a **truncated** tail only — a record header or body cut off
+  by the end of the file, the residue of a torn write. A checksum mismatch anywhere in the file, the last
+  record included, is reported as corruption and fails the open in this mode too. RocksDB's own default
+  is `kPointInTimeRecovery`; the mode here is the one whose tolerance matches exactly what a crash can
+  leave.
+- An iterator that reaches a damaged block does **not** throw: it becomes invalid and parks the
+  `Corruption` status on itself. A scan that only tested `Valid()` returned a short result as if the log
+  ended there, so a restore could read an empty log from a damaged SST and treat it as a fresh
+  partition. Every scan in `RocksDbWAL` now ends through `IteratorEnded`, which rethrows a parked error.
+
+### The acknowledged-presence watermark
+
+The one shape the engine cannot tell from a torn write is a file truncated **after** its fsync: the
+engine opens short, and the node would believe its shorter log. With `syncWrites` an acknowledged entry
+is fsynced, so the Raft layer knows exactly what it promised: the contiguous presence frontier it reports
+in every ack.
+
+Every log-carrying WAL operation therefore carries `WALWriteOperation.AcknowledgedPresence`, the
+frontier the partition will have once that batch and everything queued before it have landed
+(`RaftWriteAhead.ProjectPresenceAfter`, a conservative dry run of the live frontier advance). The
+scheduler folds it per partition in submission order and hands it to
+`IWAL.Write(logs, sync, acknowledgedPresence)`; `RocksDbWAL` stages it into the **same `WriteBatch`**
+as the rows, under the key `raft_acked_presence_p{partition}`. It costs no fsync of its own, and "the
+rows are durable" and "this node claimed them" become true in one atomic step.
+
+Three rules keep it honest:
+
+- It is **assigned**, never maximised. Within a partition's FIFO it only rises — except after a failed
+  write, when `RegressFrontiersAfterFailedWriteAsync` queues a `WALWriteOperationType.AcknowledgedPresence`
+  correction that lands behind any operation that still carried the optimistic frontier.
+- Every path that removes rows **clamps** it in the same batch: `TruncateLogsAfter` and the proposed-only
+  sweep to the cut, a truncating snapshot install to the boundary (a retained one raises it to the
+  boundary), `DeletePartitionWAL` removes it.
+- The projection never counts an id buffered over a gap, so the watermark never exceeds what the node
+  really holds once the batch lands. A low watermark narrows what the check can detect; a high one would
+  report a loss that never happened, and that is the error the design rules out.
+
+On restore, after every frontier seed (checkpoint, compaction floor, soft floor), `CompleteRestoreAsync`
+compares the watermark with the reconstructed contiguous frontier. A watermark above it means rows this
+node promised — and the leader may have counted toward a commit — are gone.
+
+### Quarantine, not silence
+
+The restore reports a `RaftRestoreStorageVerdict`; the state machine turns it into one of the
+`RaftPartitionStorageState` values, which `IRaft.GetPartitionStorageHealth` exposes for the host's
+readiness probe:
+
+| State | What happened | What the partition withholds | How it ends |
+|---|---|---|---|
+| `LostAcknowledgedEntries` | Watermark above the restored frontier | Votes, pre-votes, candidacy, leadership transfers. Acks continue: they are truthful. | On its own, once the leader has replicated past the watermark (or a snapshot covers it). A single-voter partition stays leaderless until the operator restores the data or sets `LostAcknowledgedEntriesPolicy.AcceptAndLog`, which logs the lost range at `Critical`, rewrites the watermark to the surviving log, and is audited as a disabled safety fence at startup. |
+| `ApplicationFloorBelowCompaction` | `IApplicationDurabilityProvider` reports a floor with `floor + 1 < compactionFloor`: the entries the application still needs were compacted (its store was wiped, restored, or rolled back) | Consumer replay and live applies (a suffix applied onto a store without its prefix is a corrupt store), candidacy, transfers. It keeps voting: its Raft log is complete. | The tick asks the leader for a whole-partition snapshot (`RequestReseedAsync`) and repeats the request until one installs; any installed snapshot clears it. A provider floor of `-1` is "no opinion" by contract and does not trigger this; a provider for an empty store must report `0`. |
+| `EngineFailed` | The engine fail-stopped on a `Corruption` status | Everything: a leader steps down with a step-down notice, and the partition neither votes, campaigns nor acknowledges | Never, for this process. The operator moves the damaged directory aside and the node rebuilds from its peers. |
+| `RestoreFailed` | The WAL restore threw and the executor stopped the partition | Everything (the partition is not running) | Operator. |
+
+The gates live in `RaftPartitionCoreState.StorageWithholdsCandidacy` and `StorageDeniesVote`, read by
+`ElectionCoordinator` on every campaign entry and vote decision; a real vote is denied **after** the
+higher term is adopted, so a deposed leader's appends stay fenced.
+
+### Fail-stop on `Corruption`
+
+The ENOSPC recovery used to reopen the engine on any `RocksDbException`. A `Corruption` status — a
+compaction that read a damaged SST, a probe that hit a bad block — latched the same way, the reopen
+succeeded (the open verifies sizes and identities, not every block), the next compaction hit the damage
+again, and the WAL looped every probe interval with only `Warning` lines.
+
+`RocksDbWAL` now classifies the failure by the status prefix the C API exposes (`"Corruption:"`, the
+one place error text is parsed) and **fail-stops**: `TryRecoverEngineAfterFailure` neither probes nor
+reopens, every write-path entry point fails fast through `AcquireEngineForWrite`, a `Corruption` seen on
+a read latches too, and reads of intact blocks keep serving (every block RocksDB returns is verified).
+An open that fails on `Corruption` logs at `Critical` and throws: the node does not start on partial
+data. `IWAL.GetFailStopReason` carries the engine's message, which names the damaged file; the state
+machine polls it on its tick and moves the partition to `EngineFailed`.
+
+### What an operator sees
+
+- `Critical` — `Restore found acknowledged entries missing: … acknowledged ids through A … contiguous only through P …`
+- `Critical` — `The application's durable floor F is below the WAL compaction floor C …`
+- `Critical` — `RocksDB WAL at '…' fail-stopped on a storage corruption …` / `… refused to open …`
+- `Warning`, at most every 30 s per partition — `Storage quarantine holds this replica's candidacy …` /
+  `… denies vote to …`
+- `Information` — `Lost acknowledged entries repaired …` / `Application floor repaired …`
+- Metrics: `raft.storage.lost_acknowledged_entries_total{outcome=quarantined|accepted}`,
+  `raft.storage.application_floor_below_compaction_total`,
+  `raft.storage.quarantine_transitions_total{state,direction}`, `raft.wal.engine_fail_stops_total`.
 
 ---
 

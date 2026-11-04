@@ -2403,6 +2403,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         partitions.TryGetValue(partitionId, out RaftPartition? partition) ? partition.Term : -1;
 
     /// <inheritdoc/>
+    public RaftPartitionStorageHealth? GetPartitionStorageHealth(int partitionId) =>
+        TryGetPartition(partitionId, out RaftPartition? partition) ? partition!.GetStorageHealth() : null;
+
+    /// <inheritdoc/>
     public double GetPartitionLogOpsPerSecond(int partitionId) =>
         loadReportService.GetPartitionLogOpsPerSecond(partitionId);
 

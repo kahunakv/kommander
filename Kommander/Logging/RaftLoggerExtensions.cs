@@ -477,6 +477,48 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' could not be reopened after a storage failure; every operation fails until a later write retries the reopen: {Message}")]
     public static partial void LogCritRocksDbWalReopenFailed(this ILogger<IRaft> logger, string path, string message);
 
+    // ── Storage corruption and lost writes ─────────────────────────────────
+    // One Critical line per verdict, naming the evidence an operator needs (the engine's message,
+    // which names the damaged file; the watermark and frontier; the two floors) and the consequence.
+    // The repeated conditions below them (candidacy held, votes denied) are rate-limited by their
+    // callers so a quarantined partition explains itself without flooding the log.
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' refused to open: the storage engine reported corruption, and the node must not start on partial data. Move the directory aside so the node rebuilds from its peers (never repair it in place): {Message}")]
+    public static partial void LogCritRocksDbWalOpenCorruption(this ILogger<IRaft> logger, string path, string message);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' fail-stopped on a storage corruption: every write is refused and the engine is not reopened; the partitions on it step down and stop voting and acknowledging. Repair is operational — move the damaged directory aside and let the node rebuild from its peers: {Message}")]
+    public static partial void LogCritRocksDbWalCorruptionFailStop(this ILogger<IRaft> logger, string path, string message);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}] Restore found acknowledged entries missing: this node had acknowledged ids through {AcknowledgedThrough} as durably held, but the log on disk is contiguous only through {PresentThrough} (a synced tail truncated or lost after its fsync; RocksDB opens such a file short). {Consequence}")]
+    public static partial void LogCritLostAcknowledgedEntries(this ILogger<IRaft> logger, string endpoint, int partition, long acknowledgedThrough, long presentThrough, string consequence);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Lost acknowledged entries repaired: the log is contiguous through {PresentThrough}, past the acknowledged watermark {AcknowledgedThrough}; this partition votes and campaigns again")]
+    public static partial void LogInfoLostAcknowledgedEntriesRepaired(this ILogger<IRaft> logger, string endpoint, int partition, long acknowledgedThrough, long presentThrough);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}] The application's durable floor {DurablyApplied} is below the WAL compaction floor {CompactionFloor}: the entries in ({DurablyApplied}, {CompactionFloor}) that the application still needs were compacted — its store was wiped, restored from an older copy or rolled back. Consumer replay is refused and live applies are held. {Consequence}")]
+    public static partial void LogCritApplicationFloorBelowCompaction(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long compactionFloor, string consequence);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}/{State}] Application floor repaired: the leader's snapshot installed at index {Index} replaced the application state; committed applies resume and this replica may campaign again")]
+    public static partial void LogInfoApplicationFloorRepaired(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, long index);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}/{State}] Re-seed request for the application-floor repair ended without a snapshot ({Reason}); committed applies stay held and the request is repeated on the next tick")]
+    public static partial void LogWarnStorageReseedRepeated(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string reason);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}/{State}] The storage engine fail-stopped: this partition steps down if it leads and will neither vote, campaign nor acknowledge until the node is repaired and restarted. {Reason}")]
+    public static partial void LogCritPartitionStorageEngineFailed(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}/{State}] Storage quarantine holds this replica's candidacy: {Reason}")]
+    public static partial void LogWarnStorageQuarantineHoldsCandidacy(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}/{State}] Storage quarantine denies {Kind} to {Candidate} Term={Term}: {Reason}")]
+    public static partial void LogWarnStorageQuarantineDeniesVote(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string kind, string candidate, long term, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}/{State}] Ignoring TransferLeadership from {Candidate} Term={Term}: storage quarantine withholds this replica's candidacy ({Reason})")]
+    public static partial void LogWarnTransferRefusedStorageQuarantine(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string candidate, long term, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Could not queue the acknowledged-presence correction to {Value} after a failed WAL write ({Message}); until a later batch records the regressed frontier, a crash would report the failed range as lost acknowledged entries")]
+    public static partial void LogWarnAcknowledgedPresenceCorrectionNotQueued(this ILogger<IRaft> logger, string endpoint, int partition, long value, string message);
+
     // ── Re-seed requests and withheld candidacy ────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed requested from leader {Leader}: committed applies are held at applied index {Applied} until the leader's snapshot installs (bound {Timeout})")]

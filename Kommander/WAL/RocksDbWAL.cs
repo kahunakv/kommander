@@ -328,20 +328,38 @@ public class RocksDbWAL : IWAL, IDisposable
             // single SIGKILL into a permanently unopenable data directory — the node crash-loops,
             // stays a voter that never returns, and the next fault takes the cluster below quorum.
             //
-            // TolerateCorruptedTailRecords (RocksDB's own default) drops that record and opens.
-            // Dropping it loses nothing that was promised: with syncWrites the fsync completes
-            // before the caller is acknowledged, so a record that is short was never acknowledged.
-            // Restore then rebuilds commitIndex from the contiguous committed prefix and the leader
-            // re-supplies the rest — the input this mode hands it is exactly what that path expects.
-            // With syncWrites off there is no such guarantee, but that configuration already accepts
-            // the loss of writes the operating system had not flushed, and a WAL that cannot open at
-            // all is the worse outcome there too.
+            // TolerateCorruptedTailRecords drops that record and opens. (RocksDB's own default is
+            // kPointInTimeRecovery, which also stops at a torn tail but reports a truncated header as
+            // a corruption that higher layers then have to prove harmless; this mode is the one whose
+            // tolerance matches exactly what a crash can leave.) Dropping the record loses nothing
+            // that was promised: with syncWrites the fsync completes before the caller is
+            // acknowledged, so a record that is short was never acknowledged. Restore then rebuilds
+            // commitIndex from the contiguous committed prefix and the leader re-supplies the rest —
+            // the input this mode hands it is exactly what that path expects. With syncWrites off
+            // there is no such guarantee, but that configuration already accepts the loss of writes
+            // the operating system had not flushed, and a WAL that cannot open at all is the worse
+            // outcome there too.
             //
-            // This is not a blanket "ignore corruption". A short body can only occur at the end of
-            // the file. A checksum mismatch with whole records after it is real damage, and RocksDB
-            // still refuses to open on it in this mode. Recovery.SkipAnyCorruptedRecords is the mode
-            // that would swallow that, and it is not used here.
+            // This is not a blanket "ignore corruption". What the mode tolerates is a TRUNCATED tail:
+            // a record header or body cut short by the end of the file. A checksum mismatch — a bit
+            // flip, a shuffled block — anywhere in the file, the last record included, is reported as
+            // corruption and the open fails in this mode too (log_reader.cc reports kBadRecordChecksum
+            // unconditionally for non-recycled logs; Recovery.SkipAnyCorruptedRecords is the mode that
+            // would swallow it, and it is not used here). The one case the mode cannot tell from a torn
+            // write is a file truncated AFTER its fsync: the engine opens short and the node would
+            // believe its shorter log. That is what the acknowledged-presence watermark is for (see
+            // IWAL.Write's three-argument overload): a restore whose contiguous frontier falls below
+            // what this node acknowledged quarantines the partition instead of voting from it.
             .SetWalRecoveryMode(Recovery.TolerateCorruptedTailRecords);
+
+        // Record the number and synced size of every closed write-ahead log in the MANIFEST and verify
+        // them at open: a log file that is missing, or shorter than the size it was synced at, fails the
+        // open with a Corruption status instead of replaying short and silently losing the rows it held.
+        // Only CLOSED logs are tracked (RocksDB does not record the live log's synced size, for
+        // performance), so the active log's tail is covered by the acknowledged-presence watermark
+        // above, not by this. Enabling it on an existing directory is safe: tracking starts with the
+        // next log the engine closes, and untracked logs are simply not verified.
+        Native.Instance.rocksdb_options_set_track_and_verify_wals_in_manifest(dbOptions.Handle, 1);
 
         // Bound on the alive write-ahead logs. Without it a column family that never fills its
         // memtable (a trickle shard) pins every log written after its first unflushed row until
@@ -426,7 +444,22 @@ public class RocksDbWAL : IWAL, IDisposable
         this.columnFamilies = columnFamilies;
         enginePath = completePath;
 
-        db = RocksDb.Open(dbOptions, completePath, columnFamilies);
+        try
+        {
+            db = RocksDb.Open(dbOptions, completePath, columnFamilies);
+        }
+        catch (Exception ex) when (IsCorruption(ex))
+        {
+            // The open found damage the engine's own checks catch — a block checksum that does not
+            // match, an SST shorter than the MANIFEST recorded, a closed write-ahead log that is
+            // missing or short. Nothing here may be repaired in place: the node refuses to start on
+            // partial data, and the message names the file so the operator can move the directory
+            // aside and let the node rebuild from its peers. One Critical line, then the exception the
+            // host already treats as a failed start.
+            KommanderMetrics.RecordWalEngineFailStop();
+            logger.LogCritRocksDbWalOpenCorruption(completePath, ex.Message);
+            throw;
+        }
 
         metadataColumnFamily = db.GetColumnFamily("metadata");
 
@@ -525,6 +558,25 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>Number of successful engine reopens performed by recovery. Exposed for tests.</summary>
     internal int EngineReopenCount { get; private set; }
+
+    /// <summary>
+    /// The <c>Corruption</c> failure this engine fail-stopped on, or <see langword="null"/> while it
+    /// is healthy. Set exactly once (compare-exchange from null) by <see cref="LatchCorruption"/> and
+    /// never cleared: a damaged SST or log file is not something a reopen repairs — the ENOSPC
+    /// recovery reopened on it, hit the damage again on the next compaction, and looped every probe
+    /// interval with only Warning lines. While set, every write-path entry point fails fast through
+    /// <see cref="AcquireEngineForWrite"/> and <see cref="TryRecoverEngineAfterFailure"/> refuses to
+    /// probe or reopen; reads of intact blocks keep working (RocksDB verifies every block it returns).
+    /// </summary>
+    private Exception? corruptionFailure;
+
+    /// <summary>
+    /// For tests: metadata puts this instance issued with its synchronous write options — the
+    /// hard-state (term, vote) and HLC-floor writes. Pins that a vote is fsynced before its reply leaves.
+    /// </summary>
+    internal long SyncMetadataWrites => Interlocked.Read(ref syncMetadataWrites);
+
+    private long syncMetadataWrites;
 
     /// <summary>Message of the most recent write-path failure, or <see langword="null"/>. Exposed for tests.</summary>
     internal string? LastStorageFailureMessage => Volatile.Read(ref lastStorageFailure)?.Message;
@@ -653,6 +705,19 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         Exception? failure = Volatile.Read(ref lastStorageFailure);
 
+        // Fail-stopped: a Corruption status is damage, not a transient fault. Probing the filesystem
+        // would pass, the reopen would succeed (the open verifies sizes and identities, not every
+        // block), and the next compaction or read would hit the same damaged block — the loop the
+        // ENOSPC recovery turned into when it classified every RocksDbException the same way.
+        if (Volatile.Read(ref corruptionFailure) is not null)
+            return false;
+
+        if (IsCorruption(failure))
+        {
+            LatchCorruption(failure!);
+            return false;
+        }
+
         // A managed exception (a bug, an invalid argument) is not a storage fault; reopening the engine
         // for it would hide the bug behind a recovery log line. A closed engine always qualifies.
         if (failure is not RocksDbException && !engineClosed)
@@ -760,6 +825,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // what was replayed.
             commitFrontierCache.Clear();
             compactionFloorCache.Clear();
+            ackedPresenceCache.Clear();
             maxLogCache.Clear();
 
             try
@@ -791,11 +857,89 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             KommanderMetrics.RecordWalEngineReopen(succeeded: false);
 
-            logger.LogCritRocksDbWalReopenFailed(enginePath, ex.Message);
+            // An open that fails on Corruption fails the same way every time; stop retrying it.
+            if (IsCorruption(ex))
+                LatchCorruption(ex);
+            else
+                logger.LogCritRocksDbWalReopenFailed(enginePath, ex.Message);
 
             return false;
         }
     }
+
+    // ── Fail-stop on Corruption ───────────────────────────────────────────────────────────────────
+    //
+    // RocksDB reports a damaged block, SST or log file as a Status whose code is Corruption. The C API
+    // exposes a status to managed code only as its string, and Status::ToString() always begins with
+    // the code's name followed by ": " ("Corruption: block checksum mismatch: ..."), so the prefix is
+    // the one classification available through the binding. It is checked with an ordinal prefix
+    // match and nowhere else — the ENOSPC recovery above deliberately parses nothing, and this is the
+    // single exception, kept to one method.
+    //
+    // What fail-stop means here: writes fail fast without touching the engine (AcquireEngineForWrite),
+    // the recovery path neither probes nor reopens, and reads keep working because every block RocksDB
+    // returns is checksum-verified — a read that reaches damage throws its own Corruption, which also
+    // latches. The Raft layer sees the latch through IWAL.GetFailStopReason on its tick: a partition
+    // on this engine steps down if it leads and neither votes, campaigns nor acknowledges. The latch
+    // is per process; the repair is the operator's (move the directory aside, let the node rebuild).
+
+    /// <summary>True when <paramref name="ex"/> is a storage-engine failure whose status code is <c>Corruption</c>.</summary>
+    private static bool IsCorruption(Exception? ex) =>
+        ex is RocksDbException or RocksDbSharpException
+        && ex.Message.StartsWith("Corruption:", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Records the fail-stop once (the first <c>Corruption</c> wins; later ones are the same damage seen
+    /// again) with one Critical line naming the engine directory and the engine's message, which names
+    /// the damaged file. Idempotent and lock-free, so it is safe from any read or write path.
+    /// </summary>
+    private void LatchCorruption(Exception failure)
+    {
+        if (Interlocked.CompareExchange(ref corruptionFailure, failure, null) is not null)
+            return;
+
+        KommanderMetrics.RecordWalEngineFailStop();
+        logger.LogCritRocksDbWalCorruptionFailStop(enginePath, failure.Message);
+    }
+
+    /// <summary>
+    /// Exception filter for the read entry points: latches a <c>Corruption</c> seen on a read and
+    /// returns <see langword="false"/>, so the exception propagates to the caller unchanged (the
+    /// handler never runs, the stack is not reset). A read that reached damage is the same evidence a
+    /// write would be; letting it pass unobserved left the engine serving writes over a file it had
+    /// just proven damaged.
+    /// </summary>
+    private bool LatchIfCorruption(Exception ex)
+    {
+        if (IsCorruption(ex))
+            LatchCorruption(ex);
+
+        return false;
+    }
+
+    /// <summary>
+    /// The write-path twin of <see cref="AcquireEngine"/>: additionally refuses the lease while the
+    /// engine is fail-stopped on <c>Corruption</c>. Thrown as a <see cref="RaftException"/> so the
+    /// write cores, which catch every exception, report <see cref="RaftOperationStatus.Errored"/>
+    /// without touching the engine; the sustained-failure log then names the latch at its own cadence.
+    /// </summary>
+    private EngineLease AcquireEngineForWrite()
+    {
+        Exception? corruption = Volatile.Read(ref corruptionFailure);
+        if (corruption is not null)
+        {
+            throw new RaftException(
+                $"RocksDB WAL at '{enginePath}' is fail-stopped on a storage corruption and refuses writes: {corruption.Message}");
+        }
+
+        return AcquireEngine();
+    }
+
+    /// <inheritdoc/>
+    string? IWAL.GetFailStopReason() => Volatile.Read(ref corruptionFailure)?.Message;
+
+    /// <summary>Test-visible fail-stop reason, mirroring <see cref="IWAL.GetFailStopReason"/>.</summary>
+    internal string? FailStopReason => Volatile.Read(ref corruptionFailure)?.Message;
 
     /// <summary>
     /// Bytes/second RocksDB is currently throttling writers to, or 0 when no slowdown is active.
@@ -1116,52 +1260,59 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public List<RaftLog> ReadLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-
-        List<RaftLog> result = [];
-
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-        // O(1) point lookup — the replay floor is persisted in the metadata CF and kept in sync with every
-        // checkpoint write, so restore no longer pays a reverse scan of the post-checkpoint tail.
-        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
-
-        long commitFrontier = GetCommitFrontier(partitionId);
-
-        // Bounded at the partition so the step past its last row stops there, even when a run of
-        // tombstones (a truncated suffix) lies beyond it. Async I/O: restore replays the whole tail.
-        using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
-        Iterator iterator = bounded.Iterator!;
-
-        // Rows below the compaction floor are logically deleted even where they are still physically
-        // present (the floor layout reclaims whole files, not rows), so the read starts at the floor.
-        long startLogId = Math.Max(Math.Max(0, lastCheckpoint), GetCompactionFloor(partitionId));
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, startLogId);
-        iterator.Seek(seekKey);
-
-        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(partitionPrefix, partitionId);
-
-        while (iterator.Valid())
+        try
         {
-            if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
-                break;
+            using EngineLease lease = AcquireEngine();
 
-            ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
+            List<RaftLog> result = [];
 
-            if (view.Partition != partitionId || view.Id < lastCheckpoint)
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            // O(1) point lookup — the replay floor is persisted in the metadata CF and kept in sync with every
+            // checkpoint write, so restore no longer pays a reverse scan of the post-checkpoint tail.
+            long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
+
+            long commitFrontier = GetCommitFrontier(partitionId);
+
+            // Bounded at the partition so the step past its last row stops there, even when a run of
+            // tombstones (a truncated suffix) lies beyond it. Async I/O: restore replays the whole tail.
+            using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
+            Iterator iterator = bounded.Iterator!;
+
+            // Rows below the compaction floor are logically deleted even where they are still physically
+            // present (the floor layout reclaims whole files, not rows), so the read starts at the floor.
+            long startLogId = Math.Max(Math.Max(0, lastCheckpoint), GetCompactionFloor(partitionId));
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, startLogId);
+            iterator.Seek(seekKey);
+
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
+            while (!IteratorEnded(iterator))
             {
+                if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
+                    break;
+
+                ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
+
+                if (view.Partition != partitionId || view.Id < lastCheckpoint)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                result.Add(ToRaftLog(view, commitFrontier));
+
                 iterator.Next();
-                continue;
             }
 
-            result.Add(ToRaftLog(view, commitFrontier));
-
-            iterator.Next();
+            return result;
         }
-
-        return result;
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -1179,62 +1330,69 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
-        using EngineLease lease = AcquireEngine();
-
-        // Presize when the caller supplied a sane bound (the common case: a bounded backfill batch),
-        // so a full batch does not walk the doubling sequence. An unbounded/absurd limit falls back
-        // to the default growth rather than reserving for entries that may not exist.
-        List<RaftLog> result = maxEntries is > 0 and <= 1024 ? new(maxEntries) : [];
-
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-        long commitFrontier = GetCommitFrontier(partitionId);
-
-        // Bounded at the partition (see ReadLogs). Async I/O: a backfill batch usually reads a lagging
-        // follower's range, which is often cold in SST files rather than in the memtable.
-        using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
-        Iterator iterator = bounded.Iterator!;
-
-        // Clamped at the compaction floor: a backfill request for ids below it reads exactly what
-        // it read when those rows were physically deleted — nothing — so the caller's
-        // "compacted, needs a snapshot" decision is unchanged by the floor layout.
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, startLogIndex), GetCompactionFloor(partitionId)));
-        iterator.Seek(seekKey);
-
-        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(partitionPrefix, partitionId);
-
-        long payloadBytes = 0;
-
-        while (iterator.Valid())
+        try
         {
-            if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
-                break;
+            using EngineLease lease = AcquireEngine();
 
-            ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
+            // Presize when the caller supplied a sane bound (the common case: a bounded backfill batch),
+            // so a full batch does not walk the doubling sequence. An unbounded/absurd limit falls back
+            // to the default growth rather than reserving for entries that may not exist.
+            List<RaftLog> result = maxEntries is > 0 and <= 1024 ? new(maxEntries) : [];
 
-            if (view.Partition != partitionId || view.Id < startLogIndex)
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            long commitFrontier = GetCommitFrontier(partitionId);
+
+            // Bounded at the partition (see ReadLogs). Async I/O: a backfill batch usually reads a lagging
+            // follower's range, which is often cold in SST files rather than in the memtable.
+            using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
+            Iterator iterator = bounded.Iterator!;
+
+            // Clamped at the compaction floor: a backfill request for ids below it reads exactly what
+            // it read when those rows were physically deleted — nothing — so the caller's
+            // "compacted, needs a snapshot" decision is unchanged by the floor layout.
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, startLogIndex), GetCompactionFloor(partitionId)));
+            iterator.Seek(seekKey);
+
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
+            long payloadBytes = 0;
+
+            while (!IteratorEnded(iterator))
             {
+                if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
+                    break;
+
+                ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
+
+                if (view.Partition != partitionId || view.Id < startLogIndex)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                // At-least-one-entry rule: the budget stops a batch, never the first entry —
+                // an entry larger than the whole budget must still ship or the follower stalls.
+                if (result.Count > 0 && payloadBytes + view.Log.Length > maxBytes)
+                    break;
+
+                payloadBytes += view.Log.Length;
+                result.Add(ToRaftLog(view, commitFrontier));
+
                 iterator.Next();
-                continue;
+
+                if (result.Count >= maxEntries)
+                    break;
             }
 
-            // At-least-one-entry rule: the budget stops a batch, never the first entry —
-            // an entry larger than the whole budget must still ship or the follower stalls.
-            if (result.Count > 0 && payloadBytes + view.Log.Length > maxBytes)
-                break;
-
-            payloadBytes += view.Log.Length;
-            result.Add(ToRaftLog(view, commitFrontier));
-
-            iterator.Next();
-
-            if (result.Count >= maxEntries)
-                break;
+            return result;
         }
-
-        return result;
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -1259,12 +1417,20 @@ public class RocksDbWAL : IWAL, IDisposable
     /// making prior sync-off writes durable. When this instance was constructed with <c>syncWrites=false</c>
     /// every write is already non-sync, so <paramref name="sync"/> has no additional effect.
     /// </remarks>
-    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync) => Write(logs, sync, acknowledgedPresence: null);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The acknowledged-presence watermarks are staged into the same <see cref="WriteBatch"/> as the
+    /// rows (and the frontier and checkpoint puts), so they land atomically with the entries they
+    /// describe and cost no write of their own. See the persisted acknowledged-presence region.
+    /// </remarks>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
-        RaftOperationStatus status = WriteCore(logs, sync);
+        RaftOperationStatus status = WriteCore(logs, sync, acknowledgedPresence);
 
         if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
-            status = WriteCore(logs, sync);
+            status = WriteCore(logs, sync, acknowledgedPresence);
 
         if (status == RaftOperationStatus.Success)
             NoteStorageSuccess();
@@ -1277,7 +1443,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// lease. Never reopens the engine itself: a failure is recorded and reported as Errored, and the
     /// public wrapper decides about recovery after the lease is released.
     /// </summary>
-    private RaftOperationStatus WriteCore(List<(int, List<RaftLog>)> logs, bool sync)
+    private RaftOperationStatus WriteCore(List<(int, List<RaftLog>)> logs, bool sync, IReadOnlyDictionary<int, long>? acknowledgedPresence)
     {
         WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
 
@@ -1291,7 +1457,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             if (exclusive)
                 writeGuard.EnterWriteLock();
@@ -1308,7 +1474,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     Monitor.Enter(CommitFrontierLock(advancing[frontierLocksHeld]));
             }
 
-            if (logs is [{ Item2.Count: 1 } _]) // fast path
+            if (acknowledgedPresence is null && logs is [{ Item2.Count: 1 } _]) // fast path
             {
                 RaftLog log = logs[0].Item2[0];
                 int partitionId = logs[0].Item1;
@@ -1578,12 +1744,33 @@ public class RocksDbWAL : IWAL, IDisposable
                     PutCommitFrontierToBatch(writeBatch, partitionId, value);
             }
 
+            // The acknowledged-presence watermarks land in the same batch as the rows they describe, so
+            // "this node reported id N as durably held" and "the row for N is on disk" become true in
+            // one atomic step — a torn tail can lose both or neither.
+            if (acknowledgedPresence is not null)
+            {
+                foreach ((int partitionId, long value) in acknowledgedPresence)
+                {
+                    if (value >= 0)
+                        PutAckedPresenceToBatch(writeBatch, partitionId, value);
+                }
+            }
+
             db.Write(writeBatch, effectiveOptions);
 
             if (frontierAdvances is not null)
             {
                 foreach ((int partitionId, long value) in frontierAdvances)
                     RaiseCommitFrontierCache(partitionId, value);
+            }
+
+            if (acknowledgedPresence is not null)
+            {
+                foreach ((int partitionId, long value) in acknowledgedPresence)
+                {
+                    if (value >= 0)
+                        ackedPresenceCache[partitionId] = value;
+                }
             }
 
             if (stagedMaxByPartition is not null)
@@ -1891,31 +2078,38 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public long GetMaxLog(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-
-        long floor = GetCompactionFloor(partitionId);
-
-        if (maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cached))
-            return ClampMaxLogAtFloor(Volatile.Read(ref cached.Value), floor);
-
-        // A miss computes the value under the EXCLUSIVE guard: no append can land rows between the
-        // scan and the store (an append raises the cached value only after its own rows landed, and
-        // only when a value is cached), and no truncation can remove rows between them. The scan is
-        // the reverse seek this method always ran; it is now paid once per invalidation instead of
-        // once per call — see maxLogCache.
-        writeGuard.EnterWriteLock();
         try
         {
-            if (maxLogCache.TryGetValue(partitionId, out cached))
-                return ClampMaxLogAtFloor(cached.Value, floor);
+            using EngineLease lease = AcquireEngine();
 
-            long max = ScanMaxLogId(partitionId);
-            maxLogCache[partitionId] = new PartitionMaxLog(max);
-            return ClampMaxLogAtFloor(max, floor);
+            long floor = GetCompactionFloor(partitionId);
+
+            if (maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cached))
+                return ClampMaxLogAtFloor(Volatile.Read(ref cached.Value), floor);
+
+            // A miss computes the value under the EXCLUSIVE guard: no append can land rows between the
+            // scan and the store (an append raises the cached value only after its own rows landed, and
+            // only when a value is cached), and no truncation can remove rows between them. The scan is
+            // the reverse seek this method always ran; it is now paid once per invalidation instead of
+            // once per call — see maxLogCache.
+            writeGuard.EnterWriteLock();
+            try
+            {
+                if (maxLogCache.TryGetValue(partitionId, out cached))
+                    return ClampMaxLogAtFloor(cached.Value, floor);
+
+                long max = ScanMaxLogId(partitionId);
+                maxLogCache[partitionId] = new PartitionMaxLog(max);
+                return ClampMaxLogAtFloor(max, floor);
+            }
+            finally
+            {
+                writeGuard.ExitWriteLock();
+            }
         }
-        finally
+        catch (Exception ex) when (LatchIfCorruption(ex))
         {
-            writeGuard.ExitWriteLock();
+            throw;
         }
     }
 
@@ -1934,7 +2128,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         // The key alone carries the id, so the last key in the partition answers this without reading
         // (and copying) a single value.
-        return iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+        return !IteratorEnded(iterator) && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
             ? ParseLogIdFromKey(iterator.GetKeySpan())
             : 0;
     }
@@ -2030,25 +2224,32 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     public long GetTermAt(int partitionId, long logIndex)
     {
-        using EngineLease lease = AcquireEngine();
+        try
+        {
+            using EngineLease lease = AcquireEngine();
 
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-        // Below the compaction floor the row is logically gone whether or not its file was dropped yet.
-        if (logIndex < GetCompactionFloor(partitionId))
-            return -1;
+            // Below the compaction floor the row is logically gone whether or not its file was dropped yet.
+            if (logIndex < GetCompactionFloor(partitionId))
+                return -1;
 
-        Span<byte> key = stackalloc byte[LogKeyWidth];
-        BuildLogKey(key, partitionId, logIndex);
+            Span<byte> key = stackalloc byte[LogKeyWidth];
+            BuildLogKey(key, partitionId, logIndex);
 
-        // Point lookup on the exact key: a hit is unambiguously the entry for (partitionId, logIndex),
-        // so no field re-validation is needed. The span-deserializer overload hands ReadTermFromWire
-        // the value directly in RocksDB's native buffer — the previous byte[] Get copied the FULL
-        // serialized message (multi-megabyte payload included) into managed memory just to read the
-        // `term` varint near the front. The Found flag disambiguates a missing key from a stored
-        // term of 0 (the deserializer only runs on a hit; a miss yields the tuple's default).
-        (bool found, long term) = db.Get(key, TermSpanDeserializer.Instance, cf: columnFamilyHandle);
-        return found ? term : -1;
+            // Point lookup on the exact key: a hit is unambiguously the entry for (partitionId, logIndex),
+            // so no field re-validation is needed. The span-deserializer overload hands ReadTermFromWire
+            // the value directly in RocksDB's native buffer — the previous byte[] Get copied the FULL
+            // serialized message (multi-megabyte payload included) into managed memory just to read the
+            // `term` varint near the front. The Found flag disambiguates a missing key from a stored
+            // term of 0 (the deserializer only runs on a hit; a miss yields the tuple's default).
+            (bool found, long term) = db.Get(key, TermSpanDeserializer.Instance, cf: columnFamilyHandle);
+            return found ? term : -1;
+        }
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -2364,21 +2565,28 @@ public class RocksDbWAL : IWAL, IDisposable
 
     public long GetCurrentTerm(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        SeekToLastPartitionKey(iterator, partitionId);
-
-        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
-            && ParseLogIdFromKey(iterator.GetKeySpan()) >= GetCompactionFloor(partitionId))
+        try
         {
-            ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out long term, out _);
-            return term;
-        }
+            using EngineLease lease = AcquireEngine();
 
-        return 0;
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+            SeekToLastPartitionKey(iterator, partitionId);
+
+            if (!IteratorEnded(iterator) && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+                && ParseLogIdFromKey(iterator.GetKeySpan()) >= GetCompactionFloor(partitionId))
+            {
+                ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out long term, out _);
+                return term;
+            }
+
+            return 0;
+        }
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -2400,70 +2608,84 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-        // A maintenance scan over the whole partition: bounded at the partition, async I/O, and no
-        // block-cache fill, so a count never evicts the tail blocks the hot paths read.
-        using BoundedIterator bounded = NewPartitionBoundedIterator(
-            columnFamilyHandle, partitionId, asyncIO: true, fillCache: false);
-        Iterator iterator = bounded.Iterator!;
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
-        iterator.Seek(seekKey);
-
-        int count = 0;
-
-        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(partitionPrefix, partitionId);
-
-        // Counting only needs partition membership, which the key prefix already establishes — no value read.
-        while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+        try
         {
-            count++;
-            iterator.Next();
-        }
+            using EngineLease lease = AcquireEngine();
 
-        return count;
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            // A maintenance scan over the whole partition: bounded at the partition, async I/O, and no
+            // block-cache fill, so a count never evicts the tail blocks the hot paths read.
+            using BoundedIterator bounded = NewPartitionBoundedIterator(
+                columnFamilyHandle, partitionId, asyncIO: true, fillCache: false);
+            Iterator iterator = bounded.Iterator!;
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
+            iterator.Seek(seekKey);
+
+            int count = 0;
+
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
+            // Counting only needs partition membership, which the key prefix already establishes — no value read.
+            while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
+            {
+                count++;
+                iterator.Next();
+            }
+
+            return count;
+        }
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        using EngineLease lease = AcquireEngine();
-
-        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
-
-        if (lastCheckpoint <= 0)
-            return 0;
-
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-        // Bounded at the checkpoint: only the rows below it are removable, so the scan never reads
-        // the live tail. Async I/O and no block-cache fill, as in CountPersistedLogs.
-        using BoundedIterator bounded = NewBoundedIterator(
-            columnFamilyHandle, partitionId, lastCheckpoint, asyncIO: true, fillCache: false);
-        Iterator iterator = bounded.Iterator!;
-        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
-        iterator.Seek(seekKey);
-
-        int count = 0;
-
-        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
-        BuildPartitionPrefix(partitionPrefix, partitionId);
-
-        while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+        try
         {
-            if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
-                break;
+            using EngineLease lease = AcquireEngine();
 
-            count++;
-            iterator.Next();
+            long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
+
+            if (lastCheckpoint <= 0)
+                return 0;
+
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            // Bounded at the checkpoint: only the rows below it are removable, so the scan never reads
+            // the live tail. Async I/O and no block-cache fill, as in CountPersistedLogs.
+            using BoundedIterator bounded = NewBoundedIterator(
+                columnFamilyHandle, partitionId, lastCheckpoint, asyncIO: true, fillCache: false);
+            Iterator iterator = bounded.Iterator!;
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
+            iterator.Seek(seekKey);
+
+            int count = 0;
+
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
+            while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
+            {
+                if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
+                    break;
+
+                count++;
+                iterator.Next();
+            }
+
+            return count;
         }
-
-        return count;
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -2477,11 +2699,18 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public string? GetMetaData(string key)
     {
-        using EngineLease lease = AcquireEngine();
+        try
+        {
+            using EngineLease lease = AcquireEngine();
 
-        byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metadataColumnFamily);
+            byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metadataColumnFamily);
 
-        return value is not null ? Encoding.UTF8.GetString(value) : null;
+            return value is not null ? Encoding.UTF8.GetString(value) : null;
+        }
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
     }
 
     /// <summary>
@@ -2519,9 +2748,18 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
-            db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metadataColumnFamily);
+            // Written with the instance's sync options (an fsync of its own under syncWrites), not the
+            // default non-sync options this used to ride the next log fsync with. The caller is the
+            // election path: a vote reply leaves, and a candidate solicits votes, only after this
+            // returns, and a vote that reached the candidate but not the disk let a node grant a second
+            // candidate the same term after a power loss — two leaders in one term. Metadata writes are
+            // rare (one per vote, one per term adoption, one per HLC slack window), so the fsync is cheap.
+            db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), metadataColumnFamily, writeOptions);
+
+            if (syncWrites)
+                Interlocked.Increment(ref syncMetadataWrites);
 
             return true;
         }
@@ -2626,7 +2864,7 @@ public class RocksDbWAL : IWAL, IDisposable
         while (expected <= checkpointId)
         {
             long present = long.MaxValue;
-            if (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+            if (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 present = ParseLogIdFromKey(iterator.GetKeySpan());
 
             if (present <= expected)
@@ -2789,6 +3027,131 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private void RaiseCommitFrontierCache(int partitionId, long value) =>
         commitFrontierCache.AddOrUpdate(partitionId, static (_, v) => v, static (_, old, v) => Math.Max(old, v), value);
+
+    // ── Persisted acknowledged presence ──────────────────────────────────────────────────────────
+    //
+    // Per partition, the highest id this node will have reported as contiguously, durably held once
+    // the batch carrying the value has landed — the Raft layer's presence frontier projected over the
+    // batch (RaftWriteAhead.ProjectPresenceAfter), folded per partition in FIFO order by the scheduler
+    // and staged into the SAME WriteBatch as the rows. It is the durable record of what this node
+    // promised its leader. A restore whose reconstructed contiguous frontier falls below it has lost
+    // acknowledged entries (a synced tail truncated after its fsync, which TolerateCorruptedTailRecords
+    // cannot tell from a torn write) and the partition is quarantined instead of voting from the
+    // shorter log — see RaftPartitionStorageState.LostAcknowledgedEntries.
+    //
+    // Invariants the lost-entries check depends on:
+    //  * The value is ASSIGNED, never maximised. In FIFO order it is non-decreasing except across a
+    //    regression (a failed write), which the Raft layer corrects with an operation that carries the
+    //    lowered value; a max() would discard that correction and the next restore would report a loss
+    //    that never happened.
+    //  * Every path that removes rows clamps it to what survives: TruncateLogsAfter and the proposed-
+    //    only sweep clamp to the cut, a truncating snapshot install sets it to the boundary (a retained
+    //    one raises it to the boundary, which the certified checkpoint row covers), and
+    //    DeletePartitionWAL removes it. Same batch as the deletes, so clamp and removal are atomic.
+    //  * It is never raised above a value the Raft layer supplied: the projection is conservative
+    //    (ids buffered over a gap are not counted until the gap fills), so a false "loss" cannot come
+    //    from the backend over-promising.
+    //  * -1 (absent) disables the check: a fresh partition, or a directory written before the key
+    //    existed. The first batch that carries a value turns it on. No format-version bump: an older
+    //    binary ignores the key, which is the conservative direction.
+
+    /// <summary>Cache for <see cref="AckedPresenceKey"/>; key bytes are immutable once built.</summary>
+    private readonly ConcurrentDictionary<int, byte[]> ackedPresenceKeys = new();
+
+    /// <summary>
+    /// In-memory copy of the persisted acknowledged-presence watermark per partition (-1 = none).
+    /// Assigned only AFTER the carrying batch was applied, set exactly under the exclusive write guard
+    /// by the clamping paths, and cleared by <see cref="ReopenEngine"/> so a reopened engine reloads
+    /// from metadata.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, long> ackedPresenceCache = new();
+
+    /// <summary>Builds the metadata-CF key that stores the acknowledged-presence watermark for a partition.</summary>
+    private byte[] AckedPresenceKey(int partitionId) =>
+        ackedPresenceKeys.GetOrAdd(partitionId, static pid => Encoding.UTF8.GetBytes($"raft_acked_presence_p{pid}"));
+
+    /// <summary>
+    /// Returns the acknowledged-presence watermark for <paramref name="partitionId"/> (-1 = none
+    /// recorded), loading it from the metadata CF on first use. Engine lease held by the caller.
+    /// </summary>
+    private long GetAckedPresence(int partitionId)
+    {
+        if (ackedPresenceCache.TryGetValue(partitionId, out long cached))
+            return cached;
+
+        byte[] value = db.Get(AckedPresenceKey(partitionId), cf: metadataColumnFamily);
+        long persisted = value is not null && long.TryParse(Encoding.UTF8.GetString(value), out long id) ? id : -1;
+
+        return ackedPresenceCache.TryAdd(partitionId, persisted) ? persisted : ackedPresenceCache[partitionId];
+    }
+
+    /// <summary>Stages an acknowledged-presence put so it lands atomically with the batch's other mutations.</summary>
+    private void PutAckedPresenceToBatch(WriteBatch writeBatch, int partitionId, long value) =>
+        writeBatch.Put(AckedPresenceKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), cf: metadataColumnFamily);
+
+    /// <inheritdoc/>
+    public long GetAcknowledgedPresence(int partitionId)
+    {
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            return GetAckedPresence(partitionId);
+        }
+        catch (Exception ex) when (LatchIfCorruption(ex))
+        {
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Taken under the exclusive side of <see cref="writeGuard"/>: an assignment from outside a batch
+    /// must not interleave with a batch staging the same partition's watermark, or the two could land
+    /// in the opposite order and leave the higher value durable.
+    /// </remarks>
+    public bool SetAcknowledgedPresence(int partitionId, long value)
+    {
+        bool ok = SetAcknowledgedPresenceCore(partitionId, value);
+
+        if (!ok && TryRecoverEngineAfterFailure())
+            ok = SetAcknowledgedPresenceCore(partitionId, value);
+
+        if (ok)
+            NoteStorageSuccess();
+
+        return ok;
+    }
+
+    private bool SetAcknowledgedPresenceCore(int partitionId, long value)
+    {
+        try
+        {
+            using EngineLease lease = AcquireEngineForWrite();
+
+            writeGuard.EnterWriteLock();
+            try
+            {
+                if (value < 0)
+                    db.Remove(AckedPresenceKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                else
+                    db.Put(AckedPresenceKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), metadataColumnFamily, writeOptions);
+
+                ackedPresenceCache[partitionId] = Math.Max(value, -1);
+                return true;
+            }
+            finally
+            {
+                writeGuard.ExitWriteLock();
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("SetAcknowledgedPresence({PartitionId}, {Value}): {Message}", partitionId, value, ex.Message);
+
+            NoteStorageFailure(ex);
+            return false;
+        }
+    }
 
     /// <summary>Builds the metadata-CF key that stores the compaction floor for a partition.</summary>
     private byte[] CompactionFloorKey(int partitionId) =>
@@ -2954,13 +3317,13 @@ public class RocksDbWAL : IWAL, IDisposable
                         {
                             // The walk only moves up, so the persisted iterator only ever moves forward.
                             span = certified.Iterator!;
-                            while (span.Valid() && ParseLogIdFromKey(span.GetKeySpan()) < seekFrom)
+                            while (!IteratorEnded(span) && ParseLogIdFromKey(span.GetKeySpan()) < seekFrom)
                                 span.Next();
                         }
 
                         // The upper bound makes "nothing left below the floor" read as invalid, which is
                         // the same answer the unbounded seek gave when the next live key sat above it.
-                        long present = span.Valid() && KeyBelongsToPartition(span.GetKeySpan(), partitionId)
+                        long present = !IteratorEnded(span) && KeyBelongsToPartition(span.GetKeySpan(), partitionId)
                             ? ParseLogIdFromKey(span.GetKeySpan())
                             : long.MaxValue;
 
@@ -3207,6 +3570,27 @@ public class RocksDbWAL : IWAL, IDisposable
     /// not-created state (<see cref="IsCreated"/> false), so a walk that never reaches the span
     /// the iterator serves allocates nothing.</para>
     /// </summary>
+    /// <summary>
+    /// True when <paramref name="iterator"/> has no current entry, after checking WHY. A RocksDB
+    /// iterator that reaches a damaged block does not throw: it becomes invalid and parks the
+    /// <c>Corruption</c> status on itself, so a scan that only tested <c>Valid()</c> ended early and
+    /// returned a short result as if the log ended there — a restore read an empty log from a damaged
+    /// SST and treated it as a fresh partition. Every scan in this file ends through this check, which
+    /// rethrows a parked error as the engine's own exception: the read entry points latch it
+    /// (<see cref="LatchIfCorruption"/>), the write cores report it as Errored and latch through
+    /// recovery. One native call per scan end, nothing per entry.
+    /// </summary>
+    private static bool IteratorEnded(Iterator iterator)
+    {
+        if (iterator.Valid())
+            return false;
+
+        // The binding exposes no Status() on Iterator; the native getter throws the engine's own
+        // exception when the iterator parked an error, and returns quietly at a normal end.
+        Native.Instance.rocksdb_iter_get_error(iterator.Handle);
+        return true;
+    }
+
     private readonly struct BoundedIterator : IDisposable
     {
         public readonly Iterator? Iterator;
@@ -3357,7 +3741,7 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        while (!IteratorEnded(iterator) && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
             long id = ParseLogIdFromKey(iterator.GetKeySpan());
             if (id < floor)
@@ -3394,7 +3778,7 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
@@ -3414,7 +3798,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
                 BuildPartitionPrefix(partitionPrefix, partitionId);
 
-                if (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                if (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 {
                     byte[] rangeBegin = new byte[LogKeyWidth];
                     BuildLogKey(rangeBegin, partitionId, 0);
@@ -3439,11 +3823,14 @@ public class RocksDbWAL : IWAL, IDisposable
             // it back (into the durable key or the cache) after the delete — see commitFrontierLocks.
             lock (CommitFrontierLock(partitionId))
             {
+                // The acknowledged-presence watermark goes too: the partition is wiped on purpose, and a
+                // stale watermark would make the next occupant of the id restore as a loss.
                 if (staged > 0)
                 {
                     writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
                     writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
                     writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
+                    writeBatch.Delete(AckedPresenceKey(partitionId), cf: metadataColumnFamily);
                     db.Write(writeBatch, writeOptions);
                 }
                 else
@@ -3451,10 +3838,12 @@ public class RocksDbWAL : IWAL, IDisposable
                     db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
                     db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
                     db.Remove(CompactionFloorKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                    db.Remove(AckedPresenceKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
                 }
 
                 compactionFloorCache.TryRemove(partitionId, out _);
                 commitFrontierCache.TryRemove(partitionId, out _);
+                ackedPresenceCache.TryRemove(partitionId, out _);
             }
 
             InvalidateMaxLogCache(partitionId);
@@ -3488,7 +3877,7 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             writeGuard.EnterWriteLock();
             try
@@ -3508,7 +3897,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
                 BuildPartitionPrefix(partitionPrefix, partitionId);
 
-                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 {
                     writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
                     staged++;
@@ -3533,6 +3922,14 @@ public class RocksDbWAL : IWAL, IDisposable
             if (clampFloor)
                 PutCompactionFloorToBatch(writeBatch, partitionId, clampedFloor);
 
+            // The acknowledged-presence watermark clamps to the cut too: rows above afterLogId are
+            // removed by this node's own decision (a conflicting tail, a hole repair), not lost, and a
+            // watermark left above the surviving log would make the next restore report a loss.
+            long clampedAck = Math.Max(afterLogId, 0);
+            bool clampAck = GetAckedPresence(partitionId) > clampedAck;
+            if (clampAck)
+                PutAckedPresenceToBatch(writeBatch, partitionId, clampedAck);
+
             if (staged > 0)
             {
                 // If the truncation removes the recorded checkpoint (it sits above afterLogId), recompute
@@ -3551,7 +3948,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
 
-            if (staged > 0 || clampFrontier || clampFloor)
+            if (staged > 0 || clampFrontier || clampFloor || clampAck)
                 db.Write(writeBatch, writeOptions);
 
             // Rows above the cut are gone; the surviving max is somewhere at or below it.
@@ -3565,6 +3962,9 @@ public class RocksDbWAL : IWAL, IDisposable
 
             if (clampFloor)
                 compactionFloorCache[partitionId] = clampedFloor;
+
+            if (clampAck)
+                ackedPresenceCache[partitionId] = clampedAck;
 
             return RaftOperationStatus.Success;
             }
@@ -3610,7 +4010,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             writeGuard.EnterWriteLock();
             try
@@ -3644,7 +4044,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
                     BuildPartitionPrefix(partitionPrefix, partitionId);
 
-                    while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                    while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
                     {
                         // Only unresolved (Proposed / ProposedCheckpoint) entries are removable; resolved
                         // entries are quorum-agreed and load-bearing for the commit frontier.
@@ -3665,7 +4065,19 @@ public class RocksDbWAL : IWAL, IDisposable
 
                 if (staged > 0)
                 {
+                    // A Proposed row removed inside the acknowledged prefix breaks the contiguity this
+                    // node promised; clamp the watermark to the cut in the same batch. In steady state
+                    // the cut sits at or above the watermark (the scheduler clamps it to the accepted
+                    // floor) and this is a no-op.
+                    long clampedAck = Math.Max(afterLogId, 0);
+                    bool clampAck = GetAckedPresence(partitionId) > clampedAck;
+                    if (clampAck)
+                        PutAckedPresenceToBatch(writeBatch, partitionId, clampedAck);
+
                     db.Write(writeBatch, writeOptions);
+
+                    if (clampAck)
+                        ackedPresenceCache[partitionId] = clampedAck;
 
                     // The sweep visited every row above the cut, so it knows the new max exactly
                     // whenever a row up there survived; otherwise the max is at or below the cut and
@@ -3747,7 +4159,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             writeGuard.EnterWriteLock();
             try
@@ -3776,7 +4188,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
                     BuildPartitionPrefix(partitionPrefix, partitionId);
 
-                    while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                    while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix))
                     {
                         writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
                         staged++;
@@ -3823,6 +4235,16 @@ public class RocksDbWAL : IWAL, IDisposable
             if (clampFloor)
                 PutCompactionFloorToBatch(writeBatch, partitionId, snapshotIndex);
 
+            // The boundary is a certified checkpoint: it attests its whole prefix as durably held, and
+            // the Raft layer seeds its presence frontier to it (SeedCommitFrontierFromSnapshot), so the
+            // acknowledged-presence watermark rises to the boundary. A truncating install removed every
+            // row above it, so a higher watermark clamps to it — the rows were discarded, not lost.
+            long currentAck = GetAckedPresence(partitionId);
+            long newAck = suffixTruncated ? snapshotIndex : Math.Max(currentAck, snapshotIndex);
+            bool setAck = newAck != currentAck;
+            if (setAck)
+                PutAckedPresenceToBatch(writeBatch, partitionId, newAck);
+
             OnAfterBoundaryScanForTesting?.Invoke();
 
             db.Write(writeBatch, effectiveOptions);
@@ -3832,6 +4254,9 @@ public class RocksDbWAL : IWAL, IDisposable
 
             if (clampFloor)
                 compactionFloorCache[partitionId] = snapshotIndex;
+
+            if (setAck)
+                ackedPresenceCache[partitionId] = newAck;
 
             // With the suffix gone the boundary row is the partition's max, exactly; with the suffix
             // retained the boundary row can only raise a known max.
@@ -3903,7 +4328,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
-            using EngineLease lease = AcquireEngine();
+            using EngineLease lease = AcquireEngineForWrite();
 
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
@@ -3941,7 +4366,7 @@ public class RocksDbWAL : IWAL, IDisposable
             BuildPartitionPrefix(partitionPrefix, partitionId);
 
             long lastCountedId = -1;
-            while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
+            while (!IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
             {
                 long id = ParseLogIdFromKey(iterator.GetKeySpan());
                 if (id >= newFloor)
@@ -3952,7 +4377,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 iterator.Next();
             }
 
-            if (removed == passCap && iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
+            if (removed == passCap && !IteratorEnded(iterator) && iterator.GetKeySpan().StartsWith(partitionPrefix)
                 && ParseLogIdFromKey(iterator.GetKeySpan()) < newFloor)
             {
                 long remainder = newFloor - 1 - lastCountedId;
@@ -4079,14 +4504,14 @@ public class RocksDbWAL : IWAL, IDisposable
         BuildPartitionPrefix(partitionPrefix, partitionId);
 
         iterator.SeekToFirst();
-        if (iterator.Valid() && !iterator.GetKeySpan().StartsWith(partitionPrefix))
+        if (!IteratorEnded(iterator) && !iterator.GetKeySpan().StartsWith(partitionPrefix))
             return true;
 
         Span<byte> upperBoundKey = stackalloc byte[PartitionIdWidth + 1];
         BuildPartitionUpperBoundKey(upperBoundKey, partitionId);
         iterator.Seek(upperBoundKey);
 
-        return iterator.Valid();
+        return !IteratorEnded(iterator);
     }
 
     /// <summary>
@@ -4106,7 +4531,7 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        if (!iterator.Valid() || !KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        if (IteratorEnded(iterator) || !KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
             return long.MaxValue;
 
         long head = ParseLogIdFromKey(iterator.GetKeySpan());
@@ -4292,7 +4717,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         iterator.Seek(upperBoundKey);
 
-        if (iterator.Valid())
+        if (!IteratorEnded(iterator))
             iterator.Prev();
         else
             iterator.SeekToLast();

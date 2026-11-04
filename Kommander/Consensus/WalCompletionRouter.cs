@@ -300,6 +300,16 @@ internal sealed class WalCompletionRouter
                 }
                 break;
 
+            case WALWriteOperationType.AcknowledgedPresence:
+                // Fire-and-forget like the HLC floor: the correction exists to keep a crash from
+                // reporting a failed range as lost acknowledged entries, so a rejected one is worth a
+                // line — the next log-carrying batch on the partition records the frontier anyway.
+                if (completion.Status != RaftOperationStatus.Success)
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] Acknowledged-presence correction was rejected by the storage engine ({Status}); the next batch on this partition records the frontier",
+                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, completion.Status);
+                break;
+
             case WALWriteOperationType.Compaction:
             default:
                 CompleteReply(pending?.ReplyCorrelationId, RaftResponseStatic.NoneResponse);

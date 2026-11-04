@@ -77,6 +77,20 @@ public sealed class WALWriteOperation
     /// <summary>Outcome of a metadata write (<see cref="WALWriteOperationType.HardState"/>, <see cref="WALWriteOperationType.HlcFloor"/>), set by the worker that ran it; unused for other types.</summary>
     internal RaftOperationStatus MetadataStatus = RaftOperationStatus.Success;
 
+    /// <summary>
+    /// The contiguous presence frontier (highest id with no hole below it) this partition will have
+    /// once this operation and everything queued before it have landed — what its next
+    /// acknowledgement to the leader will claim as durably held. Computed by the enqueuing partition
+    /// before the operation is queued (<c>RaftWriteAhead.ProjectPresenceAfter</c>), conservatively:
+    /// an id buffered over a gap is not counted until the gap fills, so the value never exceeds what
+    /// the node really holds once the batch lands. The scheduler folds it per partition in FIFO order
+    /// and hands it to the backend, which persists it in the same batch as the rows
+    /// (<see cref="IWAL.Write(List{ValueTuple{int, List{RaftLog}}}, bool, IReadOnlyDictionary{int, long})"/>).
+    /// <c>-1</c> means "no claim" (metadata operations, legacy callers, facades that do not track
+    /// presence), which leaves the persisted watermark untouched.
+    /// </summary>
+    public long AcknowledgedPresence { get; }
+
     public WALWriteOperation(
         Action<RaftWalCompletion> onComplete,
         long operationId,
@@ -90,9 +104,11 @@ public sealed class WALWriteOperation
         long truncateFloor = -1,
         string? votedFor = null,
         long metadataValue = -1,
-        bool requiresSync = false
+        bool requiresSync = false,
+        long acknowledgedPresence = -1
     )
     {
+        AcknowledgedPresence = acknowledgedPresence;
         RequiresSync = requiresSync;
         VotedFor = votedFor;
         MetadataValue = metadataValue;

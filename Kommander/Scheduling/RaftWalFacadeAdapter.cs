@@ -113,6 +113,10 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public void NoteHlcFloorWriteFailed(long target) => wal.NoteHlcFloorWriteFailed(target);
 
+    public RaftRestoreStorageVerdict GetRestoreStorageVerdict() => wal.GetRestoreStorageVerdict();
+
+    public string? GetStorageFailStopReason() => wal.GetStorageFailStopReason();
+
     public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
         ValueTask.FromResult(wal.LoadHardState());
 }

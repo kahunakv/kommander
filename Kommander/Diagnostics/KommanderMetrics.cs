@@ -88,6 +88,68 @@ public static class KommanderMetrics
     internal static void RecordWalEngineReopen(bool succeeded) =>
         WalEngineReopensTotal.Add(1, new KeyValuePair<string, object?>("outcome", succeeded ? "success" : "failed"));
 
+    /// <summary>
+    /// Storage engines that fail-stopped on a <c>Corruption</c> status — at open, or while running —
+    /// and now refuse every write (<see cref="WAL.IWAL.GetFailStopReason"/>). Any non-zero value is an
+    /// operator action: the damaged directory must be moved aside and the node rebuilt from its peers.
+    /// </summary>
+    internal static readonly Counter<long> WalEngineFailStopsTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.engine_fail_stops_total",
+            description: "Storage engines that fail-stopped on a Corruption status and refuse every write.");
+
+    internal static void RecordWalEngineFailStop() => WalEngineFailStopsTotal.Add(1);
+
+    // ── Partition storage integrity ───────────────────────────────────────────
+
+    /// <summary>
+    /// Restores that found the log shorter than what the node had acknowledged as durably held
+    /// (<see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>), tagged by
+    /// <c>partition_id</c> and <c>outcome</c>: <c>quarantined</c> (the partition withholds votes and
+    /// candidacy until the leader replicates past the watermark) or <c>accepted</c>
+    /// (<see cref="LostAcknowledgedEntriesPolicy.AcceptAndLog"/>: the loss was accepted by configuration).
+    /// </summary>
+    internal static readonly Counter<long> StorageLostAcknowledgedEntriesTotal =
+        Meter.CreateCounter<long>(
+            "raft.storage.lost_acknowledged_entries_total",
+            description: "Partition restores that found acknowledged entries missing from the log, by outcome.");
+
+    internal static void RecordLostAcknowledgedEntries(int partitionId, bool accepted) =>
+        StorageLostAcknowledgedEntriesTotal.Add(1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("outcome", accepted ? "accepted" : "quarantined"));
+
+    /// <summary>
+    /// Restores that refused consumer replay because the application's durable floor sat below the
+    /// WAL compaction floor (<see cref="Data.RaftPartitionStorageState.ApplicationFloorBelowCompaction"/>):
+    /// the entries the application needed were already compacted, so only a snapshot can repair it.
+    /// </summary>
+    internal static readonly Counter<long> StorageApplicationFloorBelowCompactionTotal =
+        Meter.CreateCounter<long>(
+            "raft.storage.application_floor_below_compaction_total",
+            description: "Partition restores that refused replay because the application floor was below the compaction floor.");
+
+    internal static void RecordApplicationFloorBelowCompaction(int partitionId) =>
+        StorageApplicationFloorBelowCompactionTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Transitions of a partition's storage state into and out of a quarantine, tagged by
+    /// <c>partition_id</c>, <c>state</c> (the <see cref="Data.RaftPartitionStorageState"/> name) and
+    /// <c>direction</c> (<c>entered</c> / <c>exited</c>). The difference of the two directions per
+    /// partition and state is the number currently quarantined; a partition that enters and never
+    /// exits is one whose repair (leader re-replication, a snapshot, an operator) has not happened.
+    /// </summary>
+    internal static readonly Counter<long> StorageQuarantineTransitionsTotal =
+        Meter.CreateCounter<long>(
+            "raft.storage.quarantine_transitions_total",
+            description: "Partition storage-state transitions into and out of a quarantine, by state and direction.");
+
+    internal static void RecordStorageQuarantine(int partitionId, Data.RaftPartitionStorageState state, bool entered) =>
+        StorageQuarantineTransitionsTotal.Add(1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("state", state.ToString()),
+            new KeyValuePair<string, object?>("direction", entered ? "entered" : "exited"));
+
     // ── WAL scheduler ─────────────────────────────────────────────────────────
 
     /// <summary>Total WAL write batches dispatched to the storage adapter.</summary>

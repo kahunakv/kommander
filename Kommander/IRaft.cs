@@ -994,6 +994,23 @@ public interface IRaft
     public long GetPartitionTerm(int partitionId);
 
     /// <summary>
+    /// The storage verdict for <paramref name="partitionId"/> on this node, or <see langword="null"/>
+    /// when the partition is not hosted here. Meant for the host's readiness probe: a partition whose
+    /// <see cref="RaftPartitionStorageHealth.State"/> is anything but
+    /// <see cref="RaftPartitionStorageState.Healthy"/> or <see cref="RaftPartitionStorageState.Restoring"/>
+    /// has refused to serve from damaged or incomplete storage — its log lost entries it had
+    /// acknowledged, its application store fell behind the WAL's compaction floor, its storage engine
+    /// fail-stopped on a corruption, or its restore failed — and the host should report it not ready
+    /// (and an operator should look at the Critical line that names the evidence). The engine-level
+    /// verdict is also readable directly from <see cref="WAL.IWAL.GetFailStopReason"/> on
+    /// <see cref="WalAdapter"/>. Cheap and safe from any thread; may be one transition stale.
+    /// <para>A default member (answering <see langword="null"/>, "not hosted") so hosts and test
+    /// doubles that implement this interface themselves keep compiling; <see cref="RaftManager"/>
+    /// overrides it.</para>
+    /// </summary>
+    public RaftPartitionStorageHealth? GetPartitionStorageHealth(int partitionId) => null;
+
+    /// <summary>
     /// Returns whether the given partition is materialized on this node — i.e. whether the
     /// per-partition APIs (<see cref="AmILeader"/>, <see cref="WaitForLeader"/>,
     /// <see cref="ReplicateLogs(int,string,byte[],bool,long,CancellationToken)"/>, …) can run

@@ -1091,6 +1091,28 @@ public sealed class RaftPartition : IDisposable
     /// <summary>Completes when the partition's WAL restore (Phase 2) has finished.</summary>
     internal Task RestoreTask => executor.RestoreTask;
 
+    /// <summary>
+    /// This partition's storage verdict — see <see cref="IRaft.GetPartitionStorageHealth"/>. A restore
+    /// that threw is reported as <see cref="RaftPartitionStorageState.RestoreFailed"/> with the
+    /// exception's message (the executor stopped the partition; nothing else can report it), a restore
+    /// still running as <see cref="RaftPartitionStorageState.Restoring"/>, and everything after that
+    /// comes from the state machine. Safe from any thread.
+    /// </summary>
+    public RaftPartitionStorageHealth GetStorageHealth()
+    {
+        Task restore = executor.RestoreTask;
+
+        if (restore.IsFaulted)
+            return new RaftPartitionStorageHealth(
+                RaftPartitionStorageState.RestoreFailed,
+                restore.Exception?.GetBaseException().Message ?? "the WAL restore failed");
+
+        if (!executor.IsRestored)
+            return RaftPartitionStorageHealth.Restoring;
+
+        return stateMachine.GetStorageHealth();
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

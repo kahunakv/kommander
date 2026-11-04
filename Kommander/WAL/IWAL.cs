@@ -112,6 +112,61 @@ public interface IWAL : IDisposable
     /// </summary>
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync) => Write(logs);
 
+    /// <summary>
+    /// <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/> that also records, per partition
+    /// and <b>atomically with the rows</b>, the <b>acknowledged-presence watermark</b>: the highest id
+    /// the partition will have reported as contiguously, durably held once this batch has landed
+    /// (<see cref="Data.WALWriteOperation.AcknowledgedPresence"/>, folded per partition by the
+    /// scheduler in submission order). A batch may carry a watermark for a partition it stages no
+    /// rows for (the scheduler's regression correction after a failed write).
+    /// <para><b>Why it exists.</b> With <c>syncWrites</c> an acknowledged entry is fsynced, so a short
+    /// record at the tail of the engine's log was never acknowledged — unless the file was truncated
+    /// <em>after</em> the fsync, which the engine cannot tell from a torn write. The watermark is the
+    /// durable statement of what the node promised: a restore whose contiguous frontier falls below it
+    /// has lost acknowledged entries and must not vote or lead until the leader has replicated past it
+    /// (<see cref="Data.RaftPartitionStorageState.LostAcknowledgedEntries"/>). Written in the same
+    /// batch as the rows it describes, it costs no fsync of its own.</para>
+    /// <para>The value is <b>assigned</b>, not maximised: the scheduler folds operations in
+    /// per-partition FIFO order and the Raft layer's presence frontier only ever moves down through
+    /// a correction the backend must honour. Every path that removes rows must clamp the watermark
+    /// to what survives (truncation, a truncating snapshot install, partition deletion), or the next
+    /// restore reports a loss that never happened.</para>
+    /// <para>The default ignores the watermark, which keeps external and non-durable backends
+    /// source-compatible: their <see cref="GetAcknowledgedPresence"/> answers -1 and the check is
+    /// inert. <see cref="RocksDbWAL"/> overrides all three members.</para>
+    /// </summary>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync, IReadOnlyDictionary<int, long>? acknowledgedPresence)
+        => Write(logs, sync);
+
+    /// <summary>
+    /// The persisted acknowledged-presence watermark for <paramref name="partitionId"/> (see the
+    /// three-argument <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool, IReadOnlyDictionary{int, long})"/>),
+    /// or -1 when none was recorded — a fresh partition, a backend that keeps none, or a WAL written
+    /// before the watermark existed, all of which disable the lost-entries check for that restore.
+    /// </summary>
+    public long GetAcknowledgedPresence(int partitionId) => -1;
+
+    /// <summary>
+    /// Overwrites the acknowledged-presence watermark for <paramref name="partitionId"/> outside a
+    /// row batch. Two callers: the restore that <em>accepts</em> a loss
+    /// (<see cref="LostAcknowledgedEntriesPolicy.AcceptAndLog"/>) lowers it to what the disk holds so
+    /// the next restart does not re-flag the same loss, and tests. Durable like any metadata write.
+    /// Returns <see langword="false"/> when the backend rejected the write; the default succeeds
+    /// without recording anything.
+    /// </summary>
+    public bool SetAcknowledgedPresence(int partitionId, long value) => true;
+
+    /// <summary>
+    /// Non-null once the backend has <b>fail-stopped</b>: it met a storage fault it must not try to
+    /// recover from — a <c>Corruption</c> status (a damaged SST or log file) — and now refuses every
+    /// write while still serving reads of intact data. The Raft layer polls this on its tick: a
+    /// partition on a fail-stopped engine steps down if it leads and neither votes, campaigns nor
+    /// acknowledges (<see cref="Data.RaftPartitionStorageState.EngineFailed"/>). The string is the
+    /// engine's own message, which names the damaged file. Permanent for the process. Default null
+    /// (never fail-stops), which is right for backends that have no such fault class.
+    /// </summary>
+    public string? GetFailStopReason() => null;
+
     /// <summary>Returns the largest log id persisted for <paramref name="partitionId"/>, or 0 if empty.</summary>
     public long GetMaxLog(int partitionId);
 
@@ -164,11 +219,17 @@ public interface IWAL : IDisposable
     /// Persists per-partition Raft hard state — the current term and the endpoint this node last granted
     /// its vote to in that term. Stored via the metadata primitive under a per-partition key because the
     /// backend is shared across partitions.
-    /// <para><b>Durability:</b> this rides the backend's existing WAL fsync cadence rather than forcing a
-    /// dedicated fsync per call — a deliberate latency trade-off, so the very last vote/term can be lost
-    /// on power failure. Both fields are written as ONE metadata value so a crash can never tear the term
-    /// away from the vote. Default implementation works for every backend that implements
-    /// <see cref="SetMetaData"/>; no backend override is required.</para>
+    /// <para><b>Durability:</b> a durable backend must fsync this write before returning
+    /// <see langword="true"/> (under its configured <c>syncWrites</c>): the caller sends the vote reply,
+    /// or solicits votes for the new term, only after this returns, and a vote that reaches the candidate
+    /// but not the disk lets the node grant a <em>second</em> candidate the same term after a power loss —
+    /// two leaders in one term, and committed entries overwritten. Elections are rare, so one fsync per
+    /// vote is cheap. <see cref="RocksDbWAL"/> writes it with its sync write options; the write used to
+    /// ride the next log fsync, which is the gap this closes. With <c>syncWrites</c> off the whole log
+    /// already accepts loss of the last unflushed writes, and so does the hard state. Both fields are
+    /// written as ONE metadata value so a crash can never tear the term away from the vote. Default
+    /// implementation works for every backend whose <see cref="SetMetaData"/> is durable; no backend
+    /// override is required.</para>
     /// <para>Returns <see langword="false"/> when the write failed. The caller must then treat the term
     /// or vote as NOT durable: an election must not solicit votes on a term it could not record, and a
     /// vote must not be sent when the grant could not be recorded.</para>

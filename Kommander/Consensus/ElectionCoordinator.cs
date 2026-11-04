@@ -180,6 +180,38 @@ internal sealed class ElectionCoordinator
     /// last-entry term when the facade does not track presence (test stubs), preserving the legacy
     /// ordering there.
     /// </summary>
+    /// <summary>Cadence of the quarantine lines below: one per interval, not one per election round or vote request.</summary>
+    private static readonly TimeSpan StorageQuarantineLogInterval = TimeSpan.FromSeconds(30);
+
+    private long lastStorageHoldLogTicks;
+
+    private long lastStorageDenyLogTicks;
+
+    /// <summary>
+    /// Names a candidacy withheld by the storage quarantine at Warning, at most once per
+    /// <see cref="StorageQuarantineLogInterval"/>: the election timer fires every round while the
+    /// partition is leaderless, and the verdict was already reported at Critical when it was reached.
+    /// </summary>
+    private void LogStorageQuarantineHold(string reason, long nowTicks)
+    {
+        if (lastStorageHoldLogTicks != 0 && RaftMonotonic.Elapsed(lastStorageHoldLogTicks, nowTicks) < StorageQuarantineLogInterval)
+            return;
+
+        lastStorageHoldLogTicks = nowTicks;
+        logger.LogWarnStorageQuarantineHoldsCandidacy(host.LocalEndpoint, host.PartitionId, coreState.NodeState, reason);
+    }
+
+    /// <summary>Names a (pre-)vote denied by the storage quarantine, rate-limited like <see cref="LogStorageQuarantineHold"/>.</summary>
+    private void LogStorageQuarantineDeny(string kind, string candidate, long term, string reason)
+    {
+        long nowTicks = host.GetMonotonicTimestamp();
+        if (lastStorageDenyLogTicks != 0 && RaftMonotonic.Elapsed(lastStorageDenyLogTicks, nowTicks) < StorageQuarantineLogInterval)
+            return;
+
+        lastStorageDenyLogTicks = nowTicks;
+        logger.LogWarnStorageQuarantineDeniesVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, kind, candidate, term, reason);
+    }
+
     private async ValueTask<(long MaxLogId, long LastLogTerm)> GetFreshnessLogPositionAsync()
     {
         long presentId = wal.GetPresentIndex();
@@ -565,6 +597,15 @@ internal sealed class ElectionCoordinator
         TrackLeaderless(nowTicks);
         bool leaderlessWarn = LeaderlessForLong(nowTicks, out long leaderlessMs);
 
+        // Storage quarantine: a log that lost acknowledged entries, an application store behind the
+        // compaction floor, or a fail-stopped engine must not win a term. Unconditional and ahead of
+        // every cooldown — a step-down notice skips the cooldown block below and must not skip this.
+        if (coreState.StorageWithholdsCandidacy(wal, out string storageHold))
+        {
+            LogStorageQuarantineHold(storageHold, nowTicks);
+            return;
+        }
+
         // A stalled disk never campaigns, and neither does a replica whose candidacy the application
         // withheld, whether this election was reached by timeout or by a step-down notice from a peer
         // (which skips the cooldown block below).
@@ -703,6 +744,14 @@ internal sealed class ElectionCoordinator
         long nowTicks = host.GetMonotonicTimestamp();
         TrackLeaderless(nowTicks);
         bool leaderlessWarn = LeaderlessForLong(nowTicks, out long leaderlessMs);
+
+        // Storage quarantine (see StartElectionAsync): a pre-vote probes for a term this node must
+        // not win, so it is not even asked for.
+        if (coreState.StorageWithholdsCandidacy(wal, out string storageHold))
+        {
+            LogStorageQuarantineHold(storageHold, nowTicks);
+            return;
+        }
 
         // Same "should I even try?" guards as a real election. These guards do NOT touch any Raft
         // consensus state (coreState.CurrentTerm / votes / expectedLeaders / coreState.NodeState) — that is the whole
@@ -878,6 +927,15 @@ internal sealed class ElectionCoordinator
                 logger.LogDebugDenyingPreVoteNotVoter(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
                 if (denyWarn)
                     logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, "endpoint is not a committed voter");
+                return;
+            }
+
+            // Storage quarantine: a pre-vote grant is a promise to vote, and a log that lost
+            // acknowledged entries (or a fail-stopped engine) must not vote — the candidate it helped
+            // could lack an entry this node once counted toward a commit.
+            if (coreState.StorageDeniesVote(wal, out string storageDeny))
+            {
+                LogStorageQuarantineDeny("pre-vote", node.Endpoint, voteTerm, storageDeny);
                 return;
             }
 
@@ -1077,6 +1135,18 @@ internal sealed class ElectionCoordinator
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, null,
                     "higher-term adoption on a vote request", "The term is adopted in memory only.");
             }
+        }
+
+        // Storage quarantine, AFTER the term adoption above: the higher term must still be adopted
+        // (it is what fences a deposed leader's appends), but this node's vote is withheld while its
+        // log is shorter than what it acknowledged, or its engine fail-stopped — Raft §5.4.1 assumes
+        // a voter's log is what it claims, and a voter that lost committed entries can elect a
+        // candidate without them. The candidate asks another voter; the quarantine lifts once the
+        // leader has replicated past the watermark.
+        if (coreState.StorageDeniesVote(wal, out string storageVoteDeny))
+        {
+            LogStorageQuarantineDeny("vote", node.Endpoint, voteTerm, storageVoteDeny);
+            return;
         }
 
         string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");

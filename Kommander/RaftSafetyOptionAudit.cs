@@ -185,6 +185,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.SnapshotStagingDirectory)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotStagingMemoryBytes)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.AllowLegacySnapshotSenders)] = RaftOptionKind.Safety,
+        [nameof(RaftConfiguration.LostAcknowledgedEntriesPolicy)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.SnapshotTransferStepTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.ReseedRequestTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotRescueMaxConsecutiveCycles)] = RaftOptionKind.Liveness,
@@ -308,6 +309,19 @@ public static class RaftSafetyOptionAudit
                 "false",
                 "Snapshot chunks that carry no leader term or endpoint are accepted, so a chunk "
                 + "from a superseded leader cannot be fenced by term.",
+                IsShippedDefault: false));
+        }
+
+        if (configuration.LostAcknowledgedEntriesPolicy == LostAcknowledgedEntriesPolicy.AcceptAndLog)
+        {
+            deviations.Add(new(
+                nameof(RaftConfiguration.LostAcknowledgedEntriesPolicy),
+                RaftOptionKind.Safety,
+                "AcceptAndLog",
+                "Quarantine",
+                "A partition whose log lost entries this node had acknowledged as durable votes and "
+                + "leads from the shorter log, so a committed entry the lost tail held can be "
+                + "overwritten by a candidate that never had it.",
                 IsShippedDefault: false));
         }
 

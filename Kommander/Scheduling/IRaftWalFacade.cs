@@ -341,6 +341,22 @@ public interface IRaftWalFacade
     void NoteHlcFloorWriteFailed(long target) { }
 
     /// <summary>
+    /// What the last restore concluded about this partition's storage integrity — acknowledged
+    /// entries missing from the log, or an application floor below the compaction floor (see
+    /// <see cref="RaftRestoreStorageVerdict"/>). Read by the state machine on the executor turn that
+    /// completes the restore, which turns the verdict into the quarantine it implies. Default
+    /// <see cref="RaftRestoreStorageVerdict.None"/> for facades that do not track storage integrity.
+    /// </summary>
+    RaftRestoreStorageVerdict GetRestoreStorageVerdict() => RaftRestoreStorageVerdict.None;
+
+    /// <summary>
+    /// The storage backend's fail-stop reason (<see cref="WAL.IWAL.GetFailStopReason"/>), or null
+    /// while it accepts writes. Polled on the state machine's tick; a non-null value moves the
+    /// partition to <see cref="RaftPartitionStorageState.EngineFailed"/>. Default null.
+    /// </summary>
+    string? GetStorageFailStopReason() => null;
+
+    /// <summary>
     /// Loads the persisted hard state, or <see langword="null"/> when none exists yet (fresh node or a
     /// legacy WAL predating hard state), in which case the caller infers the term from the log tail. The
     /// default returns <see langword="null"/> so fakes preserve their prior behaviour.

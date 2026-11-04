@@ -23,5 +23,18 @@ public enum WALWriteOperationType
     /// <c>AppendLogs</c> dispatches of the CamusDB slow-disk runs). Fire-and-forget; a failed write only
     /// regresses the in-memory bound so the next observation retries.
     /// </summary>
-    HlcFloor
+    HlcFloor,
+
+    /// <summary>
+    /// A correction of the partition's acknowledged-presence watermark (see
+    /// <see cref="IWAL.Write(List{ValueTuple{int, List{RaftLog}}}, bool, IReadOnlyDictionary{int, long})"/>),
+    /// queued by the Raft layer after a failed write regressed its presence frontier. Every
+    /// log-carrying operation records the frontier it will establish; an operation queued between
+    /// the failed write and the regression recorded a value that counts the failed range, so this
+    /// operation follows it in the same per-partition FIFO and assigns the regressed value. Carries
+    /// no rows; <see cref="WALWriteOperation.MetadataValue"/> is the value. Folded by the scheduler
+    /// in submission order like the per-operation values, never run ahead of the batch like the
+    /// metadata operations above — ordering is the whole point.
+    /// </summary>
+    AcknowledgedPresence
 }

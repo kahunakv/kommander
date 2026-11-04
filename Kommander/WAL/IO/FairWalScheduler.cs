@@ -666,11 +666,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             opListPool.Add(new List<WALWriteOperation>(maxBatchSize));
 
         List<(int, List<RaftLog>)> logGroups = new(maxGroupBatchPartitions);
+        Dictionary<int, long> acknowledgedPresence = new(maxGroupBatchPartitions);
 
         while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
             partitionGroup.Add(extraId);
 
-        ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
+        ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
         return true;
     }
 
@@ -708,6 +709,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // Pre-allocated log-groups list passed to walAdapter.Write — cleared and reused each flush.
         List<(int, List<RaftLog>)> logGroups = new(maxGroupBatchPartitions);
 
+        // Pre-allocated per-partition acknowledged-presence fold passed alongside — cleared and reused.
+        Dictionary<int, long> acknowledgedPresence = new(maxGroupBatchPartitions);
+
         CancellationToken token = _cts.Token;
 
         while (true)
@@ -721,7 +725,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             catch (OperationCanceledException)
             {
                 // Drain remaining items before exiting.
-                DrainRemaining(partitionGroup, groupBatches, opListPool, logGroups);
+                DrainRemaining(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
                 break;
             }
             catch (ObjectDisposedException)
@@ -754,7 +758,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (lingerTicks > 0 && partitionGroup.Count < maxGroupBatchPartitions)
                 LingerForMoreReadyPartitions(partitionGroup, token);
 
-            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
+            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
         }
     }
 #endif
@@ -888,7 +892,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         List<int> partitionIds,
         List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches,
         List<List<WALWriteOperation>> opListPool,
-        List<(int, List<RaftLog>)> logGroups)
+        List<(int, List<RaftLog>)> logGroups,
+        Dictionary<int, long> acknowledgedPresence)
     {
         groupBatches.Clear();
 
@@ -1019,6 +1024,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         {
             // Reuse the worker-owned logGroups list — cleared here, populated below.
             logGroups.Clear();
+            acknowledgedPresence.Clear();
 
             // Single-fsync fast path: the batch may skip its own fsync only if EVERY log in it is a
             // per-entry Committed marker (already quorum-durable from its propose fsync, so a lost marker
@@ -1044,6 +1050,20 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                         continue;
                     }
 
+                    // The acknowledged-presence fold: per partition, the LAST value in submission
+                    // order wins, because each operation's value already describes the whole frontier
+                    // its batch establishes (not just its own rows) and a regression correction must
+                    // be able to lower it. The backend assigns the folded value in the same batch as
+                    // the rows (IWAL.Write, three-argument overload).
+                    if (op.Type == WALWriteOperationType.AcknowledgedPresence)
+                    {
+                        acknowledgedPresence[pid] = op.MetadataValue;
+                        continue;                       // carries no rows
+                    }
+
+                    if (op.AcknowledgedPresence >= 0)
+                        acknowledgedPresence[pid] = op.AcknowledgedPresence;
+
                     logGroups.Add(op.Logs);
                     if (!sync && (op.RequiresSync || !AllCommittedMarkers(op.Logs.Logs)))
                         sync = true;
@@ -1051,9 +1071,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             batchSynced = sync;
 
-            if (logGroups.Count > 0)
+            // A batch holding only a correction still writes: the value it carries is what keeps a
+            // crash from reporting a failed range as lost acknowledged entries.
+            if (logGroups.Count > 0 || acknowledgedPresence.Count > 0)
             {
-                status = walAdapter.Write(logGroups, sync);
+                status = walAdapter.Write(logGroups, sync, acknowledgedPresence.Count > 0 ? acknowledgedPresence : null);
 
                 if (TraceSink is { } writeTrace && status == RaftOperationStatus.Success)
                     TraceBatchWrite(writeTrace, groupBatches, sync);
@@ -1212,7 +1234,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         List<int> partitionGroup,
         List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches,
         List<List<WALWriteOperation>> opListPool,
-        List<(int, List<RaftLog>)> logGroups)
+        List<(int, List<RaftLog>)> logGroups,
+        Dictionary<int, long> acknowledgedPresence)
     {
         // Drain everything still in the ready-queue as one group-commit batch.
         partitionGroup.Clear();
@@ -1220,7 +1243,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             partitionGroup.Add(pid);
 
         if (partitionGroup.Count > 0)
-            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
+            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
 
         // Also sweep all partition states for any items that were enqueued
         // but whose partitionId was not yet in the ready-queue (should not
@@ -1242,7 +1265,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 partitionGroup.Clear();
                 partitionGroup.Add(kv.Key);
-                ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
+                ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
             }
         }
     }
@@ -1284,7 +1307,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         foreach ((int pid, List<WALWriteOperation> ops) in groupBatches)
             foreach (WALWriteOperation op in ops)
             {
-                if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
+                if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor or WALWriteOperationType.AcknowledgedPresence)
                     continue;
 
                 List<RaftLog> logs = op.Logs.Logs;
