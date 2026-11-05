@@ -34,6 +34,9 @@ public sealed class RaftRequest
     /// <summary><see cref="RaftRequestType.CompleteAppendLogs"/> only: see <see cref="CompleteAppendLogsRequest.PresentTerm"/>.</summary>
     public long PresentTerm { get; } = -1;
 
+    /// <summary><see cref="RaftRequestType.CompleteAppendLogs"/> only: see <see cref="CompleteAppendLogsRequest.SeedIndex"/>; 0 when none.</summary>
+    public long SeedIndex { get; }
+
     /// <summary>
     /// Term of the sender's last log entry, carried on <see cref="RaftRequestType.RequestVote"/> /
     /// <see cref="RaftRequestType.ReceiveVote"/> alongside <see cref="CommitIndex"/> (the last log
@@ -150,7 +153,8 @@ public sealed class RaftRequest
         long presentIndex = -1,
         long presentTerm = -1,
         long retentionFloor = 0,
-        long retentionBudget = 0
+        long retentionBudget = 0,
+        long seedIndex = 0
     )
     {
         Type = type;
@@ -160,6 +164,7 @@ public sealed class RaftRequest
         WalStallMs = walStallMs;
         PresentIndex = presentIndex;
         PresentTerm = presentTerm;
+        SeedIndex = seedIndex;
         LastLogTerm = lastLogTerm;
         Timestamp = timestamp;
         Endpoint = endpoint;

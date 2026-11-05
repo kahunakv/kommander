@@ -545,12 +545,15 @@ internal sealed class HeartbeatDriver
                     continue;
             }
 
-            // A transfer in flight to this peer: it will hold the log from the seeding index once the
-            // install lands, whatever position it last reported (none at all while the install holds its
-            // executor, or a stale one from before the transfer). The need is the index after the
-            // boundary; nothing below it is ever served to this peer again. Held for as long as the
-            // transfer is in flight, which the sender bounds by its own step and acknowledgement deadlines.
-            bool seeding = snapshotSender.TryGetSeedingIndex(node.Endpoint, out long seedingIndex);
+            // A transfer in flight to this peer, or an install remembered as running there (one this
+            // leader sent and stopped waiting for, or one the peer names in its refusal acks, whoever sent
+            // it): it will hold the log from that boundary once the install lands, whatever position it
+            // last reported (none at all while the install holds its executor, or a stale one from before
+            // the transfer). The need is the index after the boundary; nothing below it is ever served to
+            // this peer again. Held for as long as the install is remembered — not for the attempt's life:
+            // between two attempts at one install the floor once rose to the commit index, and the
+            // follower landed 2.4 M entries below the first retained entry (CamusDB fault soak, 2026-11-05).
+            bool seeding = snapshotSender.TryGetRetentionHoldIndex(node.Endpoint, out long seedingIndex);
             long seedingNeed = seeding ? seedingIndex + 1 : long.MaxValue;
 
             // DURABLE, contiguous evidence only, in this order of preference:
@@ -576,6 +579,15 @@ internal sealed class HeartbeatDriver
                 position = tracker.GetCommitFrontierOrDefault(node.Endpoint, -1);
                 if (position < 0 && tracker.TryGetMatchIndex(node.Endpoint, out long match))
                     position = match;
+            }
+
+            // A peer that reports a position at or past the boundary holds it: the install landed (or the
+            // peer got there by log), the hold is over, and the remembered install is forgotten here so a
+            // stale record cannot keep the log below a peer that has moved on. Its need is its position's.
+            if (seeding && position >= seedingIndex)
+            {
+                snapshotSender.ForgetInstallsCoveredBy(node.Endpoint, position);
+                seeding = false;
             }
 
             // A peer being seeded needs nothing below the index it is seeded at, whatever position it last

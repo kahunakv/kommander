@@ -107,6 +107,7 @@ public static class GrpcCommunicationPool
         obj.WalStallMs = 0;
         obj.PresentIndex = 0;
         obj.PresentTerm = 0;
+        obj.SeedIndex = 0;
 
         if (Interlocked.Increment(ref _completeAppendLogsCount) <= MaxRetained)
         {

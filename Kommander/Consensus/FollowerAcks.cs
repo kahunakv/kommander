@@ -24,6 +24,10 @@ namespace Kommander.Consensus;
 ///   the contiguous presence frontier and the term there. It is the only position that can anchor
 ///   the repair of a hole inside the leader's UNCOMMITTED inherited tail, which the commit
 ///   frontier cannot reach until the barrier commits (see <c>HeartbeatDriver.VerifiedPresenceAnchorAsync</c>).</item>
+///   <item><see cref="CompleteAppendLogsRequest.SeedIndex"/>: the whole-partition install this node is
+///   running or recently landed (<see cref="IRaftPartitionHost.ReportedInstallIndex"/>). Any leader —
+///   the one that sent the install or its successor — holds retention from that boundary while the
+///   install runs and keeps the peer's post-install lag exempt from the budget clamp afterwards.</item>
 /// </list>
 /// All are read on the partition executor, the single writer of the frontiers.
 /// </summary>
@@ -42,7 +46,8 @@ internal static class FollowerAcks
         IRaftPartitionHost host,
         long term,
         HLCTimestamp timestamp,
-        RaftOperationStatus status) =>
+        RaftOperationStatus status,
+        long seedIndex = 0) =>
         new(
             host.PartitionId,
             term,
@@ -51,7 +56,8 @@ internal static class FollowerAcks
             status,
             -1,
             durableIndex: -1,
-            walStallMs: 0);
+            walStallMs: 0,
+            seedIndex: seedIndex);
 
     public static CompleteAppendLogsRequest Build(
         IRaftPartitionHost host,
@@ -70,5 +76,6 @@ internal static class FollowerAcks
             durableIndex: wal.GetDurableCommitFrontier(),
             walStallMs: (long)wal.GetOldestPendingWriteAgeMs(),
             presentIndex: wal.GetPresentIndex(),
-            presentTerm: wal.GetPresentTerm());
+            presentTerm: wal.GetPresentTerm(),
+            seedIndex: host.ReportedInstallIndex);
 }

@@ -544,6 +544,20 @@ public static class KommanderMetrics
             new KeyValuePair<string, object?>("cause", cause));
 
     /// <summary>
+    /// Periods of <c>SnapshotTransferStepTimeout</c> a transfer spent waiting for a follower's install
+    /// whose staged-bytes figure did not move while the follower kept reporting it running. The wait
+    /// goes on (the figure stops at the end of the stream while the import's later phases run); a count
+    /// that keeps rising for one follower is an install stuck in those phases.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotInstallWaitsPastStepTimeoutTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.install_waits_past_step_timeout_total",
+            description: "Step-timeout periods spent waiting for a follower install whose read progress did not move.");
+
+    internal static void RecordSnapshotInstallWaitPastStepTimeout(int partitionId) =>
+        SnapshotInstallWaitsPastStepTimeoutTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Snapshot-rescue convergence breaker trips: N consecutive installs each reported success and
     /// the follower still returned below the compaction floor, so the leader stopped escalating.
     /// This never shows in <see cref="SnapshotTransferFailuresTotal"/> — nothing in such a loop

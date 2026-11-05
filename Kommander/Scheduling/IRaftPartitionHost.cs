@@ -229,4 +229,20 @@ public interface IRaftPartitionHost
     /// leading, so nothing it recorded describes a leadership that still exists).
     /// </summary>
     void ClearFollowerProgress(string? endpoint) { }
+
+    /// <summary>
+    /// The boundary index of the whole-partition snapshot install this node landed within the last
+    /// <see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/>; 0 when none. Every positional ack
+    /// this node sends names it (<see cref="Data.CompleteAppendLogsRequest.SeedIndex"/>; the refusal acks
+    /// sent while an install holds the executor name that install instead), so a leader that did not
+    /// send the install — the successor of the one that did — keeps the lag it handed this node exempt
+    /// from the retention budget. Default 0 for hosts that do not install snapshots (unit-test stubs).
+    /// </summary>
+    long ReportedInstallIndex => 0;
+
+    /// <summary>
+    /// Records that a whole-partition install landed at <paramref name="snapshotIndex"/> on this node,
+    /// for <see cref="ReportedInstallIndex"/>. Called on the executor by the installer. Default no-op.
+    /// </summary>
+    void NoteSnapshotInstalled(long snapshotIndex) { }
 }

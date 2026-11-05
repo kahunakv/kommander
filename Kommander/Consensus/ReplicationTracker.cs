@@ -271,6 +271,14 @@ internal sealed class ReplicationTracker
     private readonly Dictionary<string, SnapshotSeed> snapshotSeeds = [];
 
     /// <summary>
+    /// Per peer, the highest install boundary it has named in its acks
+    /// (<see cref="Data.CompleteAppendLogsRequest.SeedIndex"/>). A reported boundary arms the peer's
+    /// <see cref="snapshotSeeds"/> record once: the peer names it on every ack for a while after the
+    /// install, and re-arming on each would keep a caught-up peer exempt from the budget clamp for good.
+    /// </summary>
+    private readonly Dictionary<string, long> reportedSeeds = [];
+
+    /// <summary>
     /// One live commit or rollback broadcast shipped to a peer: the contiguous id range it resolves
     /// and the monotonic tick it was handed to the transport.
     /// </summary>
@@ -331,6 +339,7 @@ internal sealed class ReplicationTracker
         mismatchAnchors.Clear();
         backfillProgress.Clear();
         snapshotSeeds.Clear();
+        reportedSeeds.Clear();
         compactedAnchorShips.Clear();
         resolutionShipments.Clear();
 
@@ -355,6 +364,7 @@ internal sealed class ReplicationTracker
         mismatchAnchors.Clear();
         backfillProgress.Clear();
         snapshotSeeds.Clear();
+        reportedSeeds.Clear();
         compactedAnchorShips.Clear();
         resolutionShipments.Clear();
     }
@@ -377,6 +387,7 @@ internal sealed class ReplicationTracker
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
         snapshotSeeds.Remove(endpoint);
+        reportedSeeds.Remove(endpoint);
         compactedAnchorShips.Remove(endpoint);
         resolutionShipments.Remove(endpoint);
         backfillDecisions.Remove(endpoint);
@@ -829,6 +840,30 @@ internal sealed class ReplicationTracker
 
     /// <summary>Forgets the peer's install record (its grace lapsed, or the peer converged).</summary>
     public void ClearSnapshotSeed(string endpoint) => snapshotSeeds.Remove(endpoint);
+
+    /// <summary>
+    /// Records an install the peer itself reports having landed at <paramref name="seedIndex"/>
+    /// (<see cref="Data.CompleteAppendLogsRequest.SeedIndex"/>): the first report of a boundary arms the
+    /// peer's install record as if this leader had confirmed the install, with this leader's commit index
+    /// as the lag handed over. A boundary this leader already holds a record for, or has seen reported
+    /// before, changes nothing — the peer keeps naming it after its grace has lapsed, and the exemption
+    /// must not outlive the grace.
+    /// </summary>
+    public void NoteReportedSnapshotSeed(string endpoint, long seedIndex, long leaderCommitIndex)
+    {
+        if (seedIndex <= 0)
+            return;
+
+        if (reportedSeeds.TryGetValue(endpoint, out long reported) && reported >= seedIndex)
+            return;
+
+        reportedSeeds[endpoint] = seedIndex;
+
+        if (snapshotSeeds.TryGetValue(endpoint, out SnapshotSeed existing) && existing.Index >= seedIndex)
+            return;
+
+        snapshotSeeds[endpoint] = new SnapshotSeed(host.GetMonotonicTimestamp(), seedIndex, Math.Max(leaderCommitIndex, seedIndex));
+    }
 
     /// <summary>
     /// Records that an entry-carrying batch shipped to <paramref name="endpoint"/> while its

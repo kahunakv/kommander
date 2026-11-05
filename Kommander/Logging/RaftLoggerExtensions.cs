@@ -194,6 +194,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Retention budget raised to {Budget} entries so the log is kept from index {Hold} for a peer being seeded by snapshot or catching up from its install (rate budget {RateBudget})")]
     public static partial void LogInfoSeededPeerRetentionHold(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long budget, long hold, long rateBudget);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] The snapshot install at index {Index} on {Endpoint} has read no further into its staged snapshot for {Seconds:0.##} s (SnapshotTransferStepTimeout; {Progress} bytes read) but the follower reports it still running; this transfer keeps waiting for it and retention keeps holding from its boundary")]
+    public static partial void LogWarnInstallStillRunningPastStepTimeout(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, double seconds, long progress);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Inherited a live-replica retention budget of {Budget} entries from the previous leader; it holds until this leader's own commit history covers the window")]
     public static partial void LogInfoInheritedRetentionBudget(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long budget);
 
@@ -365,8 +368,11 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "TryAddMember: Adding {Endpoint} as Learner at version {Version}")]
     public static partial void LogInfoAddMemberAddingLearner(this ILogger<IRaft> logger, string endpoint, long version);
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "TryPromoteMember: Promoting {Endpoint} to Voter at version {Version}")]
-    public static partial void LogInfoPromoteMemberToVoter(this ILogger<IRaft> logger, string endpoint, long version);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "TryPromoteMember: Promoting {Endpoint} to Voter at version {Version}; the roster holds {Voters} voter(s) once this commits")]
+    public static partial void LogWarnPromoteMemberToVoter(this ILogger<IRaft> logger, string endpoint, long version, int voters);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[RaftSystemCoordinator] Committed roster v{Version} holds {Voters} voter(s) and {Learners} learner(s); {Evicted} evicted member(s) not admitted again: {Endpoints}. Until they rejoin and are promoted, the cluster tolerates fewer failures than it was sized for")]
+    public static partial void LogWarnRosterShortOfEvictedMembers(this ILogger<IRaft> logger, long version, int voters, int learners, int evicted, string endpoints);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Endpoint {Endpoint} is not in the roster; treating as idempotent success at version {Version}")]
     public static partial void LogInfoRemoveMemberNotInRoster(this ILogger<IRaft> logger, string endpoint, long version);

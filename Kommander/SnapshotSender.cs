@@ -114,11 +114,14 @@ internal sealed class SnapshotSender
 
     /// <summary>
     /// Per follower, the install whose outcome this leader does not know: the session of a terminal
-    /// chunk that was never answered, or an install a transfer stopped waiting for (a step timeout,
-    /// unanswered polls, a lost leadership). The next attempt names it in its first question to the
+    /// chunk that was never answered, an install a transfer stopped waiting for (unanswered polls, a
+    /// lost leadership), or one the follower itself reports running in its refusal acks (an empty
+    /// session: another leader sent it). The next attempt names it in its first question to the
     /// follower, so an install that has finished meanwhile is adopted and one that is still running
-    /// is waited for — neither is sent again. Removed once the follower reports an outcome for it or
-    /// no longer knows it.
+    /// is waited for — neither is sent again. Retention holds from its boundary for as long as it is
+    /// remembered (<see cref="TryGetRetentionHoldIndex"/>): an install is the leader's own doing, and
+    /// the hold used to end with the attempt that sent it while the install ran on. Removed once the
+    /// follower reports an outcome for it, no longer knows it, or reports a position at or past it.
     /// </summary>
     private readonly ConcurrentDictionary<string, AwaitedInstall> unresolvedInstalls = new();
 
@@ -131,9 +134,11 @@ internal sealed class SnapshotSender
     /// <summary>
     /// Per follower with a transfer in flight, the lowest snapshot index that transfer will leave it at:
     /// the index it exports, lowered to the index of an install it found already running there and
-    /// waits for. The leader's heartbeat round reads it to hold log retention from that index and to
-    /// withhold entry-carrying sends until the install ends. Set when the transfer starts, removed when
-    /// it ends however it ends; a peer with no entry here is not being seeded.
+    /// waits for. The leader's send path reads it to withhold entry-carrying sends until the install
+    /// ends, and the heartbeat round folds it into the retention hold (<see cref="TryGetRetentionHoldIndex"/>).
+    /// Set when the transfer starts, removed when it ends however it ends; a peer with no entry here
+    /// is not being seeded by this leader right now (it may still have an install running: see
+    /// <see cref="unresolvedInstalls"/>).
     /// </summary>
     private readonly ConcurrentDictionary<string, long> seedingIndexes = new();
 
@@ -688,11 +693,13 @@ internal sealed class SnapshotSender
         const int chunkSize = 3 * 1024 * 1024;
 
         // Per-step watchdog: every awaited external step — the application export, one stream
-        // read, one chunk send — must finish inside SnapshotTransferStepTimeout. A step that
-        // completes resets the clock, so a large snapshot on a slow link is never cut off; only a
-        // step that stops moving trips it. Without this bound, one hung export or one
+        // read, one chunk send, one status query — must finish inside SnapshotTransferStepTimeout. A
+        // step that completes resets the clock, so a large snapshot on a slow link is never cut off;
+        // only a step that stops moving trips it. Without this bound, one hung export or one
         // deadline-less install RPC parked this task forever, the pendingSnapshotEndpoints entry
-        // never released, and CanAttempt silently vetoed every later rescue for this follower.
+        // never released, and CanAttempt silently vetoed every later rescue for this follower. The
+        // follower's install itself is not a step: it is waited for as long as the follower answers
+        // that it runs (AwaitInstallAsync).
         TimeSpan stepTimeout = host.Configuration.SnapshotTransferStepTimeout;
         using CancellationTokenSource transferCts = new();
 
@@ -852,11 +859,66 @@ internal sealed class SnapshotSender
     /// <summary>
     /// Whether a transfer to <paramref name="endpoint"/> is in flight — exporting, streaming chunks, or
     /// waiting for the follower's install — and, when one is, the index the follower will hold once it is
-    /// installed. Read by the leader's send path and its heartbeat round off the executor; the maps are
-    /// concurrent.
+    /// installed. Read by the leader's send path off the executor; the maps are concurrent. The retention
+    /// hold is <see cref="TryGetRetentionHoldIndex"/>, which outlives the transfer.
     /// </summary>
     internal bool TryGetSeedingIndex(string endpoint, out long snapshotIndex) =>
         seedingIndexes.TryGetValue(endpoint, out snapshotIndex) && snapshotIndex > 0;
+
+    /// <summary>
+    /// The index WAL retention holds from for <paramref name="endpoint"/>: the lower of the index a transfer
+    /// in flight is seeding it at (<see cref="TryGetSeedingIndex"/>) and the boundary of an install this
+    /// leader remembers as unresolved there (<see cref="unresolvedInstalls"/>) — the one it sent and stopped
+    /// waiting for, or the one the follower reports running. Unlike the in-flight index this outlives the
+    /// attempt: a follower with an install running at a boundary needs the entries after it whatever
+    /// became of the transfer that sent it, and holding only for the attempt's life let the floor rise to
+    /// the commit index between two attempts and compacted 2.4 M entries the follower then needed (CamusDB
+    /// fault soak, 2026-11-05). Read by the heartbeat round off the executor; the maps are concurrent.
+    /// </summary>
+    internal bool TryGetRetentionHoldIndex(string endpoint, out long snapshotIndex)
+    {
+        bool inFlight = seedingIndexes.TryGetValue(endpoint, out long seeding) && seeding > 0;
+        bool unresolved = unresolvedInstalls.TryGetValue(endpoint, out AwaitedInstall remembered) && remembered.SnapshotIndex > 0;
+
+        snapshotIndex = inFlight && unresolved
+            ? Math.Min(seeding, remembered.SnapshotIndex)
+            : inFlight ? seeding : unresolved ? remembered.SnapshotIndex : 0;
+
+        return snapshotIndex > 0;
+    }
+
+    /// <summary>
+    /// Remembers an install the follower reports running at <paramref name="snapshotIndex"/> in its
+    /// refusal acks (<see cref="Data.CompleteAppendLogsRequest.SeedIndex"/>), with no session: this leader
+    /// may not have sent it. An install this leader is already waiting for by session keeps its record,
+    /// lowered to the reported boundary if that is lower. Called on the executor from the ack path.
+    /// </summary>
+    internal void NoteFollowerInstalling(string endpoint, long snapshotIndex)
+    {
+        if (snapshotIndex <= 0)
+            return;
+
+        unresolvedInstalls.AddOrUpdate(
+            endpoint,
+            static (_, reported) => new AwaitedInstall("", reported),
+            static (_, current, reported) => string.IsNullOrEmpty(current.SessionId)
+                ? (current.SnapshotIndex == reported ? current : new AwaitedInstall("", reported))
+                : (reported < current.SnapshotIndex ? new AwaitedInstall(current.SessionId, reported) : current),
+            snapshotIndex);
+    }
+
+    /// <summary>
+    /// Forgets a remembered install whose boundary is at or below <paramref name="position"/>, a
+    /// position the follower has reported holding: the install is moot (it landed, or the follower
+    /// got there by log), and the retention hold from its boundary would keep entries for nothing.
+    /// </summary>
+    internal void ForgetInstallsCoveredBy(string endpoint, long position)
+    {
+        if (unresolvedInstalls.TryGetValue(endpoint, out AwaitedInstall remembered)
+            && remembered.SnapshotIndex > 0
+            && remembered.SnapshotIndex <= position)
+            unresolvedInstalls.TryRemove(new KeyValuePair<string, AwaitedInstall>(endpoint, remembered));
+    }
 
     /// <summary>
     /// The index the follower's boundary now covers: the one the install carried when the receiver
@@ -958,19 +1020,24 @@ internal sealed class SnapshotSender
     /// when the wait ended any other way (the failure is recorded here, or the wait was given up
     /// because this node stopped leading).
     ///
-    /// <para><b>Bounded by progress.</b> The follower reports how far the install has read into its
-    /// staged snapshot. The wait ends with a <see cref="TimeoutException"/> — recorded by the caller
-    /// as <c>step_timeout</c>, like any step that stopped moving — only when that figure has not
-    /// changed for <see cref="RaftConfiguration.SnapshotTransferStepTimeout"/>. How long the install
-    /// takes in total is the application's business: a 200,000-record import on a disk at 90% busy
-    /// takes tens of seconds, and a fixed bound sized for a chunk cut every one of them off.</para>
+    /// <para><b>Not bounded by progress.</b> The follower reports how far the install has read into
+    /// its staged snapshot, and that figure stops moving once the import has read the stream while the
+    /// import's own phases — the drain of queued writes, the purge of the old rows, the store decode —
+    /// run on. Treating a stalled figure as a hung step ended the attempt, released the guard, and the
+    /// retry re-anchored the transfer at a newer index only to wait for the same install (and the
+    /// retention hold moved with it — CamusDB fault soak, 2026-11-05). A figure that has not moved for
+    /// <see cref="RaftConfiguration.SnapshotTransferStepTimeout"/> is logged at Warning, once per such
+    /// period, and the wait goes on. How long the install takes in total is the application's business:
+    /// a 200,000-record import on a disk at 90% busy takes tens of seconds, and a fixed bound sized for
+    /// a chunk cut every one of them off.</para>
     ///
-    /// <para><b>What ends it otherwise.</b> The follower reports the install failed
+    /// <para><b>What ends it.</b> The follower reports the install done; it reports it failed
     /// (<c>install_failed</c>); it no longer knows the install, because it restarted
-    /// (<c>install_lost</c>); or it has not answered any poll for
-    /// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/> (<c>install_status_unanswered</c>).
-    /// In the last case, and on a timeout, the install stays remembered in
-    /// <see cref="unresolvedInstalls"/> and the next attempt asks about it before exporting.</para>
+    /// (<c>install_lost</c>); it has not answered any poll for
+    /// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/> (<c>install_status_unanswered</c>);
+    /// or this node stops leading. In the last two cases the install stays remembered in
+    /// <see cref="unresolvedInstalls"/>: retention keeps holding from its boundary, and the next
+    /// attempt asks about it before exporting.</para>
     ///
     /// <para>The follower runs one install per partition, so the install being waited for can be
     /// replaced by another while this loop runs (the first ended, a different sender's began). The
@@ -1052,8 +1119,13 @@ internal sealed class SnapshotSender
                         }
                         else if (Stopwatch.GetElapsedTime(lastProgressTicks, now) >= stepTimeout)
                         {
-                            throw new TimeoutException(
-                                $"the snapshot install at index {awaited.SnapshotIndex} on the follower made no progress within {stepTimeout.TotalSeconds:0.##}s (SnapshotTransferStepTimeout; {progress} staged bytes read); it is still running there and the next attempt waits for it instead of sending again");
+                            // The follower keeps answering that the install runs; only its read figure
+                            // has stopped. Say so and keep waiting (see the method summary).
+                            lastProgressTicks = now;
+                            KommanderMetrics.RecordSnapshotInstallWaitPastStepTimeout(host.PartitionId);
+                            logger.LogWarnInstallStillRunningPastStepTimeout(
+                                host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint,
+                                awaited.SnapshotIndex, stepTimeout.TotalSeconds, progress);
                         }
 
                         continue;

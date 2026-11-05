@@ -38,6 +38,10 @@ internal sealed class ReplicationAckProcessor
     private readonly ReadIndexCoordinator readIndex;
     private readonly BackfillSender sender;
     private readonly ElectionCoordinator election;
+
+    /// <summary>Where a peer's reported running install is remembered, so retention holds from it and the next transfer waits for it.</summary>
+    private readonly SnapshotSender snapshotSender;
+
     private readonly RaftPartitionLogThrottle logThrottle;
     private readonly ILogger<IRaft> logger;
 
@@ -53,6 +57,7 @@ internal sealed class ReplicationAckProcessor
         ReadIndexCoordinator readIndex,
         BackfillSender sender,
         ElectionCoordinator election,
+        SnapshotSender snapshotSender,
         RaftPartitionLogThrottle logThrottle,
         ILogger<IRaft> logger,
         Action failAllActiveProposalWaiters)
@@ -65,12 +70,13 @@ internal sealed class ReplicationAckProcessor
         this.readIndex = readIndex;
         this.sender = sender;
         this.election = election;
+        this.snapshotSender = snapshotSender;
         this.logThrottle = logThrottle;
         this.logger = logger;
         this.failAllActiveProposalWaiters = failAllActiveProposalWaiters;
     }
 
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1, long seedIndex = 0)
     {
         long ackStartTicks = RoundStageInstrumentation.Stamp();
 
@@ -173,6 +179,31 @@ internal sealed class ReplicationAckProcessor
         // entries contiguously. The anchored hole repair needs it when the hole sits in this
         // leader's uncommitted inherited tail, above every commit frontier (HeartbeatDriver).
         tracker.SetPresenceFrontier(endpoint, presentIndex, presentTerm);
+
+        // A fourth fact, about whole-partition installs (CompleteAppendLogsRequest.SeedIndex; 0 from
+        // peers that predate it). While an install holds the peer's executor it refuses entry-carrying
+        // appends and names the install: retention holds from that boundary on whichever node leads,
+        // and the next transfer to the peer waits for the install instead of exporting another. A peer
+        // that recently landed an install names its boundary on every positional ack: a leader that did
+        // not send it (the successor of the one that did) records it as the peer's snapshot seed, so the
+        // lag the install handed the peer stays exempt from the retention budget clamp while it closes
+        // it, and no second snapshot is offered inside the seeded grace. Without this a successor
+        // elected right after a long install started from a fresh tracker, clamped the peer's need to
+        // the rate budget, and re-installed it (CamusDB fault soak, 2026-11-05).
+        if (seedIndex > 0 && endpoint != host.LocalEndpoint)
+        {
+            if (status == RaftOperationStatus.FollowerInstallingSnapshot)
+                snapshotSender.NoteFollowerInstalling(endpoint, seedIndex);
+            else
+                tracker.NoteReportedSnapshotSeed(endpoint, seedIndex, coreState.LocalCommittedIndex);
+        }
+
+        // A position at or past a remembered install's boundary means the peer holds that boundary:
+        // the install is moot, and holding retention from it would only keep entries for nothing.
+        if (durableIndex > 0)
+            snapshotSender.ForgetInstallsCoveredBy(endpoint, durableIndex);
+        if (status == RaftOperationStatus.Success && committedIndex > 0)
+            snapshotSender.ForgetInstallsCoveredBy(endpoint, committedIndex);
 
         // Hand the same two facts to readers outside the executor (IRaft.GetFollowerProgress): an
         // application waiting on this follower can then see, without a scheduler round-trip, that its

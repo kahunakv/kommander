@@ -1504,15 +1504,23 @@ public class RaftConfiguration
     /// commits a <c>RemoveMember</c> entry.  A grace period absorbs transient partitions
     /// that resolve before the eviction log entry is applied.
     /// <para>
-    /// Default 2 minutes. Eviction is an expensive one-way door — a member that misses the
-    /// window must run the Join flow again — so the default must comfortably exceed a routine
-    /// restart (image pull, cold storage open on a large store), not just a network blip.
-    /// The original 30 s default was shorter than a cold RocksDB start and evicted nodes mid
-    /// <c>docker restart</c>. The eviction path additionally re-probes the endpoint at commit
-    /// time, but the grace is the first line of defense.
+    /// Default 10 minutes. Size it to the longest outage the cluster should ride through with its
+    /// roster intact, not to a routine restart. Eviction is an expensive one-way door: a member that
+    /// misses the window must run the Join flow again, is re-admitted as a Learner, and becomes a
+    /// voter only once it has caught up on every partition — after a whole-partition install that is
+    /// minutes. On a three-voter cluster the eviction buys nothing (the roster shrinks to two voters,
+    /// so one more failure is an outage either way, exactly as it was with the member merely down)
+    /// and costs the fault tolerance of the whole re-seed-and-promote window: a 30-second pause of
+    /// one of the two remaining voters inside it was a 30-second outage with the previous 2-minute
+    /// default and a 4-minute kill (CamusDB fault soak, 2026-11-04). What eviction buys is on larger
+    /// clusters with spare nodes, where the placement pass can re-replicate the evicted member's
+    /// ranges elsewhere; set the grace to the outage length past which that is preferable to waiting
+    /// for the member. The original 30 s default was shorter than a cold RocksDB start and evicted
+    /// nodes mid <c>docker restart</c>. The eviction path additionally re-probes the endpoint at
+    /// commit time, but the grace is the first line of defense.
     /// </para>
     /// </summary>
-    public TimeSpan DeadMemberEvictionGrace { get; set; } = TimeSpan.FromMinutes(2);
+    public TimeSpan DeadMemberEvictionGrace { get; set; } = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// When enabled (default), a node that discovers it has been removed from the committed

@@ -80,6 +80,22 @@ public sealed class RaftPartition : IDisposable
     /// <summary>Entry-carrying appends refused during the current install (see <see cref="AppendLogs"/>).</summary>
     private long appendsRefusedWhileInstalling;
 
+    /// <summary>
+    /// The boundary index of the install that holds the executor (0 when none), named in the refusal acks
+    /// so whichever node leads holds retention from it and waits for it. Written with the latch above.
+    /// </summary>
+    private long installingSnapshotIndex;
+
+    /// <summary>
+    /// The boundary index of the last whole-partition install this process landed and when, named in
+    /// positional acks for <see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/> afterwards
+    /// (see <see cref="ReportedInstallIndex"/>). Written on the executor by the installer; read on the
+    /// executor by the ack builder.
+    /// </summary>
+    private long installedSnapshotIndex;
+
+    private long installedAtTicks;
+
     private readonly RaftWriteAhead walHandler;
 
     private int _disposed;
@@ -531,7 +547,8 @@ public sealed class RaftPartition : IDisposable
             durableIndex: request.DurableIndex,
             walStallMs: request.WalStallMs,
             presentIndex: request.PresentIndex,
-            presentTerm: request.PresentTerm
+            presentTerm: request.PresentTerm,
+            seedIndex: request.SeedIndex
         ));
     }
 
@@ -783,6 +800,7 @@ public sealed class RaftPartition : IDisposable
         // Raised before the install is queued, not when the executor reaches it: an append posted in
         // between would only wait behind the install, so refusing it now loses nothing (see AppendLogs).
         // One install runs per partition (the receiver refuses a second), so the flag is a plain latch.
+        Volatile.Write(ref installingSnapshotIndex, request.SnapshotIndex);
         Volatile.Write(ref snapshotInstallRunning, 1);
         Interlocked.Exchange(ref appendsRefusedWhileInstalling, 0);
         long startedTicks = manager.Configuration.TickSource.GetTimestamp();
@@ -795,6 +813,7 @@ public sealed class RaftPartition : IDisposable
         finally
         {
             Volatile.Write(ref snapshotInstallRunning, 0);
+            Volatile.Write(ref installingSnapshotIndex, 0);
 
             long refused = Interlocked.Exchange(ref appendsRefusedWhileInstalling, 0);
             if (refused > 0 && logger.IsEnabled(LogLevel.Information))
@@ -811,10 +830,49 @@ public sealed class RaftPartition : IDisposable
     /// <summary>Entry-carrying appends refused so far during the running install (tests).</summary>
     internal long AppendsRefusedWhileInstalling => Volatile.Read(ref appendsRefusedWhileInstalling);
 
+    /// <summary>
+    /// The landed install boundary this node names in its positional acks
+    /// (<see cref="IRaftPartitionHost.ReportedInstallIndex"/>, reached through the host adapter), for a
+    /// bounded time after the install; 0 otherwise. The install that holds the executor is named by the
+    /// refusal acks instead, which read <see cref="installingSnapshotIndex"/> on the transport threads: a
+    /// positional ack built on the executor while an install is queued behind it (a heartbeat taken before
+    /// the install ran) must not name a boundary this node has not landed.
+    /// </summary>
+    internal long ReportedInstallIndex
+    {
+        get
+        {
+            long installed = Volatile.Read(ref installedSnapshotIndex);
+            if (installed <= 0)
+                return 0;
+
+            // Named for as long as a leader keeps a seed on record (the cap of the seeded catch-up grace):
+            // a successor elected inside that window learns the boundary from the first ack; one elected
+            // later sees a peer that has had the whole window to close the lag the install handed it.
+            TimeSpan window = manager.Configuration.BackfillSeededCatchUpGraceCap;
+            if (window <= TimeSpan.Zero)
+                return 0;
+
+            long elapsedTicks = manager.Configuration.TickSource.GetTimestamp() - Volatile.Read(ref installedAtTicks);
+            return elapsedTicks <= window.TotalSeconds * manager.Configuration.TickSource.Frequency ? installed : 0;
+        }
+    }
+
+    /// <summary>Records a landed install for <see cref="ReportedInstallIndex"/> (<see cref="IRaftPartitionHost.NoteSnapshotInstalled"/>). Executor thread.</summary>
+    internal void NoteSnapshotInstalled(long snapshotIndex)
+    {
+        if (snapshotIndex <= 0)
+            return;
+
+        Volatile.Write(ref installedAtTicks, manager.Configuration.TickSource.GetTimestamp());
+        Volatile.Write(ref installedSnapshotIndex, snapshotIndex);
+    }
+
     // Answers an entry-carrying append refused during an install. The ack carries no position: every
     // frontier is the executor's to read, and the leader treats -1 as "no report" — it leaves this peer's
-    // cursors and the retention floor where they are, which is what the install's own completion then
-    // advances. The responder queue is a channel, safe from this (transport) thread.
+    // cursors where they are, which is what the install's own completion then advances. It does name the
+    // install's boundary, so whichever node leads holds retention from there and waits for the install
+    // instead of sending another snapshot. The responder queue is a channel, safe from this (transport) thread.
     private void RefuseAppendWhileInstalling(AppendLogsRequest request)
     {
         Interlocked.Increment(ref appendsRefusedWhileInstalling);
@@ -823,7 +881,8 @@ public sealed class RaftPartition : IDisposable
         host.EnqueueResponse(request.Endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs,
             new(request.Endpoint),
-            FollowerAcks.BuildWithoutPosition(host, request.Term, request.Time, RaftOperationStatus.FollowerInstallingSnapshot)));
+            FollowerAcks.BuildWithoutPosition(host, request.Term, request.Time, RaftOperationStatus.FollowerInstallingSnapshot,
+                seedIndex: Volatile.Read(ref installingSnapshotIndex))));
     }
 
     public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)

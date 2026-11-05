@@ -289,7 +289,8 @@ public sealed class RaftService : Rafter.RafterBase
             request.DurableIndex,
             request.WalStallMs,
             request.PresentIndex,
-            request.PresentTerm
+            request.PresentTerm,
+            request.SeedIndex
         ));
         
         return completeAppendLogsResponse;
@@ -571,7 +572,8 @@ public sealed class RaftService : Rafter.RafterBase
                                     completeAppendLogsRequest.DurableIndex,
                                     completeAppendLogsRequest.WalStallMs,
                                     completeAppendLogsRequest.PresentIndex,
-                                    completeAppendLogsRequest.PresentTerm
+                                    completeAppendLogsRequest.PresentTerm,
+                                    completeAppendLogsRequest.SeedIndex
                                 ));
 
                                 break;

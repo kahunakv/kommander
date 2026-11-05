@@ -58,6 +58,8 @@ public sealed class TestFollowerInstallRefusal
 
         await gateReached.Task.WaitAsync(TestTimeouts.Scale(TimeSpan.FromSeconds(10)), TestContext.Current.CancellationToken);
         Assert.True(partition.IsInstallingSnapshot);
+        // Nothing has landed yet: positional acks name no boundary; the refusal below names the running install.
+        Assert.Equal(0, partition.ReportedInstallIndex);
 
         int capturedBefore = comm.Captured.Count;
 
@@ -72,6 +74,7 @@ public sealed class TestFollowerInstallRefusal
         CompleteAppendLogsRequest refusal = comm.Captured.Skip(capturedBefore).First(r => r.Status == RaftOperationStatus.FollowerInstallingSnapshot);
         Assert.Equal(-1, refusal.CommitIndex);
         Assert.Equal(-1, refusal.DurableIndex);
+        Assert.Equal(3, refusal.SeedIndex);
         Assert.Equal(term, refusal.Term);
         Assert.Equal(1, partition.AppendsRefusedWhileInstalling);
 
@@ -89,6 +92,9 @@ public sealed class TestFollowerInstallRefusal
         Assert.Equal(SnapshotInstallOutcome.Installed, outcome);
         Assert.False(partition.IsInstallingSnapshot);
         Assert.Equal(0, partition.AppendsRefusedWhileInstalling);
+        // The landed boundary is named in positional acks for the seeded grace, so a leader that did not
+        // send the install still keeps the lag it handed this node exempt from its retention budget.
+        Assert.Equal(3, partition.ReportedInstallIndex);
 
         // Entries are taken again now that the install is over: a write through the leader reaches the
         // follower's log over the ordinary replication path. The hold starved the leader of this

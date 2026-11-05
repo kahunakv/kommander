@@ -127,4 +127,8 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
     public void PublishFollowerProgress(RaftFollowerProgress progress) => partition.PublishFollowerProgress(progress);
 
     public void ClearFollowerProgress(string? endpoint) => partition.ClearFollowerProgress(endpoint);
+
+    public long ReportedInstallIndex => partition.ReportedInstallIndex;
+
+    public void NoteSnapshotInstalled(long snapshotIndex) => partition.NoteSnapshotInstalled(snapshotIndex);
 }

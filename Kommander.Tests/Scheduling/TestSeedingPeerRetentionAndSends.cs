@@ -109,6 +109,56 @@ public class TestSeedingPeerRetentionAndSends
         Assert.Equal(10, h.Wal.PublishedBudget);
     }
 
+    /// <summary>
+    /// The hold outlives the transfer attempt. The follower stops answering the install's status polls,
+    /// so the attempt gives up (the install stays remembered as unresolved); with no transfer in flight
+    /// the retention floor still holds at the seeding index + 1 and the budget still covers it. It used
+    /// to end with the attempt: between an attempt that gave up and the next, the floor rose to the
+    /// commit index and the follower landed its install 2.4 M entries below the first retained entry.
+    /// Once the install lands and the follower reports its position, the hold is over and the budget
+    /// follows the follower's need until it has caught up.
+    /// </summary>
+    [Fact]
+    public async Task TheHoldOutlivesTheAttempt_WhileTheInstallIsUnresolved()
+    {
+        Harness h = await Harness.BuildLeaderAsync(c =>
+        {
+            c.CompactionLiveReplicaLagBudget = 10;
+            c.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
+            c.SnapshotChunkAckTimeout = TimeSpan.FromMilliseconds(100);
+        });
+        h.Installer.Hold();
+
+        await h.AckSuccess();
+        await h.WaitUntilAsync(() => h.Statuses().Any(s => s.AwaitingInstall), "the transfer waits for the install");
+
+        // The follower goes silent on the status polls; the attempt gives up on it.
+        h.Host.AnswerQueries = false;
+        await h.WaitUntilAsync(() => h.Statuses().Any(s => !s.InFlight && s.FailedAttempts >= 1), "the attempt gives up on the unanswered install");
+        Assert.Contains("has not answered", Assert.Single(h.Statuses()).LastError);
+
+        // No transfer in flight, and the hold stands: the install is still remembered as running there.
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(Floor + 1, h.Wal.PublishedReplicaFloor);
+        Assert.Equal(Commit - (Floor + 1) + 1, h.Wal.PublishedBudget);
+
+        // The install lands (nobody is waiting for it) and the follower names its boundary in its next ack:
+        // the hold ends with its reported position, and its need stays exempt while it closes the lag.
+        h.Host.AnswerQueries = true;
+        h.Installer.Release();
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+
+        await h.AckSuccess(committedIndex: Floor, durableIndex: Floor, seedIndex: Floor);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(Floor + 1, h.Wal.PublishedReplicaFloor);
+        Assert.Equal(Commit - (Floor + 1) + 1, h.Wal.PublishedBudget);
+
+        await h.AckSuccess(committedIndex: Commit, durableIndex: Commit, seedIndex: Floor);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(Commit + 1, h.Wal.PublishedReplicaFloor);
+        Assert.Equal(10, h.Wal.PublishedBudget);
+    }
+
     // ── harness ───────────────────────────────────────────────────────────────
 
     private sealed class Harness
@@ -169,11 +219,11 @@ public class TestSeedingPeerRetentionAndSends
         }
 
         /// <summary>A follower ack; at frontier 0 its backfill is refused (below the checkpoint) and escalates.</summary>
-        public Task AckSuccess(long committedIndex = 0, long durableIndex = -1)
+        public Task AckSuccess(long committedIndex = 0, long durableIndex = -1, long seedIndex = 0)
         {
             ApplyPosted();
             return Sm.CompleteAppendLogsAsync(Follower, Host.HybridLogicalClock.TrySendOrLocalEvent(1),
-                RaftOperationStatus.Success, committedIndex, durableIndex: durableIndex).AsTask();
+                RaftOperationStatus.Success, committedIndex, durableIndex: durableIndex, seedIndex: seedIndex).AsTask();
         }
 
         /// <summary>One live proposal through the leader's replication path, the way a client write goes out
@@ -251,6 +301,9 @@ public class TestSeedingPeerRetentionAndSends
 
         public SnapshotReceiver Receiver { get; }
 
+        /// <summary>While false, status queries fail as a call that expired would: the follower is silent.</summary>
+        public volatile bool AnswerQueries = true;
+
         /// <summary>Entry-carrying AppendLogs handed to the transport for the follower.</summary>
         public int EntryBatchesSent => Volatile.Read(ref entryBatchesSent);
 
@@ -300,7 +353,9 @@ public class TestSeedingPeerRetentionAndSends
             Receiver.ReceiveInstallSnapshot(request, CancellationToken.None);
 
         public Task<SnapshotResponse> QuerySnapshotInstallAsync(RaftNode node, SnapshotRequest query, CancellationToken ct) =>
-            Receiver.ReceiveInstallSnapshot(query, CancellationToken.None);
+            AnswerQueries
+                ? Receiver.ReceiveInstallSnapshot(query, CancellationToken.None)
+                : Task.FromResult(new SnapshotResponse(false));
     }
 
     /// <summary>

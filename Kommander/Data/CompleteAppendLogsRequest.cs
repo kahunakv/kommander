@@ -64,7 +64,19 @@ public sealed class CompleteAppendLogsRequest
     /// </summary>
     public long PresentTerm { get; set; } = -1;
 
-    public CompleteAppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, RaftOperationStatus status, long commitIndex, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
+    /// <summary>
+    /// The boundary index of the whole-partition snapshot install this follower is running — on a
+    /// <see cref="RaftOperationStatus.FollowerInstallingSnapshot"/> ack, where it is the install that
+    /// holds its executor — or recently landed, on a positional ack, for as long as a leader would keep
+    /// that install on record (<see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/>). 0 when
+    /// none, and from peers predating the field. A leader holds WAL retention from a running install's
+    /// boundary and waits for the install before sending another snapshot; a leader that did not send
+    /// a landed install (a successor) records it as the peer's snapshot seed, so the lag the install
+    /// handed the peer stays exempt from the retention budget clamp while it closes it.
+    /// </summary>
+    public long SeedIndex { get; set; }
+
+    public CompleteAppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, RaftOperationStatus status, long commitIndex, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1, long seedIndex = 0)
     {
         Partition = partition;
         Term = term;
@@ -76,5 +88,6 @@ public sealed class CompleteAppendLogsRequest
         WalStallMs = walStallMs;
         PresentIndex = presentIndex;
         PresentTerm = presentTerm;
+        SeedIndex = seedIndex;
     }
 }

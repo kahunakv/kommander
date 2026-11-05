@@ -439,16 +439,39 @@ from feeding on itself:
   `SnapshotSender.TryGetSeedingIndex`; a live proposal or a backfill batch to a peer being exported
   to, streamed to, or awaited on is skipped (`raft.backfill.seeding_peer_sends_skipped_total`), and
   the entries ship contiguously from the installed boundary afterwards.
-- **Retention holds from the seeding index, exempt from the budget.** The heartbeat round's floor
-  publisher holds a seeding peer's need at the index it is seeded at + 1 — whatever position it last
-  reported — and keeps a just-seeded peer's need (while its install is on record) exempt from the
-  rate-scaled budget clamp by raising the published budget to cover it (`commit − need + 1`, still
-  under `CompactionLiveReplicaLagCap`). The raised budget travels to the followers on every
-  AppendLogs, so they hold too, and a node that wins an election inherits the last budget it received
+- **Retention holds from the install's boundary, exempt from the budget, for as long as the install
+  is unresolved.** The heartbeat round's floor publisher holds a peer's need at the boundary + 1 —
+  whatever position it last reported — while a transfer to it is in flight *or* an install is
+  remembered as running there (`SnapshotSender.TryGetRetentionHoldIndex`: the lower of the two), and
+  keeps a just-seeded peer's need (while its install is on record) exempt from the rate-scaled budget
+  clamp by raising the published budget to cover it (`commit − need + 1`, still under
+  `CompactionLiveReplicaLagCap`). The hold outlives the transfer attempt: it used to end with the
+  attempt, and between an attempt that gave up waiting and the next one the floor rose to the commit
+  index — the follower landed its install 2.4 M entries below the first retained entry and was
+  installed again (CamusDB fault soak, 2026-11-05). It ends when the peer reports a position at or
+  past the boundary. The raised budget travels to the followers on every AppendLogs, so they hold
+  too, and a node that wins an election inherits the last budget it received
   (`HeartbeatDriver.InheritRetentionBudget`) until its own commit history fills the window. Without
   these, a 130 s install at 8,600 entries/s outlasted a 1,000,000-entry budget, the first backfill
   after it was non-contiguous, and the leader re-installed in a loop (CamusDB fault soak, 2026-11-04).
   `raft.compaction.seeded_peer_retention_holds_total` counts the rounds that raised the budget.
+- **The follower names its install in every ack, so a successor leader holds too.**
+  `CompleteAppendLogsRequest.SeedIndex` carries the boundary of the install holding the follower's
+  executor (on its `FollowerInstallingSnapshot` refusals) or of the install it landed within the last
+  `BackfillSeededCatchUpGraceCap` (on positional acks). A leader that did not send the install — the
+  successor of the one that did — remembers a running install as unresolved (retention holds from it,
+  and its first transfer waits for it instead of exporting) and records a landed one as the peer's
+  snapshot seed, so the lag the install handed the peer stays exempt from the budget clamp while it
+  closes it. A reported boundary arms the seed once; peers predating the field send 0 and get the
+  previous behaviour.
+- **A stalled read figure does not end the wait.** The sender polls the follower for the install's
+  progress — bytes read from the staged snapshot — and that figure stops at the end of the stream
+  while the import's later phases (drain, purge, store decode) run. Treating that as a hung step ended
+  the attempt, released the in-flight guard, and the retry re-anchored the transfer at a newer index
+  only to wait for the same install. The sender now logs a Warning once per
+  `SnapshotTransferStepTimeout` of no progress (`raft.snapshot.install_waits_past_step_timeout_total`)
+  and keeps waiting; the wait still ends when the follower reports the install done, failed or lost,
+  goes silent for `SnapshotChunkAckTimeout`, or this node stops leading.
 
 ## Why the live path is *not* anchored
 

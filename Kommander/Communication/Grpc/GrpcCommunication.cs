@@ -544,6 +544,7 @@ public class GrpcCommunication : ICommunication
             completeAppendLogsRequest.WalStallMs = request.WalStallMs;
             completeAppendLogsRequest.PresentIndex = request.PresentIndex;
             completeAppendLogsRequest.PresentTerm = request.PresentTerm;
+            completeAppendLogsRequest.SeedIndex = request.SeedIndex;
 
             GrpcBatchRequestsRequestItem requestItem = new()
             {
@@ -787,6 +788,7 @@ public class GrpcCommunication : ICommunication
                 completeRequest.WalStallMs = requestItem.CompleteAppendLogs.WalStallMs;
                 completeRequest.PresentIndex = requestItem.CompleteAppendLogs.PresentIndex;
                 completeRequest.PresentTerm = requestItem.CompleteAppendLogs.PresentTerm;
+                completeRequest.SeedIndex = requestItem.CompleteAppendLogs.SeedIndex;
 
                 item.CompleteAppendLogs = completeRequest;
                 return item;

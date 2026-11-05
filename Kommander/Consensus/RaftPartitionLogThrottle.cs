@@ -142,17 +142,25 @@ internal sealed class RaftPartitionLogThrottle
             return;
         }
 
-        logger.LogWarning(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp} CommittedIndex={CommittedIndex} suppressedSinceLastLine={Suppressed}",
-            host.LocalEndpoint,
-            host.PartitionId,
-            coreState.NodeState,
-            status,
-            endpoint,
-            timestamp,
-            committedIndex,
-            suppressedFailedAckLogs
-        );
+        // A refusal because the peer is installing a snapshot is expected for the life of the install,
+        // and the install itself is logged at Warning by the snapshot sender; the ack line is kept at
+        // Information so a Warning-only log is not one line per second per install (261 suppressed per
+        // line in the CamusDB fault soak of 2026-11-05).
+        LogLevel level = status == RaftOperationStatus.FollowerInstallingSnapshot ? LogLevel.Information : LogLevel.Warning;
+
+        if (logger.IsEnabled(level))
+            logger.Log(
+                level,
+                "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp} CommittedIndex={CommittedIndex} suppressedSinceLastLine={Suppressed}",
+                host.LocalEndpoint,
+                host.PartitionId,
+                coreState.NodeState,
+                status,
+                endpoint,
+                timestamp,
+                committedIndex,
+                suppressedFailedAckLogs
+            );
 
         lastLoggedAckStatus   = status;
         lastFailedAckLogTicks = now;

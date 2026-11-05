@@ -548,7 +548,7 @@ All on `RaftConfiguration`. Defaults shown are the current code defaults.
 | `PingTimeout` | `500 ms` | Direct/indirect probe response deadline. |
 | `IndirectPingFanout` | `2` | Number of relays used for indirect probing. |
 | `SuspicionTimeout` | `5 s` | Time a node stays `Suspect` before becoming `Dead`. |
-| `DeadMemberEvictionGrace` | `30 s` | Time a node stays `Dead` before the P0 leader commits `RemoveMember`. |
+| `DeadMemberEvictionGrace` | `10 min` | Time a node stays `Dead` before the P0 leader commits `RemoveMember`. Size it to the longest outage the roster should ride through intact: an evicted member rejoins as a Learner and is a voter again only once it has caught up on every partition, and on a three-voter cluster the eviction buys nothing while that window costs the cluster's fault tolerance (a 30-second pause of one of the two remaining voters was a 30-second outage). Eviction pays off on clusters with spare nodes, where the placement pass re-replicates the evicted member's ranges. While evicted members are out, the P0 leader logs a Warning once a minute. |
 
 ---
 

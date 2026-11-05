@@ -1170,6 +1170,57 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // Keyed by learner endpoint; records when the learner first appeared caught-up on all partitions.
     private readonly Dictionary<string, DateTimeOffset> _learnerCaughtUpSince = new();
 
+    /// <summary>How often <see cref="WarnWhileRosterShortOfEvictedMembers"/> repeats its line.</summary>
+    internal static readonly TimeSpan RosterShortfallWarnInterval = TimeSpan.FromMinutes(1);
+
+    private DateTimeOffset _lastRosterShortfallWarnUtc = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// While the committed roster records evicted members that have not been admitted again (the
+    /// record is pruned on re-admission, so every <see cref="ClusterDepartureReason.Evicted"/> entry
+    /// is one still out), the P0 leader says so at Warning once per <see cref="RosterShortfallWarnInterval"/>:
+    /// the cluster is running on fewer voters than it was sized for, and a Warning-only log otherwise
+    /// shows the eviction and nothing until the member is promoted again, minutes later.
+    /// </summary>
+    private void WarnWhileRosterShortOfEvictedMembers(ClusterMembership roster)
+    {
+        if (roster.MembershipVersion == 0 || roster.Departures.Count == 0)
+            return;
+
+        int evicted = 0;
+        foreach (ClusterDeparture departure in roster.Departures)
+        {
+            if (departure.Reason == ClusterDepartureReason.Evicted)
+                evicted++;
+        }
+
+        if (evicted == 0)
+            return;
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (now - _lastRosterShortfallWarnUtc < RosterShortfallWarnInterval)
+            return;
+
+        _lastRosterShortfallWarnUtc = now;
+
+        if (!logger.IsEnabled(LogLevel.Warning))
+            return;
+
+        int voters = 0;
+        int learners = 0;
+        foreach (ClusterMember member in roster.Members)
+        {
+            if (member.Role == ClusterMemberRole.Voter)
+                voters++;
+            else if (member.Role == ClusterMemberRole.Learner)
+                learners++;
+        }
+
+        logger.LogWarnRosterShortOfEvictedMembers(
+            roster.MembershipVersion, voters, learners, evicted,
+            string.Join(", ", roster.Departures.Where(d => d.Reason == ClusterDepartureReason.Evicted).Select(d => d.Endpoint)));
+    }
+
     // Endpoints for which a terminal "below WAL floor, no transfer" signal has already been sent.
     // Prevents re-logging and re-signalling on every promotion tick.
     private readonly HashSet<string> _terminalBelowFloorEndpoints = new();
@@ -1373,6 +1424,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
         bool amP0Leader = await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
         if (!amP0Leader)
             return;
+
+        WarnWhileRosterShortOfEvictedMembers(_cachedMembership);
 
         if (_membershipChangePending)
             return;
@@ -1774,7 +1827,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
         };
 
         _membershipChangePending = true;
-        logger.LogInfoPromoteMemberToVoter(endpoint, newVersion);
+        // Warning, like the eviction that may have opened the reduced-voter window this closes: both
+        // must be visible in a Warning-only log.
+        logger.LogWarnPromoteMemberToVoter(endpoint, newVersion, newMembership.Members.Count(m => m.Role == ClusterMemberRole.Voter));
 
         try
         {

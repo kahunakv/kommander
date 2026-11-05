@@ -62,47 +62,50 @@ public class TestSnapshotInstallAwaited
     }
 
     /// <summary>
-    /// A retry against a running install waits for that install and does not export again. The first
-    /// attempt is abandoned mid-wait (the install reports no progress for the step timeout); the
-    /// leader's checkpoint then moves, so the next escalation carries a newer index — the shape that
-    /// used to open a second session at that index. It must attach to the running install: no second
-    /// export, no second session, and the follower's cursor lands on the index that was installed.
+    /// An install whose staged-bytes figure stops moving is still waited for by the same attempt: the
+    /// figure stops at the end of the stream while the import's own phases run on, and ending the
+    /// attempt on it released the guard and re-anchored the retry at a newer index only to wait for
+    /// the same install (the retention hold moved with the re-anchor). Several step timeouts pass with
+    /// the figure frozen; the leader's checkpoint moves meanwhile; nothing fails, nothing is exported
+    /// or staged again, and the follower's cursor lands on the index that was installed.
     /// </summary>
     [Fact]
-    public async Task RetryAgainstARunningInstall_WaitsForIt_AndDoesNotExportAgain()
+    public async Task InstallWhoseReadFigureStalls_IsStillWaitedFor_AndNotReanchored()
     {
-        Harness h = await Harness.BuildLeaderAsync(c => c.SnapshotTransferStepTimeout = TimeSpan.FromMilliseconds(300));
+        Harness h = await Harness.BuildLeaderAsync(c => c.SnapshotTransferStepTimeout = TimeSpan.FromMilliseconds(200));
         h.Installer.Hold();
 
         await h.AckSuccess();
-        await h.WaitUntilAsync(
-            () => h.Statuses().Any(s => !s.InFlight && s.FailedAttempts >= 1),
-            "the first attempt gives up waiting");
+        await h.WaitUntilAsync(() => h.Statuses().Any(s => s.AwaitingInstall), "the transfer waits for the install");
 
-        RaftSnapshotStatus abandoned = Assert.Single(h.Statuses());
-        Assert.Contains("made no progress", abandoned.LastError);
-        Assert.Contains("SnapshotTransferStepTimeout", abandoned.LastError);
+        // Four step timeouts with the held install's figure at 0 bytes read.
+        await Task.Delay(800, TestContext.Current.CancellationToken);
+
+        RaftSnapshotStatus waiting = Assert.Single(h.Statuses());
+        Assert.True(waiting.InFlight);
+        Assert.True(waiting.AwaitingInstall);
+        Assert.Equal(Floor, waiting.AwaitingInstallIndex);
+        Assert.Equal(0, waiting.FailedAttempts);
         Assert.Equal(1, h.Transfer.ExportCalls);
 
-        // The leader checkpoints again while the follower is still importing.
+        // The leader checkpoints again while the follower is still importing; a refused ack now starts
+        // nothing, because the transfer is still in flight.
         h.Wal.Checkpoint = 80;
+        await h.AckSuccess();
 
-        // The backoff expires and refused acks escalate again, now at index 80.
-        await h.AckUntilAsync(() => h.Statuses().Any(s => s.InFlight && s.AwaitingInstall), "the retry attaches to the running install");
-
-        RaftSnapshotStatus attached = Assert.Single(h.Statuses());
-        Assert.Equal(Floor, attached.AwaitingInstallIndex);
+        RaftSnapshotStatus still = Assert.Single(h.Statuses());
+        Assert.True(still.InFlight);
+        Assert.Equal(Floor, still.AwaitingInstallIndex);
         Assert.Equal(1, h.Transfer.ExportCalls);
         Assert.Equal(1, h.Host.SessionsOpened);
         Assert.Equal(1, h.Installer.Started);
 
         h.Installer.Release();
-        await h.WaitUntilAsync(() => h.Statuses().Count == 0, "the retry completes with the install's outcome");
+        await h.WaitUntilAsync(() => h.Statuses().Count == 0, "the attempt completes with the install's outcome");
 
         Assert.Equal(1, h.Transfer.ExportCalls);
         Assert.Equal(1, h.Host.SessionsOpened);
         Assert.Equal(1, h.Installer.Started);
-        // The index that was installed, not the one the retry was started for.
         Assert.Equal(Floor, h.FollowerCursor());
     }
 

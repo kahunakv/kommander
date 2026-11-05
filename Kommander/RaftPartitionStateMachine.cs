@@ -524,7 +524,7 @@ public sealed class RaftPartitionStateMachine
             upToIndex => applier.DrainCommittedAppliesAsync(upToIndex));
         election = new ElectionCoordinator(host, wal, coreState, tracker, logger, BecomeLeaderAsync, FailAllActiveProposalWaiters, heartbeats.SendHeartbeat, proposals);
         followerAppend = new FollowerAppendHandler(host, wal, coreState, proposals, logThrottle, replySink, logger, AdoptLeaderAsync);
-        ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, logThrottle, logger, FailAllActiveProposalWaiters);
+        ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, snapshotSender, logThrottle, logger, FailAllActiveProposalWaiters);
         replicator = new LogReplicator(host, wal, coreState, proposals, sender, replySink, logger);
         walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, applyLane, sender, replySink, logger, RevertUnpublishedPromotionAsync, ackProcessor.CompleteQuorum);
     }
@@ -3272,9 +3272,9 @@ public sealed class RaftPartitionStateMachine
     /// Handles one follower's AppendEntries acknowledgement — see
     /// <see cref="ReplicationAckProcessor.CompleteAppendLogsAsync"/>.
     /// </summary>
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1, long seedIndex = 0)
     {
-        await ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs, presentIndex, presentTerm).ConfigureAwait(false);
+        await ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs, presentIndex, presentTerm, seedIndex).ConfigureAwait(false);
 
         // The ack that levels the transfer target with the last index is the moment to hand over:
         // waiting for the next tick would add up to a heartbeat interval to every transfer under load.

@@ -447,6 +447,10 @@ internal sealed class SnapshotInstaller
             coreState.LastAppliedIndex = snapshotIndex;
         wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTerm, 0), suffixTruncated);
 
+        // Named in this node's acks from now on, so a leader that did not send the install holds the
+        // lag it handed this node exempt from its retention budget (see IRaftPartitionHost.ReportedInstallIndex).
+        host.NoteSnapshotInstalled(snapshotIndex);
+
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);
 

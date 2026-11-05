@@ -522,7 +522,7 @@ come up in practice. Defaults shown.
 |---|---|---|
 | `LearnerPromotionLag` / `LearnerPromotionStableWindow` | 10 / 3 s | how caught-up and stable a learner must be before promotion |
 | `GossipInterval` / `GossipFanout` | 5 s / 2 | how often and to how many peers gossip spreads |
-| `SuspicionTimeout` / `DeadMemberEvictionGrace` | 5 s / 30 s | SWIM failure-detection timing |
+| `SuspicionTimeout` / `DeadMemberEvictionGrace` | 5 s / 10 min | SWIM failure-detection timing; the grace is sized to the longest outage the roster should ride through intact |
 
 ---
 
