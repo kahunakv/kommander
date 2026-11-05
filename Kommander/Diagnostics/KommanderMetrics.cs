@@ -776,6 +776,15 @@ public static class KommanderMetrics
             "raft.read_scheduler.batch_size",
             description: "Operations coalesced into one IReadBatchExecutor call, tagged by scheduler instance.");
 
+    /// <summary>
+    /// WAL writes refused because a queue was at its depth limit. A refused proposal reaches its caller
+    /// as a status, so this counter is how an operator sees WAL saturation.
+    /// </summary>
+    internal static readonly Counter<long> WalBackpressureRejectionsTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.backpressure_rejections_total",
+            description: "WAL writes refused because the partition queue or the global queue was full.");
+
     /// <summary>Admissions refused because the partition's queue depth was at its limit.</summary>
     internal static readonly Counter<long> ReadSchedulerBackpressureRejectionsTotal =
         Meter.CreateCounter<long>(

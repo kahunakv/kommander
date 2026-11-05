@@ -287,7 +287,11 @@ internal sealed class SplitMergeController
                 HashBoundary      = targetRoutingMode == RaftRoutingMode.HashRange ? splitBoundary : null,
                 AutoCommit        = false,
             };
-            await RunSnapshotTransferAsync(partitionId, targetPartitionId, transferPlan, transfer, cancellationToken).ConfigureAwait(false);
+            RaftStateTransferOutcome transferOutcome =
+                await RunSnapshotTransferAsync(partitionId, targetPartitionId, transferPlan, transfer, cancellationToken).ConfigureAwait(false);
+
+            if (plan is not null)
+                plan.StateTransferOutcome = transferOutcome;
         }
 
         _pendingSplits[partitionId] = new SplitInProgress(targetPartitionId, completion);
@@ -719,14 +723,16 @@ internal sealed class SplitMergeController
     /// <summary>
     /// Executes the snapshot-transfer step of a split:
     /// exports a point-in-time state snapshot from the source partition, imports it into
-    /// the target partition, then replicates a checkpoint into the target partition's log
-    /// so all target replicas converge on the imported state.
+    /// the target partition on this node, then replicates a checkpoint into the target partition's log.
     /// <para>
-    /// This is an optimization: on error the split remains valid and continues via the
-    /// log-shipping fallback. The caller is responsible for data movement before Phase 2.
+    /// The import runs on this node only, and the checkpoint carries no application state, so the
+    /// other replicas of the target do not receive the imported data here. A failure does not fail
+    /// the split, because the map change is already committed. The returned outcome reaches the
+    /// caller through <see cref="RaftPartitionLifecycleResult.StateTransfer"/>, and the application
+    /// must move the state itself when the transfer did not complete.
     /// </para>
     /// </summary>
-    private async Task RunSnapshotTransferAsync(
+    private async Task<RaftStateTransferOutcome> RunSnapshotTransferAsync(
         int sourcePartitionId,
         int targetPartitionId,
         RaftSplitPlan plan,
@@ -743,9 +749,9 @@ internal sealed class SplitMergeController
         catch (Exception ex)
         {
             logger.LogError(
-                "TrySplitPartition: ExportRange source={Src} → target={Tgt} failed: {Message}; falling back to log-shipping",
+                "TrySplitPartition: ExportRange source={Src} → target={Tgt} failed: {Message}; the application must move the state",
                 sourcePartitionId, targetPartitionId, ex.Message);
-            return;
+            return RaftStateTransferOutcome.ExportFailed;
         }
 
         try
@@ -756,9 +762,9 @@ internal sealed class SplitMergeController
         catch (Exception ex)
         {
             logger.LogError(
-                "TrySplitPartition: ImportRange target={Tgt} failed: {Message}; falling back to log-shipping",
+                "TrySplitPartition: ImportRange target={Tgt} failed: {Message}; the application must move the state",
                 targetPartitionId, ex.Message);
-            return;
+            return RaftStateTransferOutcome.ImportFailed;
         }
 
         RaftReplicationResult checkpointResult =
@@ -774,11 +780,15 @@ internal sealed class SplitMergeController
         }
 
         if (checkpointResult.Status != RaftOperationStatus.Success)
+        {
             logger.LogError(
                 "TrySplitPartition: ReplicateCheckpoint target={Tgt} failed after retry ({Status}); " +
                 "snapshot was imported locally but followers are diverged — manual intervention required",
                 targetPartitionId, checkpointResult.Status);
-        else
-            logger.LogInfoSplitPartitionSnapshotTransferComplete(sourcePartitionId, snapshotIndex, targetPartitionId);
+            return RaftStateTransferOutcome.CheckpointFailed;
+        }
+
+        logger.LogInfoSplitPartitionSnapshotTransferComplete(sourcePartitionId, snapshotIndex, targetPartitionId);
+        return RaftStateTransferOutcome.Completed;
     }
 }

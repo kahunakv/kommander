@@ -4,12 +4,15 @@ namespace Kommander;
 
 /// <summary>
 /// Optional callback interface an application registers to enable snapshot-based partition
-/// transfer during split and merge operations.
+/// transfer during a split. A merge never calls it: a merge deletes the source WAL and moves no
+/// state, so the application must move that state before it merges.
 ///
-/// When an implementation is registered with <see cref="IRaft"/>, the split coordinator uses
-/// the snapshot primary path (ExportRange → stream → ImportRange) instead of waiting for the
-/// caller to ship individual log entries. If no implementation is registered the coordinator
-/// falls back to the log-shipping path.
+/// When an implementation is registered with <see cref="IRaft"/>, the split coordinator runs
+/// ExportRange → stream → ImportRange <b>once, on the coordinator node</b>. The other replicas of the
+/// target partition do not receive the imported data this way, and no entries are shipped when no
+/// implementation is registered: in both cases the application must bring the state to those
+/// replicas. <see cref="Data.RaftPartitionLifecycleResult.StateTransfer"/> reports the outcome,
+/// because a failed transfer does not fail the split.
 ///
 /// <para><b>Legacy catch-up fallback:</b> when a follower falls below the leader's WAL compaction
 /// floor and no <see cref="IRaftPartitionStateTransfer"/> is registered, the leader also calls
@@ -27,8 +30,8 @@ public interface IRaftStateMachineTransfer
     /// <summary>
     /// Export state for the key range described by <paramref name="plan"/> covering the committed
     /// log index <paramref name="upToIndex"/>.
-    /// The returned <see cref="Stream"/> is consumed by the coordinator and forwarded to the
-    /// target partition's leader via <see cref="ImportRange"/>. The stream must be readable and
+    /// The returned <see cref="Stream"/> is consumed by the coordinator and passed to
+    /// <see cref="ImportRange"/> on the same node. The stream must be readable and
     /// may be a <see cref="MemoryStream"/> or a file-backed stream; the coordinator disposes it
     /// after the transfer completes.
     /// </summary>
@@ -46,8 +49,8 @@ public interface IRaftStateMachineTransfer
 
     /// <summary>
     /// Install an exported snapshot into this partition's state machine.
-    /// Called on the target partition's leader after it receives the stream produced by
-    /// <see cref="ExportRange"/>.
+    /// On a split it runs on the coordinator node, which does not have to lead the target partition.
+    /// On the catch-up path it runs on the follower that receives the snapshot.
     /// <para>
     /// <b>Atomicity:</b> the implementation must apply the snapshot atomically — a partial
     /// apply followed by a crash must leave the state machine in its pre-import state, not
@@ -61,8 +64,9 @@ public interface IRaftStateMachineTransfer
     /// sender retries the <em>whole snapshot</em> when the durable WAL boundary write fails after
     /// a successful import, so a repeated <c>ImportRange</c> for the same
     /// (partition, snapshot index, term) must be idempotent. If both checkpoint attempts fail on
-    /// the split path the coordinator logs an error; the snapshot is present on the leader but
-    /// followers have not yet received it via the log, so manual intervention may be required.
+    /// the split path the coordinator logs an error and reports
+    /// <see cref="Data.RaftStateTransferOutcome.CheckpointFailed"/>. The checkpoint carries no
+    /// application state, so a successful checkpoint does not deliver the snapshot to followers either.
     /// </para>
     /// The coordinator disposes the stream after this call returns.
     /// </summary>

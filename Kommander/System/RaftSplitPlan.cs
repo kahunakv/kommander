@@ -1,4 +1,6 @@
 
+using Kommander.Data;
+
 namespace Kommander.System;
 
 /// <summary>
@@ -10,7 +12,8 @@ public sealed class RaftSplitPlan
 {
     /// <summary>
     /// Partition id to assign to the newly-created right-half partition.
-    /// When zero the coordinator auto-assigns <c>max(existing ids) + 1</c>.
+    /// When zero the coordinator auto-assigns the highest id ever handed out plus one, so the id of
+    /// a removed partition is never reused.
     /// </summary>
     public int TargetPartitionId { get; init; }
 
@@ -36,4 +39,10 @@ public sealed class RaftSplitPlan
     /// Set by the legacy <c>SplitPartition(int)</c> path.
     /// </summary>
     public bool AutoCommit { get; init; }
+
+    /// <summary>
+    /// Written by the coordinator before it completes the split, and read by the caller after that
+    /// completion, which orders the two accesses. Each split call owns its plan instance.
+    /// </summary>
+    internal RaftStateTransferOutcome StateTransferOutcome { get; set; }
 }

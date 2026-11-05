@@ -1756,8 +1756,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public void SetMinRetainIndex(int partitionId, long index)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            partition.SetMinRetainIndex(index);
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            partition!.SetMinRetainIndex(index);
     }
 
     /// <summary>
@@ -1782,8 +1782,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public long GetStaleProposedSkippedCount(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            return partition.GetStaleProposedSkippedCount();
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            return partition!.GetStaleProposedSkippedCount();
 
         return -1;
     }
@@ -1795,8 +1795,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            return partition.GetSnapshotStatuses();
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            return partition!.GetSnapshotStatuses();
 
         return [];
     }
@@ -1808,8 +1808,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public IReadOnlyList<Data.RaftBackfillStatus> GetBackfillStatuses(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            return partition.GetBackfillStatuses();
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            return partition!.GetBackfillStatuses();
 
         return [];
     }
@@ -1822,8 +1822,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public IDisposable AcquireRetentionHold(int partitionId, long index)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            return partition.AcquireRetentionHold(index);
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            return partition!.AcquireRetentionHold(index);
 
         return NoOpRetentionHold.Instance;
     }

@@ -188,7 +188,10 @@ public class SqliteWAL : IWAL, IDisposable
     /// When <see langword="true"/> (default), shard databases use <c>PRAGMA synchronous=FULL</c>
     /// so every committed transaction is durable across power loss. When <see langword="false"/>,
     /// uses <c>synchronous=NORMAL</c> in WAL journal mode: crash-safe but the last in-flight
-    /// transaction may be lost on power loss.
+    /// transaction may be lost on power loss. The metadata database follows the same setting,
+    /// because <see cref="IWAL.PersistHardState"/> stores the term and the vote there: a vote that
+    /// reached a candidate but not the disk lets this node grant the same term twice after a
+    /// power loss.
     /// </param>
     /// <param name="shardCount">
     /// Desired number of shard databases.  This value is used <b>only</b> to seed a fresh data
@@ -341,7 +344,13 @@ public class SqliteWAL : IWAL, IDisposable
 
         // Fresh directory — resolve and pin.
         int resolved = configured <= 0 ? Environment.ProcessorCount : configured;
-        SetMetaData("shard_count", resolved.ToString());
+
+        // SetMetaData reports a storage failure as a status. An unpinned shard count must stop the
+        // startup: the next open could resolve a different count and orphan every log written now.
+        if (!SetMetaData("shard_count", resolved.ToString()))
+            throw new InvalidOperationException(
+                $"SqliteWAL: could not persist shard_count for '{path}'.");
+
         return resolved;
     }
 
@@ -367,23 +376,49 @@ public class SqliteWAL : IWAL, IDisposable
         string completePath = $"{path}/raft_metadata_{revision}.db";
         // Pooling=False: same as the shard connections — physical close on Dispose.
         SqliteConnection connection = new($"Data Source={completePath};Pooling=False");
-        connection.Open();
 
-        const string createTableQuery = """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key STRING PRIMARY KEY,
-            value STRING
-        );
-        """;
-        using SqliteCommand command1 = new(createTableQuery, connection);
-        command1.ExecuteNonQuery();
+        try
+        {
+            connection.Open();
 
-        const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
-        using SqliteCommand command3 = new(pragmasQuery, connection);
-        command3.ExecuteNonQuery();
+            const string createTableQuery = """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key STRING PRIMARY KEY,
+                value STRING
+            );
+            """;
+            using SqliteCommand command1 = new(createTableQuery, connection);
+            command1.ExecuteNonQuery();
+
+            // Follows syncWrites like the shard databases. This database holds the Raft hard state, and
+            // the election path sends a vote only after PersistHardState returns, so that write must be
+            // on disk by then (IWAL.PersistHardState). Elections are rare, so one fsync per vote is cheap.
+            string pragmasQuery = $"PRAGMA journal_mode=WAL; PRAGMA synchronous={(syncWrites ? "FULL" : "NORMAL")};";
+            using SqliteCommand command3 = new(pragmasQuery, connection);
+            command3.ExecuteNonQuery();
+        }
+        catch
+        {
+            // A failed open can be retried by the next call, so it must not leak this connection.
+            connection.Dispose();
+            throw;
+        }
 
         metaDataConnection = connection;
         return connection;
+    }
+
+    /// <summary>
+    /// Returns the <c>PRAGMA synchronous</c> value of the metadata connection (1 = NORMAL, 2 = FULL),
+    /// so a test can pin the durability of the hard state without a power loss.
+    /// </summary>
+    internal long GetMetaDataSynchronousModeForTesting()
+    {
+        lock (_metaDataLock)
+        {
+            using SqliteCommand command = new("PRAGMA synchronous;", TryOpenMetaDataDatabase());
+            return (long)command.ExecuteScalar()!;
+        }
     }
 
     // ── IWAL — reads ─────────────────────────────────────────────────────────
@@ -1227,7 +1262,9 @@ public class SqliteWAL : IWAL, IDisposable
     /// <summary>
     /// Upserts a metadata key/value pair into the metadata database.
     /// Returns <see langword="true"/> on success, and <see langword="false"/> once the WAL is disposed
-    /// (the <see cref="IWAL.SetMetaData"/> contract reports failure as a status, not an exception).
+    /// or when the storage refuses the write. The <see cref="IWAL.SetMetaData"/> contract reports
+    /// failure as a status: this primitive backs <see cref="IWAL.PersistHardState"/> on the election
+    /// path, where an escaping exception abandons the election half-way.
     /// </summary>
     public bool SetMetaData(string key, string value)
     {
@@ -1236,19 +1273,27 @@ public class SqliteWAL : IWAL, IDisposable
             if (disposed)
                 return false;
 
-            SqliteConnection connection = TryOpenMetaDataDatabase();
+            try
+            {
+                SqliteConnection connection = TryOpenMetaDataDatabase();
 
-            const string upsertSql = """
-                INSERT INTO metadata (key, value)
-                VALUES (@key, @value)
-                ON CONFLICT(key) DO UPDATE SET value=@value;
-                """;
+                const string upsertSql = """
+                    INSERT INTO metadata (key, value)
+                    VALUES (@key, @value)
+                    ON CONFLICT(key) DO UPDATE SET value=@value;
+                    """;
 
-            using SqliteCommand command = new(upsertSql, connection);
-            command.Parameters.AddWithValue("@key", key);
-            command.Parameters.AddWithValue("@value", string.IsNullOrEmpty(value) ? "" : value);
-            command.ExecuteNonQuery();
-            return true;
+                using SqliteCommand command = new(upsertSql, connection);
+                command.Parameters.AddWithValue("@key", key);
+                command.Parameters.AddWithValue("@value", string.IsNullOrEmpty(value) ? "" : value);
+                command.ExecuteNonQuery();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Error during SetMetaData({Key}): {Message}", key, ex.Message);
+                return false;
+            }
         }
     }
 

@@ -46,10 +46,7 @@ public class ReplicationService : BackgroundService //, IDisposable
         {
             string key = Guid.NewGuid().ToString();
             
-            int partitionId = raft.GetPartitionKey(key);
-            
-            if (partitionId == 0)
-                throw new("System partition");
+            int partitionId = i;
 
             if (!await raft.AmILeader(partitionId, CancellationToken.None).ConfigureAwait(false))
                 return;
@@ -63,7 +60,7 @@ public class ReplicationService : BackgroundService //, IDisposable
 
             for (int j = 0; j < 20; j++)
             {
-                result = await raft.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                result = await raft.ReplicateLogs(partitionId, logType, data).ConfigureAwait(false);
                 if (result.Success)
                     Console.WriteLine("{0} #1 Replicated log with id: {1} {2}ms", partitionId, result.LogIndex, stopwatch.GetElapsedMilliseconds());
                 else
@@ -71,7 +68,7 @@ public class ReplicationService : BackgroundService //, IDisposable
 
                 stopwatch = ValueStopwatch.StartNew();
 
-                result = await raft.ReplicateLogs(i, logType, [data, data, data, data, data, data, data, data]).ConfigureAwait(false);
+                result = await raft.ReplicateLogs(partitionId, logType, [data, data, data, data, data, data, data, data]).ConfigureAwait(false);
                 if (result.Success)
                     Console.WriteLine("{0} #2 Replicated log with id: {1} {2}ms", partitionId, result.LogIndex, stopwatch.GetElapsedMilliseconds());
                 else

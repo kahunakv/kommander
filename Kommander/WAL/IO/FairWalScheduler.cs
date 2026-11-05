@@ -409,7 +409,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         lock (state.Lock)
         {
             if (state.Depth >= maxQueueDepthPerPartition)
+            {
+                KommanderMetrics.WalBackpressureRejectionsTotal.Add(1);
                 throw new BackpressureExceededException(partitionId, state.Depth);
+            }
 
             if (maxGlobalQueueDepth > 0)
             {
@@ -417,6 +420,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 if (globalDepth > maxGlobalQueueDepth)
                 {
                     Interlocked.Decrement(ref _globalQueueDepth);
+                    KommanderMetrics.WalBackpressureRejectionsTotal.Add(1);
                     throw new BackpressureExceededException(partitionId, globalDepth);
                 }
             }

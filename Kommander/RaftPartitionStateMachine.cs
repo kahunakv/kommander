@@ -3314,8 +3314,10 @@ public sealed class RaftPartitionStateMachine
         replicator.ReplicateLogs(logs, autoCommit, replyCorrelationId);
 
     /// <summary>Proposes several batches in one pass — see <see cref="LogReplicator.ReplicateLogsBatchAsync"/>.</summary>
-    public Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages) =>
-        replicator.ReplicateLogsBatchAsync(messages);
+    public Task ReplicateLogsBatchAsync(
+        IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages,
+        Action<ulong?, Exception>? onMessageFailed = null) =>
+        replicator.ReplicateLogsBatchAsync(messages, onMessageFailed);
 
     /// <summary>Proposes a checkpoint marker — see <see cref="LogReplicator.ReplicateCheckpointAsync"/>.</summary>
     public Task ReplicateCheckpointAsync(ulong? replyCorrelationId) => replicator.ReplicateCheckpointAsync(replyCorrelationId);

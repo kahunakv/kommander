@@ -394,7 +394,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // believe its shorter log. Nothing inside that log can expose it — the acknowledged-presence
             // watermark and the hard state share the log with the rows and are cut with them — so the
             // sync ledger beside the engine (RocksDbSyncLedger) attests the last synced sequence from
-            // outside the log, and an open whose replay stops below it fail-stops the engine.
+            // outside the log, and an open whose replay stops below it quarantines every partition on the engine.
             .SetWalRecoveryMode(Recovery.TolerateCorruptedTailRecords);
 
         // Record the number and synced size of every closed write-ahead log in the MANIFEST and verify

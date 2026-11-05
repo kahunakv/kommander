@@ -62,7 +62,8 @@ internal sealed class PartitionLifecycleService
         {
             Success    = status == RaftOperationStatus.Success,
             Status     = status,
-            Generation = generation
+            Generation = generation,
+            StateTransfer = effectivePlan.StateTransferOutcome
         };
     }
 
