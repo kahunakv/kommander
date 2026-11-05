@@ -104,9 +104,10 @@ internal sealed class TransportFailureEpisode
 
         long now = clockMs();
 
-        logger.LogInformation(
-            "[RaftTransportDispatcher/{Endpoint}] sends recovered after {Total} failures over {Seconds:F0} s",
-            endpoint, failuresInEpisode, (now - episodeStartMs) / 1000.0);
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation(
+                "[RaftTransportDispatcher/{Endpoint}] sends recovered after {Total} failures over {Seconds:F0} s",
+                endpoint, failuresInEpisode, (now - episodeStartMs) / 1000.0);
 
         open = false;
         episodeStartMs = 0;
