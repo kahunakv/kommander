@@ -220,10 +220,10 @@ Once enabled, the freshness of remote values is governed by the same knobs the b
 | Setting | Default | Effect on this signal |
 |---|---|---|
 | `EnableLeaderBalancer` | `false` | **Required** for the remote path. Off → remote queries return `0`. |
-| `LeaderBalancerReportInterval` | `5s` | How often a leader refreshes the gossiped value. Lower = fresher, more gossip traffic. |
+| `GossipInterval` | `5s` | How often a node builds its load report and gossips it to `GossipFanout` random peers. Lower = fresher, more gossip traffic. Reports are not forwarded. |
 | `LeaderBalancerReportTtl` | `20s` | A report older than this is dropped; a silent node's values disappear (return `0`). |
 
-Net staleness of a remote value ≈ one `LeaderBalancerReportInterval` + gossip propagation, layered on
+Net staleness of a remote value is one `GossipInterval` or more, because reports are not forwarded, layered on
 top of the rate's ≈7s smoothing half-life. In practice a remote reader reacts on the order of ~10
 seconds, not instantly. Plan your consumer's reaction window accordingly.
 
@@ -343,5 +343,5 @@ replicated entries doesn't increment the rate. Ask the leader (or read the gossi
 follower's local view.
 
 **How fresh is a remote value?**
-Up to one `LeaderBalancerReportInterval` (default 5s) plus gossip propagation, on top of the rate's ≈7s
+One `GossipInterval` (default 5s) or more, because reports are not forwarded, on top of the rate's ≈7s
 smoothing. Treat it as accurate to ~10 seconds, and debounce your consumer accordingly.

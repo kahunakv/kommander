@@ -16,8 +16,9 @@ public enum RaftOperationStatus
     Pending = 10,
 
     /// <summary>
-    /// The per-partition client proposal queue is full.
-    /// The caller should back off and retry after a delay.
+    /// The per-partition client proposal queue or the WAL write queue is full, so the proposal was
+    /// refused before anything was appended. The refusal is definite. The caller should back off
+    /// and retry after a delay.
     /// </summary>
     ProposalQueueFull = 11,
 

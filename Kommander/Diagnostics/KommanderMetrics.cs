@@ -776,6 +776,15 @@ public static class KommanderMetrics
             "raft.read_scheduler.batch_size",
             description: "Operations coalesced into one IReadBatchExecutor call, tagged by scheduler instance.");
 
+    /// <summary>
+    /// WAL writes refused because a queue was at its depth limit. A refused proposal reaches its caller
+    /// as a status, so this counter is how an operator sees WAL saturation.
+    /// </summary>
+    internal static readonly Counter<long> WalBackpressureRejectionsTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.backpressure_rejections_total",
+            description: "WAL writes refused because the partition queue or the global queue was full.");
+
     /// <summary>Admissions refused because the partition's queue depth was at its limit.</summary>
     internal static readonly Counter<long> ReadSchedulerBackpressureRejectionsTotal =
         Meter.CreateCounter<long>(
@@ -807,6 +816,11 @@ public static class KommanderMetrics
     static KommanderMetrics()
     {
 #if !BROWSER
+        Meter.CreateObservableGauge(
+            "raft.transport.channels_in_transient_failure",
+            MeasureChannelsInTransientFailure,
+            description: "Pooled gRPC channels to each peer currently in TransientFailure, tagged by peer. Non-zero while the peer is down; non-zero while the peer answers other nodes means this node's channel is the fault.");
+
         Meter.CreateObservableGauge(
             "raft.wal.delayed_write_rate",
             MeasureWalDelayedWriteRates,
@@ -1017,6 +1031,28 @@ public static class KommanderMetrics
     }
 
 #if !BROWSER
+    // ── Transport ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Pooled gRPC channels the transport watchdog disposed and reopened because they had stopped
+    /// reconnecting (see <c>ChannelConnectivityWatchdog</c>), tagged by <c>peer</c>. A rebuild while
+    /// the peer is down is harmless churn; a rebuild while the peer answers other nodes is the
+    /// one-way channel failure of the 1.13.3 inst3 soak, caught and repaired.
+    /// </summary>
+    internal static readonly Counter<long> TransportChannelRebuildsTotal =
+        Meter.CreateCounter<long>(
+            "raft.transport.channel_rebuilds_total",
+            description: "Pooled gRPC channels rebuilt by the transport watchdog because they stopped reconnecting, by peer.");
+
+    internal static void RecordChannelRebuild(string peerUrl) =>
+        TransportChannelRebuildsTotal.Add(1, new KeyValuePair<string, object?>("peer", peerUrl));
+
+    private static IEnumerable<Measurement<int>> MeasureChannelsInTransientFailure()
+    {
+        foreach ((string url, int failing) in Kommander.Communication.Grpc.SharedChannels.CountChannelsInTransientFailure())
+            yield return new Measurement<int>(failing, new KeyValuePair<string, object?>("peer", url));
+    }
+
     /// <summary>
     /// Registers a RocksDB WAL engine so its write-stall state feeds the
     /// <c>raft.wal.delayed_write_rate</c> / <c>raft.wal.write_stalled</c> observable gauges.

@@ -240,6 +240,13 @@ public sealed class RaftPartitionExecutor : IDisposable
     // Batch scratch list to avoid per-drain allocations.
     private readonly List<PendingOperation> _drainBatch = new(256);
 
+    // Correlation id that the operation in ExecuteOneAsync registered, so that its failure path can
+    // remove the reply entry. Worker-owned, and reset at the start of every dispatch.
+    private ulong? _dispatchCorrelationId;
+
+    // Cached so that a warm replication batch does not allocate a delegate per dispatch.
+    private Action<ulong?, Exception>? _failBatchMessage;
+
     // Worker-owned scratch for the coalesced replication batch passed to ReplicateLogsBatchAsync.
     // Reused across drain cycles instead of allocating a fresh list per batch: the executor is a
     // single owner and blocks on the batch call (GetResult) before touching this again, and the
@@ -1221,6 +1228,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     {
         RaftRequest request = op.Request;
         ValueStopwatch sw = ValueStopwatch.StartNew();
+        _dispatchCorrelationId = null;
 
         try
         {
@@ -1514,12 +1522,17 @@ public sealed class RaftPartitionExecutor : IDisposable
                 MarkRunnable();
             }
 
+            // The caller gets the exception now, so nothing will ever deliver a reply to this entry.
+            // Without the removal it stays in the table until the executor stops.
+            if (_dispatchCorrelationId is { } correlationId)
+                _pendingReplies.Remove(correlationId);
+
             op.Reply?.TrySetException(ex);
         }
         finally
         {
-            // Threshold check first: with slow-dispatch logging disabled (the default), the
-            // clock must not be read a third time on every operation just to discard it.
+            // Threshold check first: with slow-dispatch logging disabled, the clock must not be
+            // read a third time on every operation just to discard it.
             if (_slowThresholdMs > 0)
             {
                 long elapsedMs = sw.GetElapsedMilliseconds();
@@ -1602,7 +1615,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         ValueStopwatch sw = ValueStopwatch.StartNew();
         try
         {
-            await _stateMachine.ReplicateLogsBatchAsync(_batchScratch).ConfigureAwait(false);
+            await _stateMachine.ReplicateLogsBatchAsync(_batchScratch, _failBatchMessage ??= FailBatchMessage).ConfigureAwait(false);
             Interlocked.Add(ref _totalProcessed, count);
             Interlocked.Increment(ref _totalBatchesExecuted);
 
@@ -1618,9 +1631,23 @@ public sealed class RaftPartitionExecutor : IDisposable
                 "[RaftPartitionExecutor/{PartitionId}] ReplicateLogsBatch error: {Message}",
                 _partitionId, ex.Message);
 
-            for (int i = 0; i < count; i++)
-                source[i].Reply?.TrySetException(ex);
+            // FailBatchMessage contains a failed proposal, so this runs only if the batch dispatch
+            // itself failed. Remove each entry so that a later completion finds nothing to deliver.
+            foreach ((_, _, _, ulong? correlationId) in _batchScratch)
+                FailBatchMessage(correlationId, ex);
         }
+    }
+
+    /// <summary>
+    /// Fails one message of a batch and leaves the others alone. The other messages can already be
+    /// queued to the WAL and can still commit, so their callers must keep waiting for their outcome.
+    /// </summary>
+    private void FailBatchMessage(ulong? correlationId, Exception ex)
+    {
+        LogOperationFailure(ex);
+
+        if (correlationId is { } id && _pendingReplies.Remove(id, out PendingOperation op))
+            op.Reply?.TrySetException(ex);
     }
 
     // ── Reply correlation ──────────────────────────────────────────────────
@@ -1636,6 +1663,7 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         ulong id = _nextCorrelationId++;
         _pendingReplies[id] = op;
+        _dispatchCorrelationId = id;
         return id;
     }
 
@@ -1648,6 +1676,12 @@ public sealed class RaftPartitionExecutor : IDisposable
         if (_pendingReplies.Remove(correlationId, out PendingOperation op))
             op.Reply?.TrySetResult(response);
     }
+
+    /// <summary>
+    /// Number of registered replies that wait for the state machine. Read by tests after the executor
+    /// settles, to pin that a failed operation leaves no entry behind.
+    /// </summary>
+    internal int PendingReplyCountForTesting => _pendingReplies.Count;
 
     private void CancelPendingReplies()
     {

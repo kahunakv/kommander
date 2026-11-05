@@ -336,6 +336,19 @@ public sealed class RaftPartition : IDisposable
     public IDisposable AcquireRetentionHold(long index) => walHandler.AcquireRetentionHold(index);
 
     /// <summary>
+    /// The retention floor that compaction applies before it composes the checkpoint.
+    /// <see cref="long.MaxValue"/> means no extra retention. Diagnostics and tests only.
+    /// </summary>
+    internal long EffectiveRetentionFloor => walHandler.EffectiveRetentionFloor;
+
+    /// <summary>Runs one compaction pass and waits for it to finish. Tests only.</summary>
+    internal async Task CompactForTestingAsync()
+    {
+        walHandler.Compact();
+        await walHandler.WaitForCompactionIdleAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Highest log id known committed on this partition's WAL — the gap-aware contiguous commit
     /// frontier, which unlike the raw max log excludes proposed-but-uncommitted tail entries and
     /// anything above a hole. A plain in-memory read (no scheduler round-trip), safe on any path.

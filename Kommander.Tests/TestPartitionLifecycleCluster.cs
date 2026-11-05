@@ -282,6 +282,63 @@ public sealed class TestPartitionLifecycleCluster
         }
     }
 
+    private sealed class FailingStateTransfer(bool failExport) : IRaftStateMachineTransfer
+    {
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
+            failExport
+                ? throw new InvalidOperationException("export failed")
+                : Task.FromResult<Stream>(new MemoryStream());
+
+        public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct) =>
+            throw new InvalidOperationException("import failed");
+    }
+
+    /// <summary>
+    /// A failed state transfer does not fail a split, because the map change is already committed, so
+    /// <see cref="RaftPartitionLifecycleResult.Success"/> cannot report it. The caller must be able to
+    /// see the failure, or an application believes its state moved when it did not.
+    /// </summary>
+    [Fact]
+    public async Task SplitPartitionAsync_ReportsTheStateTransferOutcome()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        RaftManager[] nodes = await AssembleCluster(basePort: 8390, initialPartitions: 1, ct);
+
+        try
+        {
+            const int sourcePartition = 1;
+
+            RaftManager writer = await LeaderOf(nodes, sourcePartition, ct);
+            RaftManager systemLeader = await LeaderOf(nodes, RaftSystemConfig.SystemPartition, ct);
+            if (!ReferenceEquals(systemLeader, writer))
+                await TransferLeadershipTo(systemLeader, RaftSystemConfig.SystemPartition, writer, ct);
+
+            // No transfer registered: nothing ran.
+            RaftPartitionLifecycleResult none = await writer.SplitPartitionAsync(sourcePartition, 7, null, ct);
+            Assert.True(none.Success, $"Split failed: {none.Status}");
+            Assert.Equal(RaftStateTransferOutcome.NotAttempted, none.StateTransfer);
+
+            foreach (RaftManager n in nodes)
+                n.RegisterStateMachineTransfer(new FailingStateTransfer(failExport: true));
+
+            RaftPartitionLifecycleResult exportFailed = await writer.SplitPartitionAsync(sourcePartition, 8, null, ct);
+            Assert.True(exportFailed.Success, $"Split failed: {exportFailed.Status}");
+            Assert.Equal(RaftStateTransferOutcome.ExportFailed, exportFailed.StateTransfer);
+
+            foreach (RaftManager n in nodes)
+                n.RegisterStateMachineTransfer(new FailingStateTransfer(failExport: false));
+
+            RaftPartitionLifecycleResult importFailed = await writer.SplitPartitionAsync(sourcePartition, 9, null, ct);
+            Assert.True(importFailed.Success, $"Split failed: {importFailed.Status}");
+            Assert.Equal(RaftStateTransferOutcome.ImportFailed, importFailed.StateTransfer);
+        }
+        finally
+        {
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+        }
+    }
+
     // ── Split with real data ───────────────────────────────────────────────────
 
     /// <summary>
@@ -348,6 +405,10 @@ public sealed class TestPartitionLifecycleCluster
             Assert.True(result.Success, $"Split failed: {result.Status}");
             Assert.Equal(RaftOperationStatus.Success, result.Status);
             Assert.Equal(2, result.Generation); // the target's generation after both commits
+
+            // The export and the import both ran. The checkpoint step depends on whether this node
+            // leads the new target partition yet.
+            Assert.Contains(result.StateTransfer, new[] { RaftStateTransferOutcome.Completed, RaftStateTransferOutcome.CheckpointFailed });
 
             // The snapshot step ran against the real data: the export covered the committed log
             // and carried the split plan, and the import landed on the new partition with the

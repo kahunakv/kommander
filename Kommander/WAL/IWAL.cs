@@ -12,7 +12,7 @@ namespace Kommander.WAL;
 ///   <item>Reads for a given partition must observe all writes that completed before the read began.</item>
 ///   <item><see cref="Write"/> is atomic per partition: either all logs in a single partition's batch are
 ///         persisted or none are. Cross-partition atomicity is adapter-specific (RocksDB provides a single
-///         atomic write batch; SQLite commits per partition).</item>
+///         atomic write batch; SQLite commits per shard database).</item>
 ///   <item>Log ordering within a partition is determined by <see cref="RaftLog.Id"/>, not insertion order.
 ///         Adapters must return logs sorted by id ascending on all read paths.</item>
 ///   <item><see cref="GetCurrentTerm"/> returns the <see cref="RaftLog.Term"/> of the log entry with the

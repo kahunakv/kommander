@@ -113,9 +113,27 @@ internal sealed class LogReplicator
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) =>
         ReplicateLogsAsync(logs, autoCommit, expectedTerm: 0, replyCorrelationId);
 
+    /// <summary>
+    /// Proposes a batch and answers its caller. A full WAL queue answers
+    /// <see cref="RaftOperationStatus.ProposalQueueFull"/>: the WAL refused the write before anything
+    /// was queued and the propose path rolled back every mutation, so the refusal is definite and the
+    /// caller can retry after a delay. The synchronous overload keeps throwing, because the promotion
+    /// barrier has its own failure path.
+    /// </summary>
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId)
     {
-        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateLogs(logs, autoCommit, expectedTerm, replyCorrelationId);
+        RaftOperationStatus status;
+        HLCTimestamp ticketId;
+
+        try
+        {
+            (status, ticketId) = ReplicateLogs(logs, autoCommit, expectedTerm, replyCorrelationId);
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            status = RaftOperationStatus.ProposalQueueFull;
+            ticketId = HLCTimestamp.Zero;
+        }
 
         if (status != RaftOperationStatus.Pending)
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, ticketId));
@@ -355,9 +373,17 @@ internal sealed class LogReplicator
     /// </summary>
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
+    /// <param name="onMessageFailed">
+    /// Receives the correlation id and the exception of a message whose proposal failed. The batch
+    /// then continues, because earlier messages can already be queued to the WAL and can still commit:
+    /// failing the whole batch would tell those callers that their entries failed. Without a callback
+    /// the exception escapes to the caller.
+    /// </param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages)
+    public async Task ReplicateLogsBatchAsync(
+        IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages,
+        Action<ulong?, Exception>? onMessageFailed = null)
     {
         // Determine which autoCommit values to dispatch, in first-seen order among messages that carry
         // logs — a batch whose messages all have null/empty logs dispatches nothing. Only the KEYS drive
@@ -393,8 +419,17 @@ internal sealed class LogReplicator
 
             foreach ((List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId) item in messages)
             {
-                if (item.autoCommit == key)
+                if (item.autoCommit != key)
+                    continue;
+
+                try
+                {
                     await ReplicateLogsAsync(item.logs, item.autoCommit, item.expectedTerm, item.replyCorrelationId).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (onMessageFailed is not null)
+                {
+                    onMessageFailed(item.replyCorrelationId, ex);
+                }
             }
         }
     }
@@ -405,7 +440,19 @@ internal sealed class LogReplicator
     /// <returns></returns>
     public Task ReplicateCheckpointAsync(ulong? replyCorrelationId)
     {
-        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateCheckpoint(replyCorrelationId);
+        RaftOperationStatus status;
+        HLCTimestamp ticketId;
+
+        try
+        {
+            (status, ticketId) = ReplicateCheckpoint(replyCorrelationId);
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            // Same definite refusal as the propose path: nothing was queued.
+            status = RaftOperationStatus.ProposalQueueFull;
+            ticketId = HLCTimestamp.Zero;
+        }
 
         if (status != RaftOperationStatus.Pending)
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, ticketId));

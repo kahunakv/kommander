@@ -23,7 +23,7 @@ public sealed class PartitionLoadAccumulator
 {
     /// <summary>
     /// Default decay constant λ (1/s). Half-life = ln(2)/λ ≈ 6.9 s. Tuned so an idle
-    /// partition cools well within a few <c>LeaderBalancerReportInterval</c> periods.
+    /// partition cools well within a few <c>GossipInterval</c> periods.
     /// </summary>
     public const double DefaultDecayConstant = 0.1;
 

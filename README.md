@@ -417,7 +417,7 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `TransportSecurity` | see below | Node authentication and TLS validation settings. See [Transport Security And Node Authentication](#transport-security-and-node-authentication). |
 | `HttpScheme` | `https://` | Scheme used by `RestCommunication`. |
 | `GrpcScheme` | `https://` | URL scheme prepended to peer endpoints when opening gRPC channels. Set to `http://` (plus `Http2UnencryptedSupport`) for cleartext test environments. |
-| `GrpcChannelsPerNode` | `4` | Number of pooled gRPC channels (and matching streaming calls) created per peer URL. Each channel owns its own `SocketsHttpHandler` and TCP/HTTP2 connection, so effective per-peer concurrency is approximately `GrpcChannelsPerNode × MaxConcurrentStreams`. Replication appends to a peer always use the first streaming call, so they arrive in order; other traffic is spread round-robin. Clamped to [1, 64] at runtime. Set to `1` to restore single-connection behaviour. |
+| `GrpcChannelsPerNode` | `4` | Number of pooled gRPC channels (and matching streaming calls) created per peer URL. Each channel owns its own `SocketsHttpHandler` and TCP/HTTP2 connection, so effective per-peer concurrency is approximately `GrpcChannelsPerNode × MaxConcurrentStreams`. Replication appends to a peer always use the first streaming call, so they arrive in order; other traffic is spread round-robin. Clamped to [1, 64] at runtime. Set to `1` to restore single-connection behaviour. A channel that stops reconnecting (30 s in `TransientFailure` with no connect attempt, the dead-loop state of grpc-dotnet issue #2734) is disposed and rebuilt in its slot, and the streaming call bound to the slot re-opens on the new channel; `SharedChannels.GetChannelHealth(url)`, the `raft.transport.channel_rebuilds_total` counter and the `raft.transport.channels_in_transient_failure` gauge show it per peer. |
 | `GrpcEnableMultipleHttp2Connections` | `false` | When `true`, each pooled channel's handler may open additional TCP/HTTP2 connections on demand, raising the per-channel stream ceiling further on saturated links. |
 | `HttpAuthBearerToken` | empty | **Deprecated.** Legacy bearer token. Use `TransportSecurity.SharedSecret` instead. |
 | `HttpTimeout` | `5` | REST request timeout in seconds. |
@@ -430,13 +430,13 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `UpdateNodesInterval` | `5000 ms` | Discovery refresh interval. |
 | `StartElectionTimeout` | `2000 ms` | Lower election timeout bound. |
 | `EndElectionTimeout` | `4000 ms` | Upper election timeout bound. |
-| `StartElectionTimeoutIncrement` | `100 ms` | Lower timeout backoff increment. |
-| `EndElectionTimeoutIncrement` | `200 ms` | Upper timeout backoff increment. |
+| `StartElectionTimeoutIncrement` | `100 ms` | Obsolete, no effect. A failed election draws a fresh random timeout. |
+| `EndElectionTimeoutIncrement` | `200 ms` | Obsolete, no effect. A failed election draws a fresh random timeout. |
 | `EnableQuiescence` | `true` | When `true`, idle partitions stop sending per-partition heartbeats and followers gate elections on SWIM node liveness. Set to `false` to restore per-partition heartbeating on every interval. Requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` (validated at construction). See [Partition Quiescence](#partition-quiescence). |
 | `QuiesceAfter` | `1500 ms` | How long a partition must be idle (no proposals, no in-flight replication) before its leader quiesces it. |
 | `PingInterval` | `1000 ms` | SWIM failure-detector probe cadence. With quiescence on, a quiesced follower detects a dead leader roughly one `PingInterval` after the crash; must be `> 0` and `< StartElectionTimeout`. |
 | `SlowRaftStateMachineLog` | `50 ms` | Slow partition state-machine operation warning threshold. |
-| `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
+| `SlowRaftWALMachineLog` | `25 ms` | Obsolete, no effect. Use `WalStallWarnThreshold`. |
 | `WalStallStepDownTimeout` | `3 s` | Durable-write stall watchdog. A leader whose own WAL write has been unanswered by the storage engine for this long steps down in the same term (its waiting proposals fail at once so callers re-route), notifies the most caught-up peer so the successor's election starts within a round trip, and refuses to campaign again until the write completes. Raft's election timing only measures a leader's network liveness — a leader on a paused disk keeps heartbeating — so this is the bound that sheds it. `0` disables the watchdog and the candidacy gate. |
 | `CompactionLiveReplicaLagBudget` | `1000000` | Entries the leader retains below the compaction checkpoint for a live, acking follower that has not replicated them, so a follower behind by less than this is served by log backfill instead of a snapshot. Sized to cover a 30–60 s device pause under load. The leader sends the floor to its followers, which hold their own compaction at it, so the hold survives a leader change. A replica that has gone silent holds for `CompactionSilentPeerRetentionWindow`. `0` disables the hold. |
 | `WalStallWarnThreshold` | `500 ms` | Age past which a pending WAL write on any node is logged as a stall (one line on crossing, a reminder every 10 s, one line when it clears with the duration). The continuous signals are the `raft.wal.oldest_pending_write_age_ms` gauge and the `raft.wal.write_duration_ms` histogram. Every append ack also carries the follower's pending-write age and its *durable* commit frontier: a leader ships no entry-carrying backfill and starts no snapshot transfer to a peer reporting a stall at or above this age (`raft.backfill.wal_stall_pauses_total`, `raft.snapshot.transfers_deferred_wal_stall_total`), holds WAL retention at the peer's durable frontier within `CompactionLiveReplicaLagBudget` so the catch-up is served from the log once its disk answers, and a node refuses to open a snapshot session while its own disk is stalled (`raft.snapshot.installs_refused_wal_stall_total`). `0` disables the log lines only; the peer rules then use 500 ms. |
@@ -889,7 +889,6 @@ RaftConfiguration config = new()
 {
     EnableLeaderBalancer = true,                          // default false
     LeaderBalancerInterval = TimeSpan.FromSeconds(30),    // how often the controller plans a pass
-    LeaderBalancerReportInterval = TimeSpan.FromSeconds(5), // how often each node emits a load report
     MaxMovesPerPass = 4,                                  // cap on moves planned per pass
     MaxConcurrentTransfers = 2,                           // cap on moves in flight cluster-wide
     MoveCooldown = TimeSpan.FromSeconds(60),              // per-partition cooldown after a move

@@ -313,19 +313,17 @@ public class RaftConfiguration
     public int EndElectionTimeout { get; set; } = 4000;
 
     /// <summary>
-    /// Amount (milliseconds) added to <see cref="StartElectionTimeout"/> after
-    /// each failed election round (no quorum reached).  Backing off the lower
-    /// bound reduces contention when multiple nodes repeatedly collide as candidates.
-    /// Default 100 ms.
+    /// Has no effect. A failed election draws a fresh random timeout from
+    /// [<see cref="StartElectionTimeout"/>, <see cref="EndElectionTimeout"/>) instead of backing off,
+    /// because incremental backoff converged the candidates on one timeout and caused split-vote livelock.
     /// </summary>
+    [Obsolete("Has no effect: a failed election draws a fresh random timeout instead of backing off.")]
     public int StartElectionTimeoutIncrement { get; set; } = 100;
 
     /// <summary>
-    /// Amount (milliseconds) added to <see cref="EndElectionTimeout"/> after
-    /// each failed election round.  Widens the randomisation range over successive
-    /// failures, further reducing the chance of repeated simultaneous elections.
-    /// Default 200 ms.
+    /// Has no effect. See <see cref="StartElectionTimeoutIncrement"/>.
     /// </summary>
+    [Obsolete("Has no effect: a failed election draws a fresh random timeout instead of backing off.")]
     public int EndElectionTimeoutIncrement { get; set; } = 200;
 
     /// <summary>
@@ -368,11 +366,10 @@ public class RaftConfiguration
     public int SlowRaftStateMachineLog { get; set; } = 50;
 
     /// <summary>
-    /// Intended warning threshold (milliseconds) for WAL write operations.
-    /// Reserved for future use — this field is not yet wired into the WAL write path
-    /// and has no effect at runtime.
-    /// Default 25 ms.
+    /// Has no effect: nothing reads this option. Use <see cref="WalStallWarnThreshold"/> to be warned
+    /// about a slow WAL.
     /// </summary>
+    [Obsolete("Has no effect. Use WalStallWarnThreshold.")]
     public int SlowRaftWALMachineLog { get; set; } = 25;
 
     // ── I/O thread pools ──────────────────────────────────────────────────────
@@ -431,6 +428,8 @@ public class RaftConfiguration
     /// When a partition's queue reaches this depth the WAL scheduler throws
     /// <see cref="WAL.IO.BackpressureExceededException"/> so WAL write pressure
     /// propagates back to the Raft state machine before log memory grows unbounded.
+    /// A refused proposal or checkpoint answers <see cref="Data.RaftOperationStatus.ProposalQueueFull"/>.
+    /// A refused <c>CommitLogs</c> or <c>RollbackLogs</c> throws the exception to its caller.
     /// </summary>
     public int MaxWalQueueDepthPerPartition { get; set; } = 4096;
 
@@ -448,26 +447,10 @@ public class RaftConfiguration
     public int MaxWalBatchSize { get; set; } = 256;
 
     /// <summary>
-    /// Desired number of SQLite shard databases across which partitions are distributed
-    /// (<c>partitionId mod shardCount</c>).
-    ///
-    /// <para>This value is used <b>only</b> to seed a brand-new data directory; once a
-    /// directory has been initialised the value persisted in its metadata DB is authoritative.
-    /// A non-zero value that differs from the persisted one causes <see cref="WAL.SqliteWAL"/>
-    /// to throw at startup (changing the shard count for an existing directory orphans all
-    /// previously-written logs).  Use <c>0</c> (the default) to accept whatever value was
-    /// written at directory creation time.</para>
-    ///
-    /// <para>Typical trade-offs:</para>
-    /// <list type="bullet">
-    ///   <item><c>1</c> — single shared database; maximum fsync amortization, all writes serialized.</item>
-    ///   <item><see cref="Environment.ProcessorCount"/> (resolved when <c>0</c> seeds a new directory)
-    ///       — balanced default: one shard per CPU thread, parallelism without per-partition overhead.</item>
-    ///   <item>Large value — approaches the legacy one-file-per-partition layout with no amortization.</item>
-    /// </list>
-    ///
-    /// Default <c>0</c> (resolved to <see cref="Environment.ProcessorCount"/> on first initialisation).
+    /// Has no effect: nothing reads this option. The <c>shardCount</c> argument of the
+    /// <see cref="WAL.SqliteWAL"/> constructor sets the shard count of a new data directory.
     /// </summary>
+    [Obsolete("Has no effect. Pass shardCount to the SqliteWAL constructor.")]
     public int SqliteWalShardCount { get; set; }
 
     /// <summary>
@@ -477,8 +460,8 @@ public class RaftConfiguration
     /// storage write — for RocksDB this is one <c>db.Write</c> / one fsync
     /// regardless of partition count.
     ///
-    /// <para><b>SQLite note:</b> SQLite stores each partition in a separate database
-    /// file, so a group-commit batch still issues one transaction per partition file.
+    /// <para><b>SQLite note:</b> SQLite stores partitions in shard databases (<c>partitionId mod
+    /// shardCount</c>), so a group-commit batch still issues one transaction per shard.
     /// If one partition's write fails the entire batch's status is set to
     /// <c>Errored</c>, which means partitions that committed successfully will
     /// receive a spurious error completion and their proposers will retry.  The
@@ -1585,11 +1568,10 @@ public class RaftConfiguration
         EnableLoadReports || EnableLeaderBalancer || EnablePlacementRebalancer || ReplicationFactor > 0;
 
     /// <summary>
-    /// How often each node emits a <c>NodeLoadReport</c> on the gossip path.
-    /// The P0 leader uses this cadence to refresh its global leadership view.
-    /// Shorter intervals give fresher data at the cost of more gossip traffic.
-    /// <para>Default is <b>5 seconds</b>.</para>
+    /// Has no effect: nothing reads this option. A node builds its <c>NodeLoadReport</c> once per
+    /// <see cref="GossipInterval"/> and sends it to <see cref="GossipFanout"/> random peers.
     /// </summary>
+    [Obsolete("Has no effect. Load reports go out once per GossipInterval.")]
     public TimeSpan LeaderBalancerReportInterval { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
@@ -1602,8 +1584,9 @@ public class RaftConfiguration
 
     /// <summary>
     /// Maximum age of a <c>NodeLoadReport</c> before it is considered stale and excluded
-    /// from the planning view.  Must be greater than <see cref="LeaderBalancerReportInterval"/>
-    /// to tolerate at least one missed emission.
+    /// from the planning view.  Keep it greater than <see cref="GossipInterval"/> to tolerate at
+    /// least one missed emission. Reports are not forwarded, so a larger cluster needs a larger
+    /// margin or a larger <see cref="GossipFanout"/>.
     /// <para>Default is <b>20 seconds</b>.</para>
     /// </summary>
     public TimeSpan LeaderBalancerReportTtl { get; set; } = TimeSpan.FromSeconds(20);

@@ -391,6 +391,16 @@ public sealed class TestBackpressureAndAdmissionControl
     [Fact]
     public void WalScheduler_WhenQueueFull_ThrowsBackpressureExceededException()
     {
+        long rejections = 0;
+        using global::System.Diagnostics.Metrics.MeterListener listener = new();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Name == "raft.wal.backpressure_rejections_total")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, _, _) => Interlocked.Add(ref rejections, value));
+        listener.Start();
+
         const int maxDepth = 2;
         using BlockingWal wal = new();
         using FairWalScheduler scheduler = new(
@@ -424,6 +434,7 @@ public sealed class TestBackpressureAndAdmissionControl
         catch (BackpressureExceededException ex)
         {
             caught = ex;
+            Assert.True(Interlocked.Read(ref rejections) >= 1, "A refused write must be visible to operators.");
         }
         finally
         {

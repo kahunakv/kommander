@@ -69,6 +69,9 @@ public class TestGrpcChannelPool
         Assert.Equal(channelsPerNode, pool.Count);
     }
 
+    // GetAllChannels returns a snapshot list (the pool may rebuild a channel later), so the
+    // cache is observed through the channel instances, not the list wrapper.
+
     [Fact]
     public void ChannelPool_SecondCallSameUrl_ReturnsCachedPool()
     {
@@ -76,7 +79,7 @@ public class TestGrpcChannelPool
         GrpcChannelPoolOptions opts = new(3, false, null);
         List<GrpcChannel> first  = SharedChannels.GetAllChannels(url, opts);
         List<GrpcChannel> second = SharedChannels.GetAllChannels(url, opts);
-        Assert.Same(first, second);
+        Assert.Equal(first, second);
     }
 
     // ── 3. URL normalization: raw host:port coalesces with https:// prefix ───
@@ -88,7 +91,7 @@ public class TestGrpcChannelPool
         GrpcChannelPoolOptions opts = new(2, false, null);
         List<GrpcChannel> fromRaw        = SharedChannels.GetAllChannels(host, opts);
         List<GrpcChannel> fromNormalized = SharedChannels.GetAllChannels("https://" + host, opts);
-        Assert.Same(fromRaw, fromNormalized);
+        Assert.Equal(fromRaw, fromNormalized);
     }
 
     // ── 4. End-to-end: GrpcChannelsPerNode flows from RaftConfiguration ──────

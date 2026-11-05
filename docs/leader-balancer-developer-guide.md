@@ -283,7 +283,7 @@ The balancer is **off by default**. Turn it on by setting `EnableLeaderBalancer 
 |---|---|---|
 | `EnableLeaderBalancer` | `false` | Master on/off switch. When off: no reports, no passes, zero overhead. |
 | `LeaderBalancerInterval` | `30s` | How often the controller runs a balancing pass. |
-| `LeaderBalancerReportInterval` | `5s` | How often each node emits its load report. |
+| `LeaderBalancerReportInterval` | `5s` | Obsolete, no effect. A node emits its load report once per `GossipInterval`. |
 | `LeaderBalancerReportTtl` | `20s` | A report older than this is ignored (the node is treated as silent). |
 | `CountDeadband` | `1` | How far above/below the average a node may drift before it's acted on. |
 | `LoadImbalanceThreshold` | `0.25` | How skewed load must be (when counts are even) to trigger a swap. |
@@ -307,7 +307,7 @@ The balancer is **off by default**. Turn it on by setting `EnableLeaderBalancer 
 - Start with defaults. They're deliberately conservative — slow and gentle.
 - If rebalancing feels too sluggish, lower `LeaderBalancerInterval` or raise `MaxMovesPerPass` /
   `MaxConcurrentTransfers` — but expect more churn.
-- Keep `SuggestionTimeout` comfortably larger than `LeaderBalancerReportInterval` **plus** the time it
+- Keep `SuggestionTimeout` comfortably larger than `GossipInterval` **plus** the time it
   takes gossip to spread across your cluster. If it's too small, successful moves get mis-counted as
   failures (because their "I'm the new leader" report hasn't reached the controller yet) and get
   needlessly retried. On bigger clusters, raise it.

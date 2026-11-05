@@ -362,11 +362,11 @@ public interface IRaft
     /// <paramref name="entries"/>).
     /// </para>
     /// <para>
-    /// Scope: the batch is <b>auto-commit only</b>. Any entry with
-    /// <see cref="RaftProposalEntry.AutoCommit"/> set to <see langword="false"/>, or a batch that mixes
-    /// distinct non-zero <see cref="RaftProposalEntry.ExpectedGeneration"/> values, is a batch-level rejection
-    /// (<see cref="RaftBatchReplicationResult.Success"/> is <see langword="false"/> and nothing is appended).
-    /// The generation fence is applied at batch granularity against the partition's committed generation.
+    /// Shape: a leading auto-commit group plus an optional single <b>trailing</b> manual group. Any other
+    /// order is a batch-level rejection (<see cref="RaftBatchReplicationResult.Success"/> is
+    /// <see langword="false"/> and nothing is appended). The generation fence is applied <b>per entry</b>:
+    /// a non-zero <see cref="RaftProposalEntry.ExpectedGeneration"/> that no longer matches fences that
+    /// entry out while its siblings proceed.
     /// </para>
     /// </summary>
     /// <exception cref="PartitionNotHostedException">
@@ -960,9 +960,11 @@ public interface IRaft
     /// Merges two adjacent partitions into one, absorbing <paramref name="sourcePartitionId"/>
     /// into <paramref name="survivorPartitionId"/>.
     /// <para>
-    /// The caller must be the leader of both partitions. The source partition enters
-    /// <c>Draining</c> state in Phase 1, then is removed and its WAL deleted in Phase 2.
-    /// The survivor absorbs the source's hash range.
+    /// The caller must be the leader of both partitions and of the system partition, which commits
+    /// the map change. The source partition enters <c>Draining</c> state in Phase 1, then is removed
+    /// and its WAL deleted in Phase 2. The survivor absorbs the source's hash range but no state:
+    /// <see cref="IRaftStateMachineTransfer"/> does not run on a merge, so the application must move
+    /// the state before it merges.
     /// </para>
     /// </summary>
     public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
@@ -1119,8 +1121,8 @@ public interface IRaft
     /// <para>
     /// <b>Remote path:</b> when a peer leads the partition, the value is read from the
     /// most-recently-received gossip load report emitted by that peer. The result may
-    /// trail the true rate by up to one <see cref="RaftConfiguration.LeaderBalancerReportInterval"/>
-    /// plus propagation delay.
+    /// trail the true rate by one <see cref="RaftConfiguration.GossipInterval"/> or more: reports go to
+    /// <see cref="RaftConfiguration.GossipFanout"/> random peers and are not forwarded.
     /// </para>
     /// <para>
     /// <b>Sentinel:</b> returns <c>0</c> when the local node does not lead the partition and
@@ -1144,8 +1146,8 @@ public interface IRaft
     /// <para>
     /// <b>Remote path:</b> when a peer leads the partition, the value is read from the
     /// most-recently-received gossip load report emitted by that peer. The result may trail the
-    /// true depth by up to one <see cref="RaftConfiguration.LeaderBalancerReportInterval"/> plus
-    /// propagation delay.
+    /// true depth by one <see cref="RaftConfiguration.GossipInterval"/> or more: reports go to
+    /// <see cref="RaftConfiguration.GossipFanout"/> random peers and are not forwarded.
     /// </para>
     /// <para>
     /// <b>Sentinel:</b> returns <c>0</c> when the local node does not lead the partition and
@@ -1166,8 +1168,9 @@ public interface IRaft
     /// </para>
     /// <para>
     /// <b>Remote path:</b> when a peer leads the partition, the value is read from the
-    /// most-recently-received gossip load report. The result may trail by up to one
-    /// <see cref="RaftConfiguration.LeaderBalancerReportInterval"/> plus propagation delay.
+    /// most-recently-received gossip load report. The result may trail by one
+    /// <see cref="RaftConfiguration.GossipInterval"/> or more: reports go to
+    /// <see cref="RaftConfiguration.GossipFanout"/> random peers and are not forwarded.
     /// </para>
     /// <para>
     /// <b>Sentinel:</b> returns <c>0</c> when the local node does not lead the partition and
