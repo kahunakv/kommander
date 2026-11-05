@@ -1173,7 +1173,11 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// <summary>How often <see cref="WarnWhileRosterShortOfEvictedMembers"/> repeats its line.</summary>
     internal static readonly TimeSpan RosterShortfallWarnInterval = TimeSpan.FromMinutes(1);
 
-    private DateTimeOffset _lastRosterShortfallWarnUtc = DateTimeOffset.MinValue;
+    /// <summary>
+    /// The <see cref="RaftConfiguration.TickSource"/> reading at the last roster-shortfall warning;
+    /// null until the first one. Null and not a 0 sentinel, because a tick source may read 0.
+    /// </summary>
+    private long? _lastRosterShortfallWarnTicks;
 
     /// <summary>
     /// While the committed roster records evicted members that have not been admitted again (the
@@ -1181,6 +1185,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// is one still out), the P0 leader says so at Warning once per <see cref="RosterShortfallWarnInterval"/>:
     /// the cluster is running on fewer voters than it was sized for, and a Warning-only log otherwise
     /// shows the eviction and nothing until the member is promoted again, minutes later.
+    /// <para>
+    /// The interval is measured on <see cref="RaftConfiguration.TickSource"/>, never on the wall
+    /// clock. A simulation then emits the line at the same step on every replay, and a wall-clock
+    /// step (NTP, a suspended host) can neither silence the line nor repeat it early. A direct
+    /// clock read here also fails <c>scripts/check-determinism-boundary.sh</c>.
+    /// </para>
     /// </summary>
     private void WarnWhileRosterShortOfEvictedMembers(ClusterMembership roster)
     {
@@ -1197,11 +1207,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
         if (evicted == 0)
             return;
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-        if (now - _lastRosterShortfallWarnUtc < RosterShortfallWarnInterval)
+        IMonotonicTickSource tickSource = manager.Configuration.TickSource;
+        long nowTicks = tickSource.GetTimestamp();
+        if (_lastRosterShortfallWarnTicks is { } lastTicks
+            && tickSource.GetElapsedTime(lastTicks, nowTicks) < RosterShortfallWarnInterval)
             return;
 
-        _lastRosterShortfallWarnUtc = now;
+        _lastRosterShortfallWarnTicks = nowTicks;
 
         if (!logger.IsEnabled(LogLevel.Warning))
             return;

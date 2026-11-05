@@ -2,10 +2,13 @@
 using System.Text.Json;
 using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Logging;
 using Kommander.System;
 using Kommander.System.Protos;
+using Kommander.Tests.Simulation.Time;
 using Kommander.Time;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Google.Protobuf;
 
@@ -22,7 +25,9 @@ namespace Kommander.Tests.Scheduler;
 ///   3. Membership seeding is skipped when a roster is already committed, and a
 ///      second leadership term never re-seeds over the first
 ///   4. Dead-member eviction commits for an unreachable member, but a live-but-
-///      silent member is resurrected by the last-chance probe and kept
+///      silent member is resurrected by the last-chance probe and kept; while an
+///      evicted member stays out, the roster-shortfall warning repeats once per
+///      interval of the tick source
 ///   5. Removing the local voter completes without wedging the coordinator loop
 ///   6. A restored checkpoint snapshot rebuilds the map and roster; a malformed
 ///      payload is dropped without wedging; an older snapshot cannot regress a
@@ -36,7 +41,9 @@ public sealed class TestSystemCoordinatorFailures
         int initialPartitions = 0,
         TimeSpan? deadMemberEvictionGrace = null,
         Kommander.Communication.Memory.InMemoryCommunication? communication = null,
-        int port = 9000)
+        int port = 9000,
+        IMonotonicTickSource? tickSource = null,
+        ILogger<IRaft>? logger = null)
     {
         RaftConfiguration config = new()
         {
@@ -46,6 +53,8 @@ public sealed class TestSystemCoordinatorFailures
         };
         if (deadMemberEvictionGrace is { } grace)
             config.DeadMemberEvictionGrace = grace;
+        if (tickSource is not null)
+            config.TickSource = tickSource;
 
         return new(
             config,
@@ -53,8 +62,37 @@ public sealed class TestSystemCoordinatorFailures
             new InMemoryWAL(NullLogger<IRaft>.Instance),
             communication ?? new Kommander.Communication.Memory.InMemoryCommunication(),
             new HybridLogicalClock(),
-            NullLogger<IRaft>.Instance
+            logger ?? NullLogger<IRaft>.Instance
         );
+    }
+
+    /// <summary>
+    /// Counts log events by their generated event name (the <c>LoggerMessage</c> method name), so a
+    /// test can assert on one diagnostic without a dependency on its message text.
+    /// </summary>
+    private sealed class EventCountingLogger : ILogger<IRaft>
+    {
+        private readonly Dictionary<string, int> counts = new(StringComparer.Ordinal);
+
+        public int Count(string eventName)
+        {
+            lock (counts)
+                return counts.GetValueOrDefault(eventName);
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                Func<TState, Exception?, string> formatter)
+        {
+            if (eventId.Name is null)
+                return;
+
+            lock (counts)
+                counts[eventId.Name] = counts.GetValueOrDefault(eventId.Name) + 1;
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
@@ -73,7 +111,12 @@ public sealed class TestSystemCoordinatorFailures
                 RaftSystemConfigKeys.Partitions,
                 JsonSerializer.Serialize(new RaftPartitionMap { MapVersion = mapVersion, Partitions = ranges })));
 
-    private static RaftSystemRequest MakeMembersReplicated(long version, params (string Endpoint, int NodeId)[] voters)
+    private static RaftSystemRequest MakeMembersReplicated(long version, params (string Endpoint, int NodeId)[] voters) =>
+        MakeMembersReplicated(version, voters, []);
+
+    /// <summary>A committed roster of voters that also records <paramref name="departures"/>.</summary>
+    private static RaftSystemRequest MakeMembersReplicated(
+        long version, (string Endpoint, int NodeId)[] voters, List<ClusterDeparture> departures)
     {
         ClusterMembership membership = new()
         {
@@ -84,7 +127,8 @@ public sealed class TestSystemCoordinatorFailures
                 {
                     Endpoint = v.Endpoint, NodeId = v.NodeId, Role = ClusterMemberRole.Voter, JoinedVersion = 1
                 })
-            ]
+            ],
+            Departures = departures
         };
 
         return new RaftSystemRequest(
@@ -361,6 +405,79 @@ public sealed class TestSystemCoordinatorFailures
             Assert.Equal(2, roster.Members.Count);
             Assert.Equal(0, CountKeys(keys, RaftSystemConfigKeys.Members));
             Assert.Equal(Kommander.Gossip.MemberLivenessState.Alive, manager.Liveness.GetState(silent.LocalEndpoint));
+        }
+    }
+
+    /// <summary>
+    /// The roster-shortfall warning repeats once per <see cref="RaftSystemCoordinator.RosterShortfallWarnInterval"/>
+    /// (one minute). The test moves a virtual tick source across the interval, so it proves two
+    /// things without a wait: the throttle holds inside the interval, and the interval is measured on
+    /// <see cref="RaftConfiguration.TickSource"/>. A throttle on the wall clock fails here, because no
+    /// wall-clock minute passes between the passes. The 2026-11-05 CI failure was such a read:
+    /// <c>scripts/check-determinism-boundary.sh</c> rejects it in a consensus-path file.
+    /// </summary>
+    [Fact]
+    public async Task EvictDeadMembers_RosterShortOfEvictedMember_WarnsOncePerIntervalOfTheTickSource()
+    {
+        const string warning = nameof(RaftLoggerExtensions.LogWarnRosterShortOfEvictedMembers);
+
+        VirtualTickSource ticks = new();
+        EventCountingLogger logger = new();
+        RaftManager manager = Build(tickSource: ticks, logger: logger);
+        using (manager)
+        {
+            // The roster at v2 lost "ghost" to an eviction, and "ghost" is not admitted again.
+            manager.SystemCoordinator.Send(MakeMembersReplicated(
+                2,
+                [("localhost:9000", 1), ("other:9001", 3)],
+                [new ClusterDeparture { Endpoint = "ghost:9000", Version = 2, Reason = ClusterDepartureReason.Evicted }]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+
+            // The first pass that sees the shortfall says so.
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(1, logger.Count(warning));
+
+            // No tick passed: the next pass is silent.
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(1, logger.Count(warning));
+
+            // One second short of the interval: still silent. The margin of one second on each side
+            // keeps the test independent of the tick-to-TimeSpan rounding at the exact boundary.
+            long intervalMs = (long)RaftSystemCoordinator.RosterShortfallWarnInterval.TotalMilliseconds;
+            ticks.AdvanceBy(intervalMs - 1_000);
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(1, logger.Count(warning));
+
+            // One second past the interval: the line repeats, and the interval starts again.
+            ticks.AdvanceBy(2_000);
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(2, logger.Count(warning));
+
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(2, logger.Count(warning));
+        }
+    }
+
+    [Fact]
+    public async Task EvictDeadMembers_RosterWithOnlyRequestedDepartures_DoesNotWarnOfAShortfall()
+    {
+        EventCountingLogger logger = new();
+        RaftManager manager = Build(logger: logger);
+        using (manager)
+        {
+            // A member that asked to leave is not a shortfall: the cluster was resized on purpose.
+            manager.SystemCoordinator.Send(MakeMembersReplicated(
+                2,
+                [("localhost:9000", 1), ("other:9001", 3)],
+                [new ClusterDeparture { Endpoint = "gone:9000", Version = 2, Reason = ClusterDepartureReason.Requested }]));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+
+            await manager.SystemCoordinator.EvictDeadMembersAsync();
+            Assert.Equal(0, logger.Count(nameof(RaftLoggerExtensions.LogWarnRosterShortOfEvictedMembers)));
         }
     }
 
