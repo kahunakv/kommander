@@ -47,6 +47,13 @@ internal sealed class RaftTransportDispatcher : IDisposable
         private readonly string _endpoint;
 
         /// <summary>
+        /// Rate limit on this peer's send-failure log: a dead link fails every frame, and one line
+        /// per frame was the loudest symptom of the 1.13.3 inst3 stuck channel. Touched only by the
+        /// one loop (or the one manual flusher) that sends.
+        /// </summary>
+        private readonly TransportFailureEpisode _failures;
+
+        /// <summary>
         /// Approximate log-payload bytes currently queued (or in the in-flight batch) for this
         /// peer. Incremented at enqueue, decremented after the batch containing the message has
         /// been handed to the transport — the queue AND the in-flight batch both retain the
@@ -102,6 +109,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
             _node = node;
             _communication = communication;
             _manualExecution = manualExecution;
+            _failures = new TransportFailureEpisode(logger, node.Endpoint);
 
             _channel = Channel.CreateUnbounded<QueuedMessage>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -214,13 +222,12 @@ internal sealed class RaftTransportDispatcher : IDisposable
             try
             {
                 await Send(batch, _manager, _node, _communication, _logger).ConfigureAwait(false);
+                _failures.NoteSuccess();
                 return batch.Count;
             }
             catch (Exception ex)
             {
-                _logger.LogError(
-                    "[RaftTransportDispatcher/{Endpoint}] flush {Type}: {Message}",
-                    _endpoint, ex.GetType().Name, ex.Message);
+                _failures.NoteFailure(ex, "flush");
                 return 0;
             }
             finally
@@ -376,12 +383,11 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 try
                 {
                     await Send(batch, manager, node, communication, logger).ConfigureAwait(false);
+                    _failures.NoteSuccess();
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(
-                        "[RaftTransportDispatcher/{Endpoint}] {Type}: {Message}\n{StackTrace}",
-                        node.Endpoint, ex.GetType().Name, ex.Message, ex.StackTrace);
+                    _failures.NoteFailure(ex, "send");
                 }
                 finally
                 {
@@ -399,12 +405,14 @@ internal sealed class RaftTransportDispatcher : IDisposable
             // message carried over from the last frame the loop built).
             while (FillBatch(batch) > 0)
             {
-                try { await Send(batch, manager, node, communication, logger).ConfigureAwait(false); }
+                try
+                {
+                    await Send(batch, manager, node, communication, logger).ConfigureAwait(false);
+                    _failures.NoteSuccess();
+                }
                 catch (Exception ex)
                 {
-                    logger.LogError(
-                        "[RaftTransportDispatcher/{Endpoint}] drain {Type}: {Message}",
-                        node.Endpoint, ex.GetType().Name, ex.Message);
+                    _failures.NoteFailure(ex, "drain");
                 }
                 finally { ReleaseBatchBytes(batch); }
             }

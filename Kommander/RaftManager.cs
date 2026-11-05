@@ -812,7 +812,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             Kommander.Communication.Grpc.SharedChannels.Configure(
                 configuration.GetEffectiveGrpcChannelsPerNode(),
                 configuration.GrpcEnableMultipleHttp2Connections,
-                configuration.GrpcMaxMessageBytes);
+                configuration.GrpcMaxMessageBytes,
+                Logger);
         }
 
         if (communication is Kommander.Communication.Rest.RestCommunication

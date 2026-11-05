@@ -392,7 +392,7 @@ public sealed class TestBackpressureAndAdmissionControl
     public void WalScheduler_WhenQueueFull_ThrowsBackpressureExceededException()
     {
         long rejections = 0;
-        using System.Diagnostics.Metrics.MeterListener listener = new();
+        using global::System.Diagnostics.Metrics.MeterListener listener = new();
         listener.InstrumentPublished = (instrument, l) =>
         {
             if (instrument.Name == "raft.wal.backpressure_rejections_total")

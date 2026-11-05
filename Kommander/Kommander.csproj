@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.13.3</Version>
+    <Version>1.13.4</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -66,9 +66,9 @@
 
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
     <PackageReference Include="System.IO.Hashing" Version="10.0.14" />
-    <PackageReference Include="Google.Protobuf" Version="3.29.6" />
-    <PackageReference Include="Grpc.Net.Client" Version="2.67.0" />
-    <PackageReference Include="Grpc.Tools" Version="2.68.1">
+    <PackageReference Include="Google.Protobuf" Version="3.36.2" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.85.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.85.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
@@ -86,8 +86,8 @@
           remain.
        Code outside these files that names a removed type is gated with the SDK's BROWSER symbol. -->
   <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
-    <PackageReference Include="Grpc.AspNetCore" Version="2.67.0" />
-    <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.67.0" />
+    <PackageReference Include="Grpc.AspNetCore" Version="2.85.0" />
+    <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.85.0" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
   </ItemGroup>
 
