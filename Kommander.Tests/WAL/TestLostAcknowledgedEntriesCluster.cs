@@ -220,7 +220,7 @@ public sealed class TestLostAcknowledgedEntriesCluster
                     {
                         if (n is null) return $"node{i + 1}: down";
                         n.WalAdapter.TryGetHardState(0, out long hsTerm, out string? hsVote);
-                        return $"node{i + 1}: leader0={n.AmILeaderQuick(0).GetAwaiter().GetResult()} max0={n.WalAdapter.GetMaxLog(0)} logTerm0={n.WalAdapter.GetCurrentTerm(0)} hard=({hsTerm},{hsVote}) health0={n.GetPartitionStorageHealth(0)?.State}";
+                        return $"node{i + 1}: leader0={n.AmILeaderQuick(0).AsTask().GetAwaiter().GetResult()} max0={n.WalAdapter.GetMaxLog(0)} logTerm0={n.WalAdapter.GetCurrentTerm(0)} hard=({hsTerm},{hsVote}) health0={n.GetPartitionStorageHealth(0)?.State}";
                     }));
                     Assert.Fail($"the system partition never lifted its quarantine: {system?.State} — {system?.Reason}; victim=node{victimNodeId}; {nodes}");
                 }

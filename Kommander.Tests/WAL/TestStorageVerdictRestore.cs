@@ -65,7 +65,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(healthy);
-                await WaitForConditionAsync(() => healthy.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => healthy.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
 
                 byte[] data = "Hello World"u8.ToArray();
                 for (int i = 1; i <= total; i++)
@@ -128,7 +128,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(accepting);
-                await WaitForConditionAsync(() => accepting.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => accepting.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
                 Assert.Equal(RaftPartitionStorageState.Healthy, accepting.GetPartitionStorageHealth(UserPartition)?.State);
             }
             finally
@@ -141,7 +141,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(strict);
-                await WaitForConditionAsync(() => strict.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => strict.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
                 Assert.Equal(RaftPartitionStorageState.Healthy, strict.GetPartitionStorageHealth(UserPartition)?.State);
             }
             finally
@@ -205,7 +205,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(accepting);
-                await WaitForConditionAsync(() => accepting.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => accepting.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
                 Assert.Equal(RaftPartitionStorageState.Healthy, accepting.GetPartitionStorageHealth(UserPartition)?.State);
             }
             finally
@@ -218,7 +218,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(strict);
-                await WaitForConditionAsync(() => strict.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => strict.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
                 Assert.Equal(RaftPartitionStorageState.Healthy, strict.GetPartitionStorageHealth(UserPartition)?.State);
             }
             finally
@@ -295,7 +295,7 @@ public sealed class TestStorageVerdictRestore
             try
             {
                 await JoinAsync(node);
-                await WaitForConditionAsync(() => node.AmILeaderQuick(UserPartition).GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
+                await WaitForConditionAsync(() => node.AmILeaderQuick(UserPartition).AsTask().GetAwaiter().GetResult(), TestContext.Current.CancellationToken);
 
                 Assert.Equal(RaftPartitionStorageState.Healthy, node.GetPartitionStorageHealth(UserPartition)?.State);
                 Assert.Equal(new long[] { 12, 13, 14, 15 }, restored.OrderBy(id => id).ToArray());
