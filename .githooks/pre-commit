@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# pre-commit guard: run the determinism boundary check on the content the commit records.
+#
+# Why: scripts/check-determinism-boundary.sh is the first step of the Run Tests workflow, and a
+# failure there skips every test step after it. On 2026-11-05 a commit added one direct
+# DateTimeOffset.UtcNow read to a consensus-path file, the step failed, and the commit reached
+# main with no CI test run at all. Nothing ran the check before the push. This hook runs it at
+# commit time, where the fix costs a minute instead of a red main.
+#
+# Behaviour:
+#   - Checks the STAGED content, not the working tree. It exports the index to a temporary
+#     folder and runs the staged copy of the check there, so an unstaged fix does not hide a
+#     staged violation, and an unstaged experiment does not block an unrelated commit.
+#   - Does nothing when the commit stages no library source file, check script, or baseline:
+#     only those files can change the result.
+#   - Does nothing on a branch that predates the check script.
+#
+# Bypass:  git commit --no-verify   (CI still runs the check and still fails.)
+#
+# Install (once per clone):  git config core.hooksPath .githooks
+
+set -euo pipefail
+
+CHECK="scripts/check-determinism-boundary.sh"
+BASELINE="scripts/determinism-boundary-baseline.txt"
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Read the staged names into a variable first. A pipe into 'grep -q' can end 'git diff' with
+# SIGPIPE, and under pipefail that reads as "no match" and skips the check without a word.
+STAGED="$(git diff --cached --name-only)"
+
+if ! grep -qE '^(Kommander/.*\.cs|scripts/check-determinism-boundary\.sh|scripts/determinism-boundary-baseline\.txt)$' <<<"$STAGED"; then
+  exit 0
+fi
+
+# No check script in the index: an old branch, nothing to run.
+if ! git cat-file -e ":$CHECK" 2>/dev/null; then
+  exit 0
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/kommander-boundary.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# The index, not the working tree: 'git ls-files' and 'git checkout-index' both read the index
+# git prepared for this commit (GIT_INDEX_FILE covers 'git commit -a' and 'git commit <path>').
+# The check derives its root from its own location, so the staged copy checks the staged tree.
+git ls-files -z -- 'Kommander/*.cs' "$CHECK" "$BASELINE" \
+  | git checkout-index -z --stdin --prefix="$WORK/"
+
+if ! bash "$WORK/$CHECK"; then
+  cat >&2 <<'EOF'
+
+pre-commit: the determinism boundary check failed on the staged content. Commit stopped.
+The same check is the first step of the Run Tests workflow, and its failure skips every test.
+Fix the read as the message above says, stage the fix, and commit again.
+EOF
+  exit 1
+fi
