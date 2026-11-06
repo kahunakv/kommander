@@ -540,6 +540,13 @@ internal sealed class BackfillSender
     /// time it needs to close that lag can only repeat the first. The escalation — not the pacing,
     /// not the Warning — is deferred for <see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/>
     /// at most (see <see cref="IsInsideSeededCatchUpGrace"/>).</para>
+    ///
+    /// <para><b>A follower whose commit frontier reaches the checkpoint is not seeded.</b> The
+    /// escalation holds the transfer (<see cref="PeerReportsCommittedThrough"/>) and says so once per
+    /// episode, so an episode that ends without a transfer-start line still explains itself. The
+    /// follower's durable frontier does not count against it: judged on that frontier, a follower
+    /// resuming from a 30-s pause with 73,000 unflushed entries was seeded with a snapshot it skipped
+    /// on arrival (CamusDB fault soak inst5, 2026-11-06).</para>
     /// </summary>
     private async Task RecordShippedAsync(RaftNode node, long reportedFrontier, long anchor, long lastShippedId)
     {
@@ -688,19 +695,29 @@ internal sealed class BackfillSender
     }
 
     /// <summary>
-    /// True when the peer's own reports put it at or past <paramref name="index"/> on both counts the
-    /// leader tracks: its commit frontier (gap-aware, so every entry through it is committed there and
-    /// deliverable) and, when it reports one, its durable frontier (every entry through it contiguously
-    /// on its disk). Stricter than <see cref="PeerReportsHolding"/>, which trusts the durable frontier
-    /// alone: a peer can hold a range whose commit markers it lost, and for that peer a snapshot is
-    /// still a repair.
+    /// True when the peer's gap-aware commit frontier reaches <paramref name="index"/>: every entry
+    /// through it is committed there and deliverable, so a snapshot taken at the index carries nothing
+    /// the peer lacks. That frontier is the one report which proves it, and it is consulted alone.
+    ///
+    /// <para><b>The durable frontier must not be required as well.</b> It is the peer's synced
+    /// position, built to trail its commit frontier by whatever its disk has not flushed yet (that lag
+    /// is what keeps WAL retention off queued writes, see <see cref="ReplicationTracker"/>), and a
+    /// snapshot cannot move it: the peer's disk does, and the install would need that same disk. When
+    /// this method also demanded the durable frontier, a follower resuming from a 30-s pause with its
+    /// commit and presence frontiers 73,000 entries past the checkpoint and its durable frontier 25
+    /// entries under it was sent a NoProgressProbe snapshot it skipped on arrival as already covered by
+    /// its apply cursor (CamusDB fault soak inst5, Kommander 1.13.4, 2026-11-06). The gate had the
+    /// peer's positions in hand and started the export anyway.</para>
+    ///
+    /// <para><b>The presence frontier must not stand in for the commit frontier.</b> A peer that holds a
+    /// range whose commit markers it lost (a restart) reports presence above the index and commit below
+    /// it; the markers under the retention floor cannot be shipped, so for that peer the snapshot is the
+    /// repair. Stricter than <see cref="PeerReportsHolding"/> in that sense: holding is not committing.</para>
     /// </summary>
     private bool PeerReportsCommittedThrough(string endpoint, long index)
     {
-        if (tracker.GetCommitFrontierOrDefault(endpoint, -1) < index)
-            return false;
-
-        return !tracker.TryGetDurableFrontier(endpoint, out long durable) || durable <= 0 || durable >= index;
+        long committed = tracker.GetCommitFrontierOrDefault(endpoint, -1);
+        return committed > 0 && committed >= index;
     }
 
     /// <summary>
@@ -770,20 +787,31 @@ internal sealed class BackfillSender
             return;
 
         // A snapshot at the checkpoint repairs a peer that is missing something at or below it. A peer
-        // whose own latest reports already reach the checkpoint holds everything the snapshot would
+        // whose own commit frontier already reaches the checkpoint holds everything the snapshot would
         // carry, so the transfer can only cost: a whole-partition export here, every chunk on the wire,
         // and an install the receiver has to recognise as redundant. The streaks behind an escalation
         // are built from acks that lag exactly such a peer — a follower delivering a large backfill in
-        // one executor turn stops acknowledging while it does — so without this check a follower far past
-        // the checkpoint gets a snapshot. Whatever still keeps it from converging lies above the
-        // checkpoint, where the log is retained and shipping it is the repair.
+        // one executor turn stops acknowledging while it does, and a follower resuming from a pause
+        // answers every batch shipped during it with the frontier it had before — so without this check
+        // a follower far past the checkpoint gets a snapshot. Whatever still keeps it from converging
+        // lies above the checkpoint, where the log is retained and shipping it is the repair, or on its
+        // own disk, which no snapshot can flush: the peer's durable frontier is deliberately not part of
+        // this test (see PeerReportsCommittedThrough). The hold is counted, and for the no-progress probe
+        // it is logged once per episode: the episode's Warning promised a snapshot "unless the peer
+        // already reaches the checkpoint", and the log must say which it was.
         if (PeerReportsCommittedThrough(node.Endpoint, lastCheckpoint))
         {
-            if (logger.IsEnabled(LogLevel.Debug))
+            KommanderMetrics.RecordSnapshotWithheldPeerReachesCheckpoint(host.PartitionId);
+
+            if (trigger == SnapshotTransferTrigger.NoProgressProbe && logger.IsEnabled(LogLevel.Information) && tracker.TryMarkBackfillNoProgressCheckpointHoldLogged(node.Endpoint))
+                logger.LogInformation(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] No snapshot for {Endpoint} after {Ships} fruitless batches (last anchor {Anchor}): its commit frontier already reaches this leader's checkpoint {Checkpoint} ({Positions}), so a transfer would carry nothing it lacks. What keeps it from converging is above the checkpoint, where the log is the repair, or on its own disk, which no snapshot can flush",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, fruitlessShips, anchor, lastCheckpoint, PeerPositions(node.Endpoint));
+            else if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] Not escalating to a snapshot for {Endpoint}: its reports already reach the checkpoint {Checkpoint} (commit frontier {Committed})",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, lastCheckpoint,
-                    tracker.GetCommitFrontierOrDefault(node.Endpoint, -1));
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Not escalating {Trigger} to a snapshot for {Endpoint}: its commit frontier already reaches the checkpoint {Checkpoint} ({Positions})",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, trigger, node.Endpoint, lastCheckpoint, PeerPositions(node.Endpoint));
+
             return;
         }
 

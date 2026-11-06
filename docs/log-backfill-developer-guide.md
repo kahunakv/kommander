@@ -363,6 +363,18 @@ Operational notes on the handoff:
   plus the time the follower needs to close that lag at the commit rate the leader has sustained
   since, bounded by `BackfillSeededCatchUpGraceCap` (3 minutes). A refused backfill still escalates
   at once: the grace is for the probe, whose verdict is inference, not for a floor the log cannot serve.
+- **A follower that already reaches the checkpoint is not seeded.** Every escalation — a refused
+  read, the no-progress probe, a compacted anchor — passes one gate before the export starts: when the
+  follower's gap-aware commit frontier reaches the leader's last checkpoint, the snapshot would carry
+  nothing it lacks, and no transfer starts. The hold is counted
+  (`raft.snapshot.transfers_withheld_peer_reaches_checkpoint_total`) and the probe logs it once per
+  episode. The follower's *durable* frontier does not count against it: that frontier trails its
+  commit frontier by whatever its disk has not flushed, a snapshot cannot move it, and the install
+  would need the same disk. Requiring it seeded a follower resuming from a 30-second pause whose
+  commit and presence frontiers stood 73,000 entries past the checkpoint with its durable frontier
+  25 entries under it; the follower skipped the install as already covered (CamusDB fault soak inst5,
+  2026-11-06). The *presence* frontier does not stand in for the commit frontier either: a follower
+  that holds a range without its commit markers still needs the snapshot.
 - **The transfer-start line says why.** Every snapshot transfer starts with a Warning that names
   its trigger (`SnapshotTransferTrigger`: a non-contiguous or empty backfill read, the no-progress
   probe, a compacted anchor, the follower's own re-seed request) and the numbers behind it — the

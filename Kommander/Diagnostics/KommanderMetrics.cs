@@ -396,6 +396,21 @@ public static class KommanderMetrics
         SnapshotTransfersDeferredWalStallTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Escalations that did NOT start a snapshot transfer because the peer's gap-aware commit frontier
+    /// already reaches this leader's checkpoint: the transfer would carry nothing the peer lacks. One
+    /// per escalation attempt held; the no-progress probe logs the hold once per episode. A follower
+    /// whose durable frontier trails its commit frontier (unflushed writes after a pause) lands here
+    /// rather than in <c>raft.snapshot.transfers_started_total</c>.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotTransfersWithheldPeerReachesCheckpointTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.transfers_withheld_peer_reaches_checkpoint_total",
+            description: "Snapshot escalations withheld because the peer's commit frontier already reaches the leader's checkpoint; the log above it is the repair.");
+
+    internal static void RecordSnapshotWithheldPeerReachesCheckpoint(int partitionId) =>
+        SnapshotTransfersWithheldPeerReachesCheckpointTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Snapshot sessions this node refused to open because its OWN disk reports a durable-write
     /// stall (the receiver-side guard, for a leader that has not heard the peer's report).
     /// </summary>

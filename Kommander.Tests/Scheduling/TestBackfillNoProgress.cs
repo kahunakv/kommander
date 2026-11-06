@@ -533,24 +533,57 @@ public class TestBackfillNoProgress
         Assert.Equal(1, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
     }
 
+    /// <summary>
+    /// The inst5 shape (CamusDB fault soak, 2026-11-06): a follower resuming from a 30-s pause reports
+    /// commit and presence frontiers far past the leader's checkpoint and only its durable frontier —
+    /// what its disk has flushed — under it. The streak still forms (every batch shipped during the
+    /// pause comes back acknowledged with the frontier the follower had before it), but a snapshot at
+    /// the checkpoint carries nothing the follower lacks and cannot flush its disk. The gate used to
+    /// demand the durable frontier too and exported a snapshot the follower skipped on arrival. Now:
+    /// no transfer, the log keeps shipping, the episode warns once, and the hold is said once.
+    /// </summary>
     [Fact]
-    public async Task NoProgressEpisode_CommittedPastTheCheckpointButNotDurablyHeld_StillEscalates()
+    public async Task NoProgressEpisode_CommittedPastTheCheckpointWithALaggingDurableFrontier_IsNotSentASnapshot()
     {
-        // The peer's commit frontier passes the checkpoint but its durable frontier does not: it does
-        // not attest to holding the range, so the snapshot remains the rescue.
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 150, durableIndex: 80, presentIndex: 150, presentTerm: 1);
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+        Assert.Empty(sm.GetSnapshotStatuses());
+        Assert.True(EntryBatchesTo(host, VoterA) > 0);
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "triggered by NoProgressProbe"));
+        Assert.Equal(1, logger.Count(LogLevel.Information, "already reaches this leader's checkpoint 100"));
+        Assert.Equal(1, logger.Count(LogLevel.Information, "peer commit 150, durable 80, present 150"));
+    }
+
+    /// <summary>
+    /// The opposite shape keeps its snapshot: a peer whose presence frontier passes the checkpoint but
+    /// whose commit frontier does not holds a range without its commit markers (a restart that lost
+    /// them). The markers under the retention floor cannot be shipped, so the snapshot is the repair:
+    /// presence is not an attestation of commitment, and the gate must not read it as one.
+    /// </summary>
+    [Fact]
+    public async Task NoProgressEpisode_PresentPastTheCheckpointButNotCommitted_StillEscalates()
+    {
         (RaftPartitionStateMachine sm, CapturingHost host, _) =
             await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
 
         for (int i = 0; i < 10; i++)
-            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 150, durableIndex: 80);
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50, durableIndex: 50, presentIndex: 150, presentTerm: 1);
 
         TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
         long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
         while (host.SnapshotChunksTo(VoterA) == 0)
         {
             if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
-                Assert.Fail("a peer that is not durably past the checkpoint was never offered a snapshot");
+                Assert.Fail("a peer that holds the range past the checkpoint without its commit markers was never offered a snapshot");
             await Task.Delay(10, TestContext.Current.CancellationToken);
         }
     }

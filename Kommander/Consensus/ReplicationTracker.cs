@@ -251,6 +251,13 @@ internal sealed class ReplicationTracker
         public bool Warned;
 
         /// <summary>
+        /// True once this episode has logged that its escalation is held because the peer's commit
+        /// frontier reaches the leader's checkpoint. Reset together with <see cref="Warned"/> when a
+        /// ship observes progress, so the next episode says so again.
+        /// </summary>
+        public bool CheckpointHoldLogged;
+
+        /// <summary>
         /// True while at least one ship since the last fruitless-count update awaits its verdict.
         /// Set on every ship, cleared when an ack proves the outstanding ship(s) fruitless — so a
         /// burst of ships answered by one stuck ack counts once, and a flood of heartbeat acks
@@ -895,6 +902,7 @@ internal sealed class ReplicationTracker
             {
                 probe.FruitlessShips = 0;
                 probe.Warned = false;
+                probe.CheckpointHoldLogged = false;
                 probe.PresenceCreditThreshold = long.MaxValue;
             }
         }
@@ -1023,6 +1031,21 @@ internal sealed class ReplicationTracker
             return false;
 
         probe.Warned = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Marks the peer's current no-progress episode as having logged that its escalation is held
+    /// because the peer's commit frontier reaches the checkpoint, returning true exactly once per
+    /// episode. Resets with <see cref="TryMarkBackfillNoProgressWarned"/>: a ship that observes
+    /// progress, or an ack that drops the probe.
+    /// </summary>
+    public bool TryMarkBackfillNoProgressCheckpointHoldLogged(string endpoint)
+    {
+        if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe) || probe.CheckpointHoldLogged)
+            return false;
+
+        probe.CheckpointHoldLogged = true;
         return true;
     }
 
