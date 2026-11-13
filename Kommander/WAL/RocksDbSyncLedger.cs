@@ -23,11 +23,13 @@ namespace Kommander.WAL;
 /// after the engine's synchronous write of that batch returned. RocksDB assigns sequence numbers in
 /// log order and its fsync covers every record appended before it, so everything at or below the
 /// attested sequence is on disk. At open, <see cref="RocksDbWAL"/> compares the attested sequence with
-/// the sequence the engine replayed: a replay that stops short lost synced writes, and the engine
-/// fail-stops (<see cref="IWAL.GetFailStopReason"/>) instead of voting or leading from a log it cannot
-/// vouch for. One global number covers the rows of every partition, the watermark, the hard state,
-/// the frontiers and the floors alike, which is why the check needs no per-partition bookkeeping and
-/// no ordering rules at the paths that lower a watermark.</para>
+/// the sequence the engine replayed: a replay that stops short lost synced writes, and the open records
+/// a persisted verdict (<see cref="IWAL.GetLostSyncedWritesReason"/>). The verdict quarantines every
+/// partition on the engine, so none of them votes or leads from a log it cannot vouch for until a
+/// leader reconciles it. The engine does not fail-stop: it keeps accepting writes, because replication
+/// from a leader is the repair. One global number covers the rows of every partition, the watermark,
+/// the hard state, the frontiers and the floors alike, which is why the check needs no per-partition
+/// bookkeeping and no ordering rules at the paths that lower a watermark.</para>
 ///
 /// <para><b>Why there is no false positive.</b> The ledger is written only <em>after</em> the engine's
 /// synchronous write returned, with the sequence of that batch taken from the batch itself (never

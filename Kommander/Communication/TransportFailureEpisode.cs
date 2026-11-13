@@ -5,8 +5,14 @@ namespace Kommander.Communication;
 
 /// <summary>
 /// Rate-limits the log of one peer's outbound send failures: one Error line when an episode
-/// opens, one Warning summary per interval with the counts while it lasts, one Information
-/// line when a send succeeds again, and the full text of every failure at Debug.
+/// opens, one Warning summary per interval with the counts while it lasts, one Warning line
+/// when a send succeeds again, and the full text of every failure at Debug.
+///
+/// <para><b>Why the recovery line is a Warning.</b> The open line and the summaries sit at Error
+/// and Warning, so a host that filters the Kommander category at Warning sees the episode start
+/// and continue. If the close were an Information line that host would never see it, and the
+/// episode would look open forever: the inst4 soak had to infer every recovery from the summaries
+/// stopping. The close belongs at the same level as the lines that describe the episode.</para>
 ///
 /// <para><b>Why.</b> A dead link fails every frame the dispatcher hands it, and the dispatcher
 /// sends a leader's whole replication stream: the 1.13.3 inst3 soak logged about 45,000 lines a
@@ -96,7 +102,11 @@ internal sealed class TransportFailureEpisode
                 endpoint, stage, exception.GetType().Name, exception.Message);
     }
 
-    /// <summary>Records a successful send: closes the open episode, if any, with its totals. Free when none is open.</summary>
+    /// <summary>
+    /// Records a successful send: closes the open episode, if any, with its totals. Free when none is open.
+    /// The line is a Warning, not an Information, so that a Warning-level filter shows the episode's end
+    /// as well as its start (see the class summary).
+    /// </summary>
     public void NoteSuccess()
     {
         if (!open)
@@ -104,8 +114,8 @@ internal sealed class TransportFailureEpisode
 
         long now = clockMs();
 
-        if (logger.IsEnabled(LogLevel.Information))
-            logger.LogInformation(
+        if (logger.IsEnabled(LogLevel.Warning))
+            logger.LogWarning(
                 "[RaftTransportDispatcher/{Endpoint}] sends recovered after {Total} failures over {Seconds:F0} s",
                 endpoint, failuresInEpisode, (now - episodeStartMs) / 1000.0);
 

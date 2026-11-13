@@ -6,8 +6,9 @@ namespace Kommander.Tests.Communication;
 
 /// <summary>
 /// The rate limit on a peer's send-failure log: one Error when an episode opens, one Warning
-/// summary per interval carrying the counts, Debug for everything in between, one Information
-/// line when sends recover. Driven on a scripted clock so no interval is waited out.
+/// summary per interval carrying the counts, Debug for everything in between, one Warning
+/// line when sends recover (so a Warning-level filter sees the episode close as well as open).
+/// Driven on a scripted clock so no interval is waited out.
 /// </summary>
 public sealed class TestTransportFailureEpisode
 {
@@ -83,7 +84,7 @@ public sealed class TestTransportFailureEpisode
     }
 
     [Fact]
-    public void SuccessClosesTheEpisodeAtInformation_AndTheNextFailureOpensANewOne()
+    public void SuccessClosesTheEpisodeAtWarning_AndTheNextFailureOpensANewOne()
     {
         CapturingLogger logger = new();
         long now = 0;
@@ -97,7 +98,9 @@ public sealed class TestTransportFailureEpisode
 
         Assert.False(episode.IsOpen);
         Assert.Equal(0, episode.FailuresInEpisode);
-        Assert.Equal(1, logger.Count(LogLevel.Information));
+        Assert.Equal(1, logger.Count(LogLevel.Warning));
+        Assert.Equal(0, logger.Count(LogLevel.Information));
+        Assert.Equal(LogLevel.Warning, logger.Lines.Last().Level);
         Assert.Contains("sends recovered after 2 failures over 3 s", logger.Lines.Last().Message);
 
         episode.NoteFailure(new InvalidOperationException("c"), "drain");
