@@ -496,8 +496,17 @@ internal sealed class ReplicationAckProcessor
 
         logger.LogInfoProposalCompletedAt(host.LocalEndpoint, host.PartitionId, coreState.NodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
 
-        CompleteQuorum(proposal, timestamp, ackStartTicks);
+        if (CompleteQuorum(proposal, timestamp, ackStartTicks) && CommitAtQuorum is { } commitAtQuorum)
+            await commitAtQuorum(proposal, timestamp).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Runs the leader's commit of a fast-path proposal when its propose quorum became durable
+    /// (<see cref="WalCompletionRouter.CommitAtQuorumAsync"/>). Set once, by the state machine, after
+    /// the completion router exists. While it is null <see cref="CompleteQuorum"/> never reports a
+    /// commit at quorum, and the commit takes effect at the marker's completion as it did before.
+    /// </summary>
+    internal Func<RaftProposalQuorum, HLCTimestamp, Task>? CommitAtQuorum { get; set; }
 
     /// <summary>
     /// The step a proposal takes once <see cref="RaftProposalQuorum.HasQuorum"/> first holds: mark it
@@ -507,7 +516,12 @@ internal sealed class ReplicationAckProcessor
     /// followers' acks got there first (<see cref="WalCompletionRouter"/>).
     /// </summary>
     /// <param name="quorumStartTicks">Round-stage stamp of the step that made the quorum (0 when stages are off).</param>
-    public void CompleteQuorum(RaftProposalQuorum proposal, HLCTimestamp timestamp, long quorumStartTicks)
+    /// <returns>
+    /// True when the proposal took the single-fsync fast path and its commit marker was enqueued as
+    /// bookkeeping only: the caller must then run <see cref="CommitAtQuorum"/> for it, in the same
+    /// executor operation, so the commit takes effect now and not when the marker is written.
+    /// </returns>
+    public bool CompleteQuorum(RaftProposalQuorum proposal, HLCTimestamp timestamp, long quorumStartTicks)
     {
         proposal.SetState(RaftProposalState.Completed);
 
@@ -546,7 +560,7 @@ internal sealed class ReplicationAckProcessor
             // blocks until the 10 s timeout. CompleteLeaderCommit/Rollback fire TrySetResult again
             // later; both are idempotent no-ops once this has run.
             proposals.CompleteWaiterOnSuccess(proposal, proposal.LastLogIndex, ProposalReplySite.ManualProposeQuorum);
-            return;
+            return false;
         }
 
         // Single-fsync fast path: release the client ticket on propose-quorum-durable,
@@ -558,7 +572,16 @@ internal sealed class ReplicationAckProcessor
         Scheduling.RaftPendingWalOperation pendingAutoCommit = proposals.RentPending();
         pendingAutoCommit.Proposal = proposal;
         pendingAutoCommit.TicketId = timestamp;
+
+        // On the fast path the commit takes effect now: the caller applies the entries and sends
+        // the resolution in this same operation, and the marker write that was just enqueued only
+        // records the commit in the store.
+        bool commitsAtQuorum = CommitAtQuorum is not null && proposals.CommitsAtQuorum(proposal);
+        pendingAutoCommit.CommittedAtQuorum = commitsAtQuorum;
+
         proposals.TrackPending(operation.OperationId, pendingAutoCommit);
+
+        return commitsAtQuorum;
     }
 
     /// <summary>

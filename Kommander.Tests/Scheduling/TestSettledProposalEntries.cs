@@ -65,10 +65,18 @@ public class TestSettledProposalEntries
 
     // ── through the state machine ─────────────────────────────────────────────
 
-    [Fact]
-    public async Task SoleVoter_AutoCommit_ReleasesTheEntriesAtTheCommitCompletion_AndTheTicketStillAnswers()
+    /// <summary>
+    /// The entries go when the commit takes effect: at the marker's completion on the two-fsync path,
+    /// and when the propose quorum is durable on the single-fsync fast path, where the marker write
+    /// that follows only records the commit. Either way the entry reaches the consumer once.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SoleVoter_AutoCommit_ReleasesTheEntriesWhenTheCommitTakesEffect_AndTheTicketStillAnswers(bool singleFsyncCommit)
     {
         (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, CapturingReplySink sink) = Build();
+        host.Configuration.WalSingleFsyncCommit = singleFsyncCommit;
         await BecomeSoleLeaderAsync(sm);
 
         List<RaftLog> logs = [new() { Id = 1, Term = 1, LogType = "t", LogData = new byte[1024] }];
@@ -78,9 +86,20 @@ public class TestSettledProposalEntries
         HLCTimestamp ticket = TicketOf(sink, 10);
         RaftProposalQuorum proposal = Assert.IsType<RaftProposalQuorum>(sm.GetRegisteredProposalForTesting(ticket));
 
-        // The commit marker is queued but not durable: the entries are still the proposal's to re-send.
-        Assert.Single(proposal.Logs);
-        Assert.False(proposal.EntriesReleased);
+        if (singleFsyncCommit)
+        {
+            // The sole voter's own write is the quorum: the commit took effect with it, the entry
+            // was applied, and the queued marker write keeps its own reference to the entries.
+            Assert.True(proposal.EntriesReleased);
+            Assert.Equal(["Applied:1"], host.EventLog);
+        }
+        else
+        {
+            // The commit marker is queued but not durable: the entries are still the proposal's to re-send.
+            Assert.Single(proposal.Logs);
+            Assert.False(proposal.EntriesReleased);
+            Assert.Empty(host.EventLog);
+        }
 
         await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 1, 1));
 
@@ -100,10 +119,40 @@ public class TestSettledProposalEntries
         Assert.Equal(RaftLogType.Committed, logs[0].Type);
     }
 
+    /// <summary>
+    /// On the fast path the marker write is bookkeeping: one that fails after the commit took effect
+    /// at quorum leaves the commit in effect. The entry stays applied, once, the ticket still answers
+    /// Committed, and the leader keeps leading. A quorum holds the entry; only the row in this store
+    /// stays Proposed, as it does when a crash loses a marker.
+    /// </summary>
     [Fact]
-    public async Task TwoVoters_TheEntriesStayWhileTheProposalIsUnresolved_AndGoAtTheCommitCompletion()
+    public async Task FastPath_AFailedMarkerWriteAfterTheCommitAtQuorum_LeavesTheCommitInEffect()
     {
-        (RaftPartitionStateMachine sm, _, PipelinedWalFacade wal, CapturingReplySink sink) = Build(nodes: [new("node-b")]);
+        (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, CapturingReplySink sink) = Build();
+        host.Configuration.WalSingleFsyncCommit = true;
+        await BecomeSoleLeaderAsync(sm);
+
+        sm.ReplicateLogs([new() { Id = 1, Term = 1, LogType = "t" }], autoCommit: true, replyCorrelationId: 20);
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderPropose, -1, 1));
+
+        HLCTimestamp ticket = TicketOf(sink, 20);
+        Assert.Equal(["Applied:1"], host.EventLog);
+
+        await sm.CompleteWalOperationAsync(
+            MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 1, 1) with { Status = RaftOperationStatus.Errored });
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(["Applied:1"], host.EventLog);
+        Assert.Equal((RaftProposalTicketState.Committed, 1L), sm.CheckTicketCompletion(ticket));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TwoVoters_TheEntriesStayWhileTheProposalIsUnresolved_AndGoWhenTheCommitTakesEffect(bool singleFsyncCommit)
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, CapturingReplySink sink) = Build(nodes: [new("node-b")]);
+        host.Configuration.WalSingleFsyncCommit = singleFsyncCommit;
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         await sm.ReceivedVoteAsync("node-b", voteTerm: 1, remoteMaxLogId: 0);
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);
@@ -118,18 +167,33 @@ public class TestSettledProposalEntries
         Assert.Equal(RaftProposalState.Incomplete, proposal.State);
         Assert.Single(proposal.Logs);
 
-        // Quorum reached (the single-fsync fast path may already report Committed); the commit marker
-        // is queued but not durable, so the entries stay until its completion.
+        // Quorum reached. On the two-fsync path the commit marker is queued but not durable, so the
+        // entries stay until its completion. On the fast path the commit takes effect with the
+        // quorum: the entry is applied and released in the operation that carried node-b's ack.
         await sm.CompleteAppendLogsAsync("node-b", ticket, RaftOperationStatus.Success, committedIndex: 0);
         Assert.NotEqual(RaftProposalState.Incomplete, proposal.State);
-        Assert.Single(proposal.Logs);
-        Assert.False(proposal.EntriesReleased);
+
+        if (singleFsyncCommit)
+        {
+            Assert.Equal(RaftProposalState.Committed, proposal.State);
+            Assert.True(proposal.EntriesReleased);
+            Assert.Equal(["Applied:1"], host.EventLog);
+        }
+        else
+        {
+            Assert.Single(proposal.Logs);
+            Assert.False(proposal.EntriesReleased);
+            Assert.Empty(host.EventLog);
+        }
 
         await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 1, 1));
 
         Assert.Equal(RaftProposalState.Committed, proposal.State);
         Assert.True(proposal.EntriesReleased);
         Assert.Equal((RaftProposalTicketState.Committed, 1L), sm.CheckTicketCompletion(ticket));
+
+        // The marker's completion delivered nothing a second time.
+        Assert.Equal(["Applied:1"], host.EventLog);
     }
 
     [Fact]

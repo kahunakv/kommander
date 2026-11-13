@@ -129,8 +129,8 @@ public sealed class RaftProposalQuorum
 
     /// <summary>
     /// Drops this proposal's reference to its entries once nothing on the leader will read them again:
-    /// the commit (or rollback) marker is durable, the resolution is broadcast, and the local applies
-    /// ran or were deferred from a copy. The record stays registered for its ticket window with only
+    /// the commit (or rollback) marker is written, or queued for writing with its own reference to
+    /// them, the resolution is broadcast, and the local applies ran or were deferred from a copy. The record stays registered for its ticket window with only
     /// <see cref="LastLogIndex"/> retained, so the window no longer pins every settled payload.
     /// <para>The list is <b>dropped, never emptied</b>, for the reason <see cref="Clear"/> gives: the
     /// WAL write and the transport sends still queued for a slow peer share it.</para>

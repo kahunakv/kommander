@@ -60,6 +60,15 @@ public sealed class RaftPendingWalOperation
     public bool IsInheritedRecommit { get; set; }
 
     /// <summary>
+    /// True when this <c>LeaderCommit</c> operation only writes the commit markers of a proposal whose
+    /// commit already took effect when its propose quorum became durable
+    /// (<see cref="Kommander.Consensus.WalCompletionRouter.CommitAtQuorumAsync"/>): the entries were
+    /// applied and the resolution was sent to the peers then. Its completion must not run the
+    /// leader-commit handling a second time.
+    /// </summary>
+    internal bool CommittedAtQuorum { get; set; }
+
+    /// <summary>
     /// True when this <c>LeaderPropose</c> operation's batch was sent to the peers when the write was
     /// queued (<see cref="RaftConfiguration.FanOutBeforeLocalWrite"/>); <see cref="Proposal"/> then holds
     /// its registered quorum. The peers may hold the batch whatever happens to this write, so a caller
@@ -88,5 +97,6 @@ public sealed class RaftPendingWalOperation
         Endpoint = null;
         Timestamp = default;
         IsInheritedRecommit = false;
+        CommittedAtQuorum = false;
     }
 }

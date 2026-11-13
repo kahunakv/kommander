@@ -57,7 +57,7 @@ internal sealed class WalCompletionRouter
     /// Needed here for a proposal fanned out before its local write: when both followers ack first, it is
     /// the leader's own propose completion that makes the quorum.
     /// </summary>
-    private readonly Action<RaftProposalQuorum, HLCTimestamp, long> completeQuorum;
+    private readonly Func<RaftProposalQuorum, HLCTimestamp, long, bool> completeQuorum;
 
     public WalCompletionRouter(
         IRaftPartitionHost host,
@@ -70,7 +70,7 @@ internal sealed class WalCompletionRouter
         IRaftOperationReplySink replySink,
         ILogger<IRaft> logger,
         Func<string, Task> revertUnpublishedPromotionAsync,
-        Action<RaftProposalQuorum, HLCTimestamp, long> completeQuorum)
+        Func<RaftProposalQuorum, HLCTimestamp, long, bool> completeQuorum)
     {
         this.host = host;
         this.wal = wal;
@@ -371,7 +371,7 @@ internal sealed class WalCompletionRouter
         // have the batch already, and all that is left is the leader's own vote.
         if (pending is { FannedOutBeforeWrite: true, Proposal: { } fannedOut })
         {
-            CompleteProposeFannedOutEarly(completion, pending, fannedOut, ticketId);
+            await CompleteProposeFannedOutEarly(completion, pending, fannedOut, ticketId).ConfigureAwait(false);
             return;
         }
 
@@ -453,6 +453,8 @@ internal sealed class WalCompletionRouter
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
 
+        bool singleVoterCommitsAtQuorum = false;
+
         // Single-voter leader (no voter peers): the self-completion above already satisfies
         // quorum, but no voter ack will arrive to drive CompleteAppendLogsAsync. Drive the
         // Completed → (auto)commit transition here. Guarded to voter-only peers so learner-only
@@ -487,11 +489,22 @@ internal sealed class WalCompletionRouter
                 Scheduling.RaftPendingWalOperation pendingFollowUpCommit = proposals.RentPending();
                 pendingFollowUpCommit.Proposal = proposalQuorum;
                 pendingFollowUpCommit.TicketId = ticketId;
+
+                // Same as the multi-voter quorum step: on the fast path the commit takes effect in
+                // this operation, and the marker write only records it in the store.
+                singleVoterCommitsAtQuorum = proposals.CommitsAtQuorum(proposalQuorum);
+                pendingFollowUpCommit.CommittedAtQuorum = singleVoterCommitsAtQuorum;
+
                 proposals.TrackPending(commitOperation.OperationId, pendingFollowUpCommit);
             }
         }
 
+        // The caller is answered before the commit is applied, as it was when the apply waited for
+        // the marker: the answer names the ticket, and the ticket is already released.
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+
+        if (singleVoterCommitsAtQuorum)
+            await CommitAtQuorumAsync(proposalQuorum, ticketId).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -506,7 +519,7 @@ internal sealed class WalCompletionRouter
     /// hold the batch, and a later leader can commit it (Raft §5.4.2). A failed proposal is dropped
     /// from the registry so no ack can complete it.</para>
     /// </summary>
-    private void CompleteProposeFannedOutEarly(RaftWalCompletion completion, RaftPendingWalOperation pending, RaftProposalQuorum proposal, HLCTimestamp ticketId)
+    private async Task CompleteProposeFannedOutEarly(RaftWalCompletion completion, RaftPendingWalOperation pending, RaftProposalQuorum proposal, HLCTimestamp ticketId)
     {
         // The registry holds the proposal until a demotion clears it; after that the pooled object
         // may serve another ticket, so identity, not just presence, decides.
@@ -536,10 +549,15 @@ internal sealed class WalCompletionRouter
 
         proposal.MarkLocalDurable(host.LocalEndpoint);
 
-        if (proposal.State == RaftProposalState.Incomplete && proposal.HasQuorum())
-            completeQuorum(proposal, ticketId, RoundStageInstrumentation.Stamp());
+        bool commitsAtQuorum = proposal.State == RaftProposalState.Incomplete && proposal.HasQuorum()
+            && completeQuorum(proposal, ticketId, RoundStageInstrumentation.Stamp());
 
+        // The caller is answered before the commit is applied, as it was when the apply waited for
+        // the marker: the answer names the ticket, and the ticket is already released.
         CompleteReply(pending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+
+        if (commitsAtQuorum)
+            await CommitAtQuorumAsync(proposal, ticketId).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -591,6 +609,20 @@ internal sealed class WalCompletionRouter
             return;
         }
 
+        // The commit took effect when the propose quorum became durable (the single-fsync fast
+        // path): the entries are applied and the resolution is on its way to the peers. All that is
+        // left of this operation is the marker write, and a marker is bookkeeping. One that failed
+        // leaves the rows Proposed in this store, exactly as a marker lost to a crash does, and the
+        // commit stands: a quorum holds the entries.
+        if (pending is { CommittedAtQuorum: true })
+        {
+            if (completion.Status != RaftOperationStatus.Success)
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Commit marker write for ticket {Ticket} failed ({Status}) after the commit took effect at quorum; entries up to {MaxLogIndex} stay Proposed in this store",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, pending.TicketId, completion.Status, completion.MaxLogIndex);
+            return;
+        }
+
         RaftProposalQuorum? proposal = pending?.Proposal;
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
 
@@ -607,6 +639,53 @@ internal sealed class WalCompletionRouter
             return;
         }
 
+        await ApplyLeaderCommitAsync(proposal, ticketId, completion.MinLogIndex, completion.MaxLogIndex, pending?.ReplyCorrelationId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The leader's commit of a proposal on the single-fsync fast path, run when its propose quorum
+    /// became durable instead of when its commit marker is written. Must be called on the partition
+    /// executor, in the operation that made the quorum, after the marker write was enqueued with
+    /// <see cref="RaftPendingWalOperation.CommittedAtQuorum"/> set.
+    ///
+    /// <para><b>Why not at the marker.</b> Propose-quorum-durable is the Raft commit point, and the
+    /// fast path already releases the caller's ticket and advances the commit index there. The
+    /// consumer, though, was told only when the marker write completed. A marker write that waits
+    /// behind another partition's sync then held back the apply, the commit broadcast and the
+    /// applied frontier for a whole sync, and everything that reads up to the commit index (a
+    /// leadership confirmation, a linearizable read) waited that long on every call.</para>
+    ///
+    /// <para><b>What does not change.</b> The steps, their order, and the in-order apply discipline
+    /// are those of <see cref="CompleteLeaderCommit"/>: this runs the same code
+    /// (<see cref="ApplyLeaderCommitAsync"/>). Proposals still commit in the order their quorums
+    /// complete, which is the order their markers were enqueued and completed in before. The marker
+    /// is still written, and every durable frontier still moves only when it is.</para>
+    /// </summary>
+    internal Task CommitAtQuorumAsync(RaftProposalQuorum proposal, HLCTimestamp ticketId)
+    {
+        List<RaftLog> logs = proposal.Logs;
+
+        // What the marker's completion reports as its span: the lowest id the batch carries, and
+        // the proposal's last index.
+        long minLogIndex = -1;
+        for (int i = 0; i < logs.Count; i++)
+        {
+            if (minLogIndex < 0 || logs[i].Id < minLogIndex)
+                minLogIndex = logs[i].Id;
+        }
+
+        return ApplyLeaderCommitAsync(proposal, ticketId, minLogIndex, proposal.LastLogIndex, replyCorrelationId: null);
+    }
+
+    /// <summary>
+    /// The effect of a leader commit: fence on leadership, mark the proposal committed, send the
+    /// resolution to the peers, deliver inherited entries below the batch, apply the batch in log
+    /// order, and publish leadership when the proposal is the promotion barrier. Shared by the
+    /// marker's completion (<see cref="CompleteLeaderCommit"/>) and the commit at quorum
+    /// (<see cref="CommitAtQuorumAsync"/>); see the former for the reasoning behind each step.
+    /// </summary>
+    private async Task ApplyLeaderCommitAsync(RaftProposalQuorum proposal, HLCTimestamp ticketId, long minLogIndex, long maxLogIndex, ulong? replyCorrelationId)
+    {
         // Leader-state fence — the commit-side twin of the fence in CompleteLeaderPropose. The
         // upstream term fence cannot catch this: commit operations are enqueued without a term
         // (EnqueueCommit takes none, so completion.Term is -1), and a same-term step-down leaves
@@ -625,18 +704,18 @@ internal sealed class WalCompletionRouter
             logger.LogWarning(
                 "[{LocalEndpoint}/{PartitionId}/{State}] Commit completion for ticket {Ticket} landed after a step-down; failing the caller instead of fanning out.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
             return;
         }
 
         proposal.SetState(RaftProposalState.Committed);
         // Unblock event-driven waiters on the public write path. If TryReleaseTicketOnQuorumDurable
         // already fired on the fast path (WalSingleFsyncCommit + autoCommit), TrySetResult is a no-op.
-        proposals.CompleteWaiterOnSuccess(proposal, completion.MaxLogIndex, ProposalReplySite.CommitCompletion);
+        proposals.CompleteWaiterOnSuccess(proposal, maxLogIndex, ProposalReplySite.CommitCompletion);
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
-        if (completion.MaxLogIndex > coreState.LocalCommittedIndex)
-            coreState.LocalCommittedIndex = completion.MaxLogIndex;
+        if (maxLogIndex > coreState.LocalCommittedIndex)
+            coreState.LocalCommittedIndex = maxLogIndex;
 
         // Send committed entries to ALL peers (voters + learners). proposal.Nodes only tracks
         // quorum voters; learners were excluded from quorum but still need log delivery so their
@@ -648,7 +727,7 @@ internal sealed class WalCompletionRouter
         // previous leader, held as Proposed in our WAL, and now committed by quorum.
         // They have no local proposal waiter and were never delivered via CompleteFollowerAppend,
         // so the leader's consumer would silently miss them without this drain.
-        long inheritedEnd = completion.MinLogIndex - 1;
+        long inheritedEnd = minLogIndex - 1;
         InheritedDrainStatus drainStatus = InheritedDrainStatus.Covered;
         if (inheritedEnd >= 0 && inheritedEnd > coreState.LastAppliedIndex)
         {
@@ -722,7 +801,7 @@ internal sealed class WalCompletionRouter
                 break;
 
             case InheritedDrainStatus.BlockedByInFlight:
-                applier.DeferLeaderApplies(completion.MinLogIndex, proposal.Logs);
+                applier.DeferLeaderApplies(minLogIndex, proposal.Logs);
                 break;
         }
 
@@ -736,9 +815,9 @@ internal sealed class WalCompletionRouter
                 (currentTime - proposal.StartTimestamp).TotalMilliseconds
             );
 
-        // Nothing on this leader reads the entries again: the commit marker is durable, the
-        // resolution is on its way to every peer, and the local applies ran or were deferred from a
-        // copy. The record stays registered for its ticket window with only the last index, so the
+        // Nothing on this leader reads the entries again: the commit marker is written or its write
+        // is queued with its own reference to them, the resolution is on its way to every peer, and
+        // the local applies ran or were deferred from a copy. The record stays registered for its ticket window with only the last index, so the
         // window stops pinning every settled payload: at kilobyte values and thousands of proposals
         // a second those entries were the largest surviving population on the leader's heap.
         proposal.ReleaseEntries();
@@ -791,7 +870,7 @@ internal sealed class WalCompletionRouter
             await revertUnpublishedPromotionAsync("inherited-entry drain incomplete on a leader commit").ConfigureAwait(false);
         }
 
-        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, maxLogIndex));
     }
 
     /// <summary>

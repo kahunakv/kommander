@@ -747,7 +747,11 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             configuration.WalGroupCommitLingerMs,
             configuration.WalSingleFsyncCommit,
             configuration.TickSource,
-            manualExecution: !configuration.EnableInternalSchedulingThreads);
+            manualExecution: !configuration.EnableInternalSchedulingThreads,
+            // With the fast path the leader's commit takes effect when the propose quorum is
+            // durable, so nothing waits for a marker write any more and a marker batch can ride its
+            // partition's next write instead of holding the partition behind another one's sync.
+            markerDeferralMs: configuration.WalSingleFsyncCommit ? FairWalScheduler.DefaultMarkerDeferralMs : 0);
         walScheduler.TraceSink = configuration.WalTraceSink;
 
         loadReportService = new LoadReportService(

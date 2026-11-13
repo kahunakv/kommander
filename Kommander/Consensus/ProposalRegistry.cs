@@ -279,6 +279,27 @@ internal sealed class ProposalRegistry
     }
 
     /// <summary>
+    /// Whether <paramref name="proposal"/> takes the single-fsync fast path
+    /// (<see cref="RaftConfiguration.WalSingleFsyncCommit"/> and <c>autoCommit</c>): its ticket is
+    /// released when the propose quorum is durable.
+    /// </summary>
+    public bool ReleasesTicketAtQuorum(RaftProposalQuorum proposal) =>
+        host.Configuration.WalSingleFsyncCommit && proposal.AutoCommit;
+
+    /// <summary>
+    /// Whether the commit of <paramref name="proposal"/> takes effect on this leader when its propose
+    /// quorum is durable, instead of when its commit marker is written: a fast-path proposal
+    /// (<see cref="ReleasesTicketAtQuorum"/>) of a leader whose leadership is published.
+    ///
+    /// <para>While a promotion barrier is armed nothing commits at quorum. The barrier's commit is
+    /// what proves the consumer projection complete and publishes leadership, and a barrier whose
+    /// marker write fails reverts the promotion: that decision stays with the marker's completion.
+    /// Proposals behind an armed barrier keep the same order for the same reason.</para>
+    /// </summary>
+    public bool CommitsAtQuorum(RaftProposalQuorum proposal) =>
+        ReleasesTicketAtQuorum(proposal) && coreState.LeadershipBarrierTicket == HLCTimestamp.Zero;
+
+    /// <summary>
     /// Single-fsync commit fast path (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>).
     /// For an <c>autoCommit</c> proposal whose propose quorum is already durable, advances the
     /// leader's commit frontier and moves the proposal to <see cref="RaftProposalState.Committed"/>
@@ -300,7 +321,7 @@ internal sealed class ProposalRegistry
     /// </summary>
     public void TryReleaseTicketOnQuorumDurable(RaftProposalQuorum proposal)
     {
-        if (!host.Configuration.WalSingleFsyncCommit || !proposal.AutoCommit)
+        if (!ReleasesTicketAtQuorum(proposal))
             return;
 
         if (proposal.LastLogIndex > coreState.LocalCommittedIndex)

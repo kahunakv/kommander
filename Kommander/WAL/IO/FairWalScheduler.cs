@@ -114,6 +114,48 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private readonly bool lazyCommitMarkers;
 
     /// <summary>
+    /// A bound for how long a batch that holds only lazy commit markers may wait for its partition's
+    /// next write before it is written on its own, for a caller that turns the deferral on. See
+    /// <see cref="TryDeferMarkerBatch"/>.
+    /// </summary>
+    public const int DefaultMarkerDeferralMs = 2;
+
+    /// <summary>
+    /// The deferral bound on the tick source; zero means marker batches are never held. Zero unless
+    /// the constructor is given a bound, because the deferral is only right when nothing waits for a
+    /// marker's completion. The manager gives one with the single-fsync fast path, where the leader's
+    /// commit takes effect when the propose quorum is durable
+    /// (<c>WalCompletionRouter.CommitAtQuorumAsync</c>). Before that existed the consumer was told
+    /// about a commit at the marker's completion; a consumer that waits for that before it sends
+    /// more work then waited for a write its own next proposal was meant to carry, and was released
+    /// only by the bound: measured on one, the deferral cut the round from 8.9 ms to 5.9 ms and
+    /// still lost a third of the throughput.
+    /// </summary>
+    private readonly long markerDeferralTicks;
+
+    /// <summary>
+    /// Synced <c>walAdapter.Write</c> calls in progress across all workers. A sync-off write issued
+    /// while one of them runs does not return until the engine finishes that sync, so this is what
+    /// tells <see cref="TryDeferMarkerBatch"/> that writing a marker batch now would cost a sync.
+    /// </summary>
+    private int _syncWritesInFlight;
+
+    /// <summary>
+    /// Ids of partitions that hold a deferred marker batch (<see cref="PartitionState.DeferredMarkers"/>).
+    /// An id may be stale: the partition's next batch takes the markers without touching this queue.
+    /// The reader checks the partition under its lock.
+    /// </summary>
+    private readonly ConcurrentQueue<int> _deferredMarkerPartitions = new();
+
+    private long _totalMarkerBatchesDeferred;
+
+    /// <summary>
+    /// Number of times a batch of lazy commit markers was held back to ride its partition's next
+    /// write instead of being written on its own behind another partition's sync.
+    /// </summary>
+    public long TotalMarkerBatchesDeferred => Interlocked.Read(ref _totalMarkerBatchesDeferred);
+
+    /// <summary>
     /// Test-only: receives a Write event per operation after a successful batch write, and a Truncate
     /// event after a successful proposed-tail truncation, so the TLA+ trace validator can keep its
     /// model of the disk in step with this store (see <see cref="Diagnostics.IWalTraceSink"/>).
@@ -157,8 +199,25 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         /// <summary>Pending operations in submission order.</summary>
         public readonly Queue<WALWriteOperation> Ops = new();
 
-        /// <summary>Guards <see cref="Ops"/>, <see cref="Scheduled"/>, <see cref="InFlight"/>, and <see cref="Depth"/>.</summary>
+        /// <summary>
+        /// Guards <see cref="Ops"/>, <see cref="Scheduled"/>, <see cref="InFlight"/>, <see cref="Depth"/> and
+        /// the deferred-marker fields.
+        /// </summary>
         public readonly object Lock = new();
+
+        /// <summary>
+        /// Lazy commit-marker operations a worker drained and put back, in submission order, to be
+        /// written with this partition's next batch. They precede everything in <see cref="Ops"/>,
+        /// still count in <see cref="Depth"/>, and are not complete: their callbacks fire only after
+        /// the write that carries them. Null until the partition first defers.
+        /// </summary>
+        public List<WALWriteOperation>? DeferredMarkers;
+
+        /// <summary>Tick at which <see cref="DeferredMarkers"/> went from empty to non-empty.</summary>
+        public long DeferredSinceTicks;
+
+        /// <summary>True while this partition's id is in <see cref="_deferredMarkerPartitions"/>.</summary>
+        public bool DeferredQueued;
 
         /// <summary>
         /// True when this partition's id is already in <see cref="FairWalScheduler._readyPartitions"/>.
@@ -341,7 +400,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         int groupCommitLingerMs = 0,
         bool lazyCommitMarkers = false,
         Kommander.Time.IMonotonicTickSource? tickSource = null,
-        bool manualExecution = false)
+        bool manualExecution = false,
+        int markerDeferralMs = 0)
     {
         this.manualExecution = manualExecution;
         this.tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
@@ -358,10 +418,21 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         this.trackQueuedOps = this.lingerTicks > 0;
         this.lazyCommitMarkers = lazyCommitMarkers;
 
+        // Deferral needs worker threads: it relies on another worker's write being in progress, and
+        // on that worker's completion to release what was held. Manual mode writes inline, one batch
+        // at a time, so there is never a sync in progress to step around.
+        this.markerDeferralTicks = MarkerDeferralTicks(lazyCommitMarkers, manualExecution, markerDeferralMs, this.tickSource.Frequency);
+
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
 
+        // CA1416: BlockingCollection<T> is flagged unsupported on 'browser'. The browser targets
+        // define KOMMANDER_THREAD_FREE and run in manual mode only (refused below otherwise), where
+        // the collection is used from one thread and never blocks. Same reason as at its TryAdd in
+        // ProcessGroupBatch.
+#pragma warning disable CA1416
         _readyPartitions = new BlockingCollection<int>(boundedCapacity: workerCount * 64);
+#pragma warning restore CA1416
 
         // The ready-queue capacity is still sized from the resolved worker count, so manual mode
         // and threaded mode admit the same number of ready partitions. Only the threads differ.
@@ -551,8 +622,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         lock (state.Lock)
         {
             // An in-flight batch always predates anything still queued behind it.
+            // Deferred markers were drained before anything queued now, so they are older still.
             oldest = state.InFlightOldestEnqueueTicks != 0
                 ? state.InFlightOldestEnqueueTicks
+                : state.DeferredMarkers is { Count: > 0 } deferred ? deferred[0].EnqueueTicks
                 : state.Ops.TryPeek(out WALWriteOperation? head) ? head.EnqueueTicks : 0;
         }
 
@@ -915,30 +988,74 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             List<WALWriteOperation> pidBatch = opListPool[groupBatches.Count];
             pidBatch.Clear();
 
+            int takenFromQueue = 0;
+            bool deferred = false;
+            bool announceDeferral = false;
+
             lock (state.Lock)
             {
+                // Markers held back earlier were submitted before anything queued now: they go first.
+                long deferredSinceTicks = 0;
+                if (state.DeferredMarkers is { Count: > 0 } held)
+                {
+                    pidBatch.AddRange(held);
+                    held.Clear();
+                    deferredSinceTicks = state.DeferredSinceTicks;
+                }
+
                 while (pidBatch.Count < maxBatchSize && state.Ops.TryDequeue(out WALWriteOperation? op))
+                {
                     pidBatch.Add(op);
+                    takenFromQueue++;
+                }
 
-                // Clear Scheduled (the id has been consumed from _readyPartitions)
-                // and raise InFlight so Enqueue cannot re-add this partition while
-                // the combined Write is in progress.
+                // Clear Scheduled (the id has been consumed from _readyPartitions).
                 state.Scheduled = false;
-                state.InFlight  = true;
 
-                // Ops dequeue in submission order, so the first op of the batch is its oldest: the
-                // stall signal ages it until the post-write section below clears it.
-                state.InFlightOldestEnqueueTicks = pidBatch.Count > 0 ? pidBatch[0].EnqueueTicks : 0;
+                if (TryDeferMarkerBatch(state, pidBatch, deferredSinceTicks))
+                {
+                    deferred = true;
+                    announceDeferral = !state.DeferredQueued;
+                    state.DeferredQueued = true;
+                    pidBatch.Clear();
+                }
+                else
+                {
+                    // Raise InFlight so Enqueue cannot re-add this partition while the combined
+                    // Write is in progress.
+                    state.InFlight = true;
+
+                    // Ops dequeue in submission order, so the first op of the batch is its oldest: the
+                    // stall signal ages it until the post-write section below clears it.
+                    state.InFlightOldestEnqueueTicks = pidBatch.Count > 0 ? pidBatch[0].EnqueueTicks : 0;
+                }
+            }
+
+            // Drained ops leave the linger gate's evidence pool here, not at completion: once out of
+            // the queue they can no longer cause a future ready-queue arrival by themselves. Markers
+            // taken back from a deferral left it when they were first drained.
+            if (trackQueuedOps && takenFromQueue > 0)
+                Interlocked.Add(ref _queuedOperations, -takenFromQueue);
+
+            if (deferred)
+            {
+                Interlocked.Increment(ref _totalMarkerBatchesDeferred);
+
+                if (announceDeferral)
+                    _deferredMarkerPartitions.Enqueue(pid);
+
+                // The sync this batch stepped around may have ended between the check and the
+                // announcement. Its worker then found nothing to release, so release it here: the
+                // id is announced before this read, and that worker reads the queue after its
+                // decrement, so one of the two always sees the other.
+                if (Volatile.Read(ref _syncWritesInFlight) == 0)
+                    RescheduleDeferredMarkers(engineIdle: true);
+
+                continue;
             }
 
             if (pidBatch.Count > 0)
-            {
-                // Drained ops leave the linger gate's evidence pool here, not at completion:
-                // once inside this batch they can no longer cause a future ready-queue arrival.
-                if (trackQueuedOps)
-                    Interlocked.Add(ref _queuedOperations, -pidBatch.Count);
                 groupBatches.Add((pid, pidBatch));
-            }
             else
             {
                 // Nothing to write; clear InFlight immediately.
@@ -1024,6 +1141,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // is not on disk yet (see RaftWriteAhead.MarkResolutionWritten).
         bool batchSynced = true;
 
+        // Whether this batch is counted in _syncWritesInFlight, so every exit below gives it back.
+        bool syncWriteCounted = false;
+
         try
         {
             // Reuse the worker-owned logGroups list — cleared here, populated below.
@@ -1079,6 +1199,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             // crash from reporting a failed range as lost acknowledged entries.
             if (logGroups.Count > 0 || acknowledgedPresence.Count > 0)
             {
+                if (sync)
+                {
+                    Interlocked.Increment(ref _syncWritesInFlight);
+                    syncWriteCounted = true;
+                }
+
                 status = walAdapter.Write(logGroups, sync, acknowledgedPresence.Count > 0 ? acknowledgedPresence : null);
 
                 if (TraceSink is { } writeTrace && status == RaftOperationStatus.Success)
@@ -1098,6 +1224,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 groupBatches.Count, ex.Message);
             status = RaftOperationStatus.Errored;
         }
+
+        // The engine is done with this batch. When that was the last sync in progress, a marker
+        // batch held back behind it can be written now without waiting on anything.
+        bool engineIdle = syncWriteCounted && Interlocked.Decrement(ref _syncWritesInFlight) == 0;
 
         // Stamp completion time once for all ops in this group batch.
         long doneAtTicks = tickSource.GetTimestamp();
@@ -1231,6 +1361,143 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
         }
+
+        // After this batch's own callbacks, so the order of its completions is as it always was.
+        // The callbacks are also what brings each partition's next propose, which takes its held
+        // markers with it; what is still held here has no write of its own coming.
+        RescheduleDeferredMarkers(engineIdle);
+    }
+
+    private static long MarkerDeferralTicks(bool lazyCommitMarkers, bool manualExecution, int markerDeferralMs, long ticksPerSecond) =>
+        lazyCommitMarkers && !manualExecution && markerDeferralMs > 0
+            ? (long)(markerDeferralMs / 1000.0 * ticksPerSecond)
+            : 0;
+
+    /// <summary>
+    /// Decides, under the partition lock, whether the batch just drained for a partition is held back
+    /// instead of written, and holds it back when so. Returns true when the batch was moved to
+    /// <see cref="PartitionState.DeferredMarkers"/>; the caller then must not write it.
+    ///
+    /// <para><b>Why.</b> A batch that holds only lazy commit markers is written sync-off, which costs
+    /// microseconds on an idle engine. The engine serializes its writers, though: while another
+    /// partition's synced write is in progress, a sync-off write waits for that sync to end. The
+    /// marker batch then holds its partition in flight for a whole sync, and the partition's next
+    /// propose, which is usually enqueued a moment after the markers, waits behind it and then pays
+    /// its own sync. With four partitions on one engine a round took two syncs instead of one.</para>
+    ///
+    /// <para><b>What changes.</b> Only when the markers are written. A held batch stays first in the
+    /// partition's order and is written by the partition's next batch, in the same engine write as
+    /// the propose that follows it, or on its own once no sync is in progress or
+    /// the bound passed. Its operations are not complete while held:
+    /// every callback still fires after the write that carried its rows, with that write's sync
+    /// flag, so nothing downstream learns of a marker that is not in the store.</para>
+    ///
+    /// <para><b>What may be held.</b> Leader commit operations whose rows are all per-entry
+    /// <c>Committed</c> markers and that do not require a sync: exactly what the fast path would
+    /// write sync-off. A batch with anything else in it is written at once, as before, and takes
+    /// earlier held markers with it. Nothing is held when no sync is in progress (the write is
+    /// cheap), when the partition has more queued (the batch size cap cut the drain short), or
+    /// while the scheduler stops.</para>
+    /// </summary>
+    private bool TryDeferMarkerBatch(PartitionState state, List<WALWriteOperation> pidBatch, long deferredSinceTicks)
+    {
+        if (markerDeferralTicks == 0 || _stopping || pidBatch.Count == 0 || state.Ops.Count > 0)
+            return false;
+
+        if (Volatile.Read(ref _syncWritesInFlight) == 0)
+            return false;
+
+        long nowTicks = tickSource.GetTimestamp();
+
+        // Markers that were already held keep their first deferral time: the bound is on the wait of
+        // the oldest marker, not on each pass through here.
+        if (deferredSinceTicks != 0 && nowTicks - deferredSinceTicks >= markerDeferralTicks)
+            return false;
+
+        foreach (WALWriteOperation op in pidBatch)
+        {
+            if (op.Type != WALWriteOperationType.LeaderCommit || op.RequiresSync || !AllCommittedMarkers(op.Logs.Logs))
+                return false;
+        }
+
+        state.DeferredMarkers ??= new List<WALWriteOperation>(pidBatch.Count);
+        state.DeferredMarkers.AddRange(pidBatch);
+        state.DeferredSinceTicks = deferredSinceTicks != 0 ? deferredSinceTicks : nowTicks;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Puts partitions that hold a deferred marker batch back in the ready-queue, so a worker drains
+    /// them and decides again: with <paramref name="engineIdle"/> every such partition (its markers
+    /// can be written at once), otherwise only those held for the bound.
+    /// Called by a worker when it defers and after each batch it writes.
+    ///
+    /// <para><b>Nothing stays held for ever.</b> A batch is held only while a synced write is in
+    /// progress. The worker of that write calls this when the write ends. If other synced writes
+    /// are still in progress then, a young batch stays held, and each of those writes calls this
+    /// again when it ends. The last one to end passes <paramref name="engineIdle"/>.</para>
+    /// </summary>
+    private void RescheduleDeferredMarkers(bool engineIdle)
+    {
+#if !KOMMANDER_THREAD_FREE
+        // The thread-free build runs in manual mode only, where nothing is ever held.
+        if (_deferredMarkerPartitions.IsEmpty)
+            return;
+
+        long nowTicks = tickSource.GetTimestamp();
+
+        // One pass over what is queued now: an id put back below is not looked at again in this call.
+        for (int remaining = _deferredMarkerPartitions.Count; remaining > 0; remaining--)
+        {
+            if (!_deferredMarkerPartitions.TryDequeue(out int pid))
+                return;
+
+            if (!_partitions.TryGetValue(pid, out PartitionState? state))
+                continue;
+
+            bool keepQueued = false;
+
+            lock (state.Lock)
+            {
+                if (state.DeferredMarkers is not { Count: > 0 })
+                {
+                    // The partition's next batch already took them.
+                    state.DeferredQueued = false;
+                    continue;
+                }
+
+                bool due = engineIdle || _stopping || nowTicks - state.DeferredSinceTicks >= markerDeferralTicks;
+
+                if (!due)
+                {
+                    keepQueued = true;
+                }
+                else if (state.Scheduled || state.InFlight)
+                {
+                    // A worker is about to drain the partition, or will re-schedule it: that drain
+                    // takes the markers.
+                    state.DeferredQueued = false;
+                }
+                else
+                {
+                    if (_readyPartitions.TryAdd(pid))
+                    {
+                        state.Scheduled = true;
+                        state.DeferredQueued = false;
+                    }
+                    else
+                    {
+                        // The ready-queue is full; try again at the next completion.
+                        keepQueued = true;
+                    }
+                }
+            }
+
+            if (keepQueued)
+                _deferredMarkerPartitions.Enqueue(pid);
+        }
+#endif
     }
 
 #if !KOMMANDER_THREAD_FREE
@@ -1268,7 +1535,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             PartitionState state = kv.Value;
             bool shouldProcess;
             lock (state.Lock)
-                shouldProcess = state.Ops.Count > 0 && !state.InFlight;
+                shouldProcess = (state.Ops.Count > 0 || state.DeferredMarkers is { Count: > 0 }) && !state.InFlight;
 
             if (shouldProcess)
             {

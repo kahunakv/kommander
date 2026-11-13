@@ -775,6 +775,12 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 0, CommitIndexValue = 0 };   // PresentId = -1: untracked
         wal.SeedNextId(1);
         CapturingHost host = new();
+
+        // The two-fsync path: the commit takes effect at the marker's completion, which leaves room
+        // between the two completions to make a voter peer visible. The fast path is covered by
+        // OrdinaryCommitAtQuorum_InheritedDrainHole_StepsDownWithoutDeliveringBatch.
+        host.Config.WalSingleFsyncCommit = false;
+
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
         sm.MarkRestoredForTesting();
         // Promote over an empty WAL: no inherited tail, publishes immediately.
@@ -810,6 +816,56 @@ public class TestHoleyLogElection
         // The leader stepped down instead of continuing to serve from an incomplete projection.
         Assert.NotEqual("node-a", host.Leader);
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    /// <summary>
+    /// The same hole on the single-fsync fast path, where the commit takes effect when the propose
+    /// quorum is durable: the drain runs in the operation that carried the peer's ack, finds the
+    /// hole, and the leader steps down without delivering the batch. The marker's completion,
+    /// which arrives after the step-down, delivers nothing either.
+    /// </summary>
+    [Fact]
+    public async Task OrdinaryCommitAtQuorum_InheritedDrainHole_StepsDownWithoutDeliveringBatch()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 0, CommitIndexValue = 0 };   // PresentId = -1: untracked
+        wal.SeedNextId(1);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        host.Config.WalSingleFsyncCommit = true;
+        host.Config.LeadershipBarrierTimeout = TimeSpan.FromMilliseconds(200);
+
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        sm.MarkRestoredForTesting();
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", voteTerm: sm.CurrentTerm, remoteMaxLogId: 0);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal("node-a", host.Leader);
+
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+        ]);
+        wal.SeedNextId(4);
+
+        (RaftOperationStatus status, HLCTimestamp ticket) = sm.ReplicateLogs(
+            [new RaftLog { LogType = "t", LogData = [1] }], autoCommit: true);
+        Assert.Equal(RaftOperationStatus.Pending, status);
+
+        await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+        Assert.DoesNotContain("Applied:4", host.EventLog);
+
+        // The peer's ack makes the quorum, and the commit takes effect in that operation.
+        await sm.CompleteAppendLogsAsync("node-b", ticket, RaftOperationStatus.Success, committedIndex: 0);
+
+        Assert.DoesNotContain("Applied:3", host.EventLog);
+        Assert.DoesNotContain("Applied:4", host.EventLog);
+        Assert.NotEqual("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
+
+        Assert.DoesNotContain("Applied:3", host.EventLog);
+        Assert.DoesNotContain("Applied:4", host.EventLog);
     }
 
     // ── the committed-drain guard is bounded and escalates ────────────────────

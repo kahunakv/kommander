@@ -527,6 +527,7 @@ public sealed class RaftPartitionStateMachine
         ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, snapshotSender, logThrottle, logger, FailAllActiveProposalWaiters);
         replicator = new LogReplicator(host, wal, coreState, proposals, sender, replySink, logger);
         walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, applyLane, sender, replySink, logger, RevertUnpublishedPromotionAsync, ackProcessor.CompleteQuorum);
+        ackProcessor.CommitAtQuorum = walCompletions.CommitAtQuorumAsync;
     }
 
     /// <summary>
