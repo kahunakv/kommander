@@ -30,6 +30,14 @@ public sealed class TestFollowerInstallRefusal
         await CommitEntries(leader, partition: 1, count: 3);
         await WaitForCondition(() => follower.WalAdapter.GetMaxLog(1) >= 3, TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
+        // The leader must have nothing left to send before the install takes the executor. The max
+        // log moves at the propose write, and the caller is answered at the propose quorum, so at
+        // this point the resolution of entry 3 can still be on its way: it carries the entry, the
+        // held follower refuses it, and the count below reads 2 (GA run 43602197064). A leader that
+        // has not seen the follower's commit frontier reach 3 re-sends the entry at a heartbeat with
+        // the same result. So wait for both ends: the follower committed 3, and the leader knows it.
+        await WaitForReplicationToSettle(leader, follower, partitionId: 1, index: 3);
+
         long term = leader.WalAdapter.GetCurrentTerm(1);
         long termAtIndex3 = follower.WalAdapter.GetCurrentTerm(1);
 
@@ -208,6 +216,30 @@ public sealed class TestFollowerInstallRefusal
                 cancellationToken: TestContext.Current.CancellationToken);
             Assert.Equal(RaftOperationStatus.Success, result.Status);
         }
+    }
+
+    private static async Task WaitForReplicationToSettle(IRaft leader, IRaft follower, int partitionId, long index)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TestTimeouts.Scale(TimeSpan.FromSeconds(10)));
+
+        string followerEndpoint = follower.GetLocalEndpoint();
+
+        while (!cts.Token.IsCancellationRequested)
+        {
+            if (follower.GetCommitIndex(partitionId) >= index)
+            {
+                RaftPartitionView? view = await ((RaftManager)leader).GetPartitionViewAsync(partitionId, cts.Token);
+
+                if (view is not null && view.Peers.Any(peer => peer.Endpoint == followerEndpoint && peer.FrontierKnown && peer.CommitFrontier >= index))
+                    return;
+            }
+
+            await Task.Delay(10, cts.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
+        Assert.Fail($"Replication of index {index} did not settle within the timeout.");
     }
 
     private static async Task WaitForCondition(Func<bool> condition, TimeSpan timeout, CancellationToken ct)
