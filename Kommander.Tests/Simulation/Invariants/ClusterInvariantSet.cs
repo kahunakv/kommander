@@ -417,11 +417,21 @@ public static class ClusterInvariantSet
     /// <param name="RangeStart">Lowest index the read covered.</param>
     /// <param name="RangeEnd">Highest index the read covered.</param>
     /// <param name="ByIndex">Committed entries the node actually holds, keyed by index.</param>
+    /// <param name="AwaitingMarkerByIndex">
+    /// Entries a leader holds inside the range whose stored row is still proposed, keyed by index.
+    /// With <c>WalSingleFsyncCommit</c> a leader commits when the propose quorum is durable, sends
+    /// the resolution, and writes its own commit marker afterwards (the marker can also be held for
+    /// the partition's next write, or fail). In that interval a follower can hold the row as
+    /// committed while the leader's row is still proposed. The leader holds the entry, so this is
+    /// not a hole. Empty for a node that is not a leader, and never fed to the agreement check: a
+    /// proposed row is evidence only of what its own leader committed.
+    /// </param>
     public sealed record NodeCommittedWindow(
         string Endpoint,
         long RangeStart,
         long RangeEnd,
-        IReadOnlyDictionary<long, CommittedEntryFingerprint> ByIndex);
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> ByIndex,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint>? AwaitingMarkerByIndex = null);
 
     /// <summary>
     /// Checks <see cref="CommittedTermsNonDecreasing"/> over everything the run has recorded.
@@ -460,6 +470,12 @@ public static class ClusterInvariantSet
     /// <para>Only indices inside the leader's own read range are judged. Below that range the
     /// leader may have compacted the entry, and calling that a violation would report a defect
     /// where the protocol did exactly what it should.</para>
+    ///
+    /// <para>An index the leader holds as a proposed row at or below its own commit index
+    /// (<see cref="NodeCommittedWindow.AwaitingMarkerByIndex"/>) is present, not missing: the
+    /// leader committed it at the propose quorum and its commit marker is not in the store yet.
+    /// Such a row must still describe the entry the cluster committed. Reading it as a hole made
+    /// this rule fire on a correct cluster (nightly run 43585112059, two seeds).</para>
     /// </summary>
     public static void CheckLeaderCompleteness(
         int stepNumber,
@@ -483,7 +499,9 @@ public static class ClusterInvariantSet
                 if (recorded.Key < window.RangeStart || recorded.Key > window.RangeEnd)
                     continue;
 
-                if (!window.ByIndex.TryGetValue(recorded.Key, out CommittedEntryFingerprint? held))
+                if (!window.ByIndex.TryGetValue(recorded.Key, out CommittedEntryFingerprint? held)
+                    && (window.AwaitingMarkerByIndex is null
+                        || !window.AwaitingMarkerByIndex.TryGetValue(recorded.Key, out held)))
                 {
                     throw Violation(
                         LeaderCompleteness,

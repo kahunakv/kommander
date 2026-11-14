@@ -288,6 +288,72 @@ public sealed class TestClusterInvariantSet
         ClusterInvariantSet.CheckLeaderCompleteness(9, views, [leaderWindow], recorded);
     }
 
+    /// <summary>
+    /// The commit-at-quorum interval. The leader committed index 2 at the propose quorum and sent
+    /// the resolution, so a follower holds the row as committed, and the leader's own commit marker
+    /// is not in its store yet. The leader holds the entry: this is not a hole. The nightly search
+    /// reported it as one (run 43585112059).
+    /// </summary>
+    [Fact]
+    public void LeaderCompleteness_AllowsAnEntryTheLeaderHoldsWithoutItsCommitMarker()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Leader, term: 3, commitIndex: 2)];
+
+        ClusterInvariantSet.NodeCommittedWindow leaderWindow = new(
+            "node1",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 3, payload: "a"),
+            },
+            AwaitingMarkerByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [2] = Fingerprint("node1", index: 2, term: 3, payload: "b"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [2] = Fingerprint("node2", index: 2, term: 3, payload: "b"),
+        };
+
+        ClusterInvariantSet.CheckLeaderCompleteness(9, views, [leaderWindow], recorded);
+    }
+
+    /// <summary>
+    /// The row that awaits its marker is still judged. A leader that holds a different entry at a
+    /// committed index diverged, whatever the stored type of its row.
+    /// </summary>
+    [Fact]
+    public void LeaderCompleteness_FiresWhenTheEntryAwaitingItsMarkerIsADifferentEntry()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Leader, term: 3, commitIndex: 2)];
+
+        ClusterInvariantSet.NodeCommittedWindow leaderWindow = new(
+            "node1",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 3, payload: "a"),
+            },
+            AwaitingMarkerByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [2] = Fingerprint("node1", index: 2, term: 3, payload: "other"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [2] = Fingerprint("node2", index: 2, term: 3, payload: "b"),
+        };
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(
+            () => ClusterInvariantSet.CheckLeaderCompleteness(9, views, [leaderWindow], recorded));
+
+        Assert.Equal(ClusterInvariantSet.LeaderCompleteness, error.InvariantName);
+        Assert.Contains("different entry", error.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>A follower with a hole is not this rule's business; only a leader must be complete.</summary>
     [Fact]
     public void LeaderCompleteness_IgnoresAFollower()

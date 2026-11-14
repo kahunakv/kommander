@@ -128,6 +128,8 @@ public sealed class SimulatedWAL : IWAL
     private bool outOfSpace;
     private int failNextWrites;
     private HashSet<int>? failNextWritesScope;
+    private int failNextUnsyncedWrites;
+    private int failNextUnsyncedWritesPartition;
     private bool disposed;
 
     private long writes;
@@ -200,6 +202,25 @@ public sealed class SimulatedWAL : IWAL
     }
 
     /// <summary>
+    /// Refuses the next <paramref name="count"/> writes on <paramref name="partitionId"/> that do
+    /// not ask for their own fsync, and lets every synced write through.
+    ///
+    /// <para>On the single-fsync fast path that is the commit marker and nothing else, so a scenario
+    /// can let a propose reach its quorum and then lose only the marker. <see cref="FailNextWrites"/>
+    /// cannot do that: the propose is the next write, and it takes the fault.</para>
+    /// </summary>
+    /// <param name="count">How many unsynced writes to refuse.</param>
+    /// <param name="partitionId">The partition to fail on.</param>
+    public void FailNextUnsyncedWrites(int count, int partitionId)
+    {
+        lock (gate)
+        {
+            failNextUnsyncedWrites = count;
+            failNextUnsyncedWritesPartition = partitionId;
+        }
+    }
+
+    /// <summary>
     /// Clears every injected fault, leaving the durability model untouched.
     ///
     /// <para>Teardown calls this. A node that is still refusing writes cannot commit the roster
@@ -214,6 +235,7 @@ public sealed class SimulatedWAL : IWAL
             outOfSpaceScope = null;
             failNextWrites = 0;
             failNextWritesScope = null;
+            failNextUnsyncedWrites = 0;
             retentionHolds.Clear();
             restoreReadHoldsUntil.Clear();
         }
@@ -436,7 +458,7 @@ public sealed class SimulatedWAL : IWAL
         get
         {
             lock (gate)
-                return outOfSpace || failNextWrites > 0;
+                return outOfSpace || failNextWrites > 0 || failNextUnsyncedWrites > 0;
         }
     }
 
@@ -564,6 +586,13 @@ public sealed class SimulatedWAL : IWAL
             if (failNextWrites > 0 && InScope(logs, failNextWritesScope))
             {
                 failNextWrites--;
+                failedWrites++;
+                return RaftOperationStatus.Errored;
+            }
+
+            if (!sync && failNextUnsyncedWrites > 0 && InScope(logs, [failNextUnsyncedWritesPartition]))
+            {
+                failNextUnsyncedWrites--;
                 failedWrites++;
                 return RaftOperationStatus.Errored;
             }

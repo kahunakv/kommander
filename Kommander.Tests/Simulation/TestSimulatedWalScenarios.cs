@@ -360,6 +360,111 @@ public sealed class TestSimulatedWalScenarios
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// A leader whose commit marker is not in its store breaks no invariant.
+    ///
+    /// <para>With the single-fsync fast path the leader commits when the propose quorum is durable:
+    /// it advances its commit index, applies, and sends the resolution, and the marker write that
+    /// follows is bookkeeping. Here that marker write fails, which holds the cluster in the state a
+    /// slow marker write only passes through: the followers store the entry as committed, the
+    /// leader's commit index covers it, and the leader's stored row is still proposed. The leader
+    /// holds the entry. The nightly search read the row as a hole and reported
+    /// <c>leader-completeness</c> on a correct cluster (run 43585112059, two seeds), a state too
+    /// short-lived to replay, so this scenario makes it last.</para>
+    /// </summary>
+    [Fact]
+    public async Task ALeaderCommitMarkerNotYetInTheStore_BreaksNoInvariant()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await StartAsync(new SimulationClusterOptions
+        {
+            NodeCount = 3,
+            PartitionCount = 1,
+            Seed = 20261114,
+        }, cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+
+        RaftReplicationResult first = await leader.Manager.ReplicateLogs(
+            PartitionId, "Greeting", "Hello World"u8.ToArray(), cancellationToken: cancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, first.Status);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    return views.Count == cluster.Nodes.Count
+                        && views.All(view => view.CommitIndex >= first.LogIndex);
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The cluster did not converge on the first entry.");
+
+        leader.SimulatedWal!.FailNextUnsyncedWrites(1, PartitionId);
+
+        RaftReplicationResult second = await leader.Manager.ReplicateLogs(
+            PartitionId, "Greeting", "Hello Again"u8.ToArray(), cancellationToken: cancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, second.Status);
+
+        bool leaderHeldTheEntryWithoutItsMarker = false;
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    RaftPartitionView? leaderView = views.FirstOrDefault(
+                        view => string.Equals(view.Endpoint, leader.Endpoint, StringComparison.Ordinal));
+
+                    bool followersCommitted = cluster.Nodes
+                        .Where(node => !ReferenceEquals(node, leader))
+                        .All(node => node.Wal.ReadLogsRange(PartitionId, second.LogIndex, 1)
+                            .Any(log => log.Id == second.LogIndex && log.Type == RaftLogType.Committed));
+
+                    // The state under test, read the way the invariant runner reads it: the leader
+                    // is still the leader, its published commit index covers the entry, its stored
+                    // row is proposed, and both followers store the row as committed.
+                    if (followersCommitted
+                        && leaderView is { Role: RaftNodeState.Leader }
+                        && leaderView.CommitIndex >= second.LogIndex
+                        && leader.Wal.ReadLogsRange(PartitionId, second.LogIndex, 1)
+                            .Any(log => log.Id == second.LogIndex && log.Type == RaftLogType.Proposed))
+                    {
+                        leaderHeldTheEntryWithoutItsMarker = true;
+                    }
+
+                    return leaderHeldTheEntryWithoutItsMarker;
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The leader never held the committed entry as a proposed row. The marker write did not "
+            + "fail, or the commit no longer takes effect at the propose quorum, and this scenario "
+            + "then tests nothing.");
+
+        // A few steps more in that state: the checks must hold while it lasts, not only at the
+        // step that first shows it.
+        for (int step = 0; step < 10; step++)
+        {
+            await cluster.StepAsync(50, cancellationToken);
+            await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+        }
+    }
+
     private Task<SimulationCluster> StartAsync(
         SimulationClusterOptions options,
         CancellationToken cancellationToken) =>

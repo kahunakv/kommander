@@ -466,6 +466,11 @@ public sealed class ClusterInvariantRunner
     /// <para>The range each read covered is carried alongside the entries, because a missing index
     /// means two different things. Inside the range it is a hole. Below it, the node may simply
     /// have compacted the entry away, which is correct behavior.</para>
+    ///
+    /// <para>A leader's proposed rows inside the range are carried separately
+    /// (<see cref="ClusterInvariantSet.NodeCommittedWindow.AwaitingMarkerByIndex"/>). The view's
+    /// commit index covers an entry once the leader committed it and holds it on disk, and the
+    /// commit marker that changes the stored row to committed is written later.</para>
     /// </summary>
     private static List<ClusterInvariantSet.NodeCommittedWindow> CollectCommittedWindows(
         SimulationCluster cluster,
@@ -502,13 +507,25 @@ public sealed class ClusterInvariantRunner
             if (from > view.CommitIndex)
                 continue;
             Dictionary<long, CommittedEntryFingerprint> byIndex = [];
+            Dictionary<long, CommittedEntryFingerprint>? awaitingMarker = null;
 
             foreach (RaftLog log in node.Wal.ReadLogsRange(partitionId, from, CommittedWindow))
             {
-                if (log.Id > view.CommitIndex || !IsCommitted(log.Type))
+                if (log.Id > view.CommitIndex)
                     continue;
 
-                byIndex[log.Id] = CommittedEntryFingerprint.From(view.Endpoint, log);
+                if (IsCommitted(log.Type))
+                {
+                    byIndex[log.Id] = CommittedEntryFingerprint.From(view.Endpoint, log);
+                    continue;
+                }
+
+                // A leader commits at the propose quorum and writes its commit marker afterwards,
+                // so a row at or below its commit index can still be stored as proposed while a
+                // follower already holds it as committed. Kept apart from the committed entries:
+                // the leader check reads it as present, and the agreement check never sees it.
+                if (view.Role == RaftNodeState.Leader && IsProposed(log.Type))
+                    (awaitingMarker ??= [])[log.Id] = CommittedEntryFingerprint.From(view.Endpoint, log);
             }
 
             if (byIndex.Count == 0)
@@ -518,7 +535,8 @@ public sealed class ClusterInvariantRunner
                 view.Endpoint,
                 from,
                 view.CommitIndex,
-                byIndex));
+                byIndex,
+                awaitingMarker));
         }
 
         return windows;
@@ -589,4 +607,11 @@ public sealed class ClusterInvariantRunner
     /// </summary>
     private static bool IsCommitted(RaftLogType type) =>
         type is RaftLogType.Committed or RaftLogType.CommittedCheckpoint;
+
+    /// <summary>
+    /// The forms a row has between its propose write and its commit marker. A rolled-back row is
+    /// neither: a leader that rolled an index back does not hold the entry.
+    /// </summary>
+    private static bool IsProposed(RaftLogType type) =>
+        type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint;
 }
