@@ -1,14 +1,14 @@
 # Kommander Architecture Overview
 
-Welcome! This guide is the front door to Kommander. It is written for two kinds of reader:
+This guide introduces Kommander. It is written for two kinds of reader:
 
 - **Developers who want to understand the system** — what Kommander does, the vocabulary it uses, and
   how a request travels through it.
 - **Developers who want to improve or contribute** — where the moving parts live, why they are shaped
   the way they are, and which invariants you must not break.
 
-It assumes **no prior knowledge of Raft or distributed consensus**. We build the concepts from the
-ground up, then walk the main runtime flows end to end. Deeper feature guides
+It assumes **no prior knowledge of Raft or distributed consensus**. It defines the concepts first and then
+covers the main runtime flows end to end. Deeper feature guides
 ([Dynamic Membership](dynamic-membership-developer-guide.md),
 [Elastic Partitions](elastic-partitions-developer-guide.md)) pick up where this one leaves off.
 
@@ -17,8 +17,8 @@ ground up, then walk the main runtime flows end to end. Deeper feature guides
 ## Table of contents
 
 1. [Summary](#summary)
-2. [The problem Kommander solves](#the-problem-kommander-solves)
-3. [Core concepts (the vocabulary)](#core-concepts-the-vocabulary)
+2. [Purpose and scope](#purpose-and-scope)
+3. [Core concepts](#core-concepts)
 4. [The component map](#the-component-map)
 5. [Architecture flows](#architecture-flows)
    - [Flow 1 — Starting up and joining a cluster](#flow-1--starting-up-and-joining-a-cluster)
@@ -29,8 +29,8 @@ ground up, then walk the main runtime flows end to end. Deeper feature guides
    - [Flow 6 — Compaction and snapshots](#flow-6--compaction-and-snapshots)
 6. [The pluggable layers](#the-pluggable-layers)
 7. [Partitions, membership, and the system partition](#partitions-membership-and-the-system-partition)
-8. [Configuration you will actually touch](#configuration-you-will-actually-touch)
-9. [Code map — where everything lives](#code-map--where-everything-lives)
+8. [Common configuration](#common-configuration)
+9. [Code map](#code-map)
 10. [Invariants you must not break](#invariants-you-must-not-break)
 11. [How to extend Kommander](#how-to-extend-kommander)
 12. [Glossary](#glossary)
@@ -42,13 +42,13 @@ ground up, then walk the main runtime flows end to end. Deeper feature guides
 Kommander keeps **the same data, in the same order, on several machines**, so that the system keeps
 working even when some machines fail.
 
-It does this with the **Raft consensus protocol**. The idea in one breath:
+It does this with the **Raft consensus protocol**:
 
 > One node is elected **leader**. Every change is first written to an ordered, on-disk **log**. The
 > leader copies new log entries to the **followers**. Once a **majority** of nodes have stored an
 > entry, it is **committed** — guaranteed to survive, and applied to the application's state.
 
-Kommander adds one twist on top of textbook Raft: it is **partitioned**. The data is sliced into
+Kommander extends Raft with **partitions**. The data is sliced into
 independent **partitions**, and *each partition runs its own Raft group with its own leader*. A single
 node can be the leader for partition 3 and a follower for partition 7. This spreads work across the
 cluster instead of funnelling everything through one leader.
@@ -63,21 +63,17 @@ cluster instead of funnelling everything through one leader.
         each partition = an independent Raft group with its own leader & log
 ```
 
-Everything else in this document is detail hanging off that sentence.
-
 ---
 
-## The problem Kommander solves
+## Purpose and scope
 
-Imagine you have a service that holds important state — account balances, a key/value store, a job
-queue. If it runs on one machine and that machine dies, you lose availability and maybe data.
+A service that holds important state — account balances, a key/value store, a job queue — loses
+availability, and maybe data, when its only machine fails. Copies on several machines need a rule for
+which copy is correct when they disagree. Naive replication leads to split brain (two machines both
+think they are in charge), lost updates, and inconsistent reads.
 
-The obvious fix — "just run copies on several machines" — immediately raises a hard question: **when
-two copies disagree, who is right?** Naively replicating writes leads to split brain (two machines
-both think they are in charge), lost updates, and inconsistent reads.
-
-**Consensus** is the formal answer to "how does a group of machines agree on a single sequence of
-events despite failures and network delays." **Raft** is a consensus protocol designed to be
+**Consensus** lets a group of machines agree on a single sequence of events despite failures and
+network delays. **Raft** is a consensus protocol designed to be
 understandable, and Kommander is a C#/.NET implementation of it.
 
 What Kommander gives an application:
@@ -96,7 +92,7 @@ per deployment.
 
 ---
 
-## Core concepts (the vocabulary)
+## Core concepts
 
 You will see these words everywhere in the code and the rest of this guide. Learn them once here.
 
@@ -175,11 +171,11 @@ The pieces, in plain terms:
 - **`RaftPartition`** (`RaftPartition.cs`) — one per partition. It runs that partition's slice of the
   protocol: election timers, leadership state, and replication.
 
-- **`RaftPartitionExecutor`** (`Scheduling/RaftPartitionExecutor.cs`) — the heart of a partition. Every
+- **`RaftPartitionExecutor`** (`Scheduling/RaftPartitionExecutor.cs`) — the serial executor of a partition. Every
   operation for a partition (a client proposal, an incoming append, an election timer tick, a commit)
   is turned into an operation and pushed onto a **single bounded queue**, then processed **one at a
-  time**. This "actorless" serial executor is *why the state machine is easy to reason about*: there is
-  no lock soup — within a partition, exactly one thing happens at a time, in order. The actual protocol
+  time**. Because of this serial executor, the state machine needs no locks: within a
+  partition, exactly one thing happens at a time, in order. The actual protocol
   logic lives in `RaftPartitionStateMachine.cs`.
 
 - **`RaftSystemCoordinator`** (`System/`) — manages **partition 0**, the special "system" partition
@@ -365,7 +361,7 @@ The key design choices, so you do not get surprised when reading the code:
 - **If a follower is so far behind that the leader has already compacted the entries it needs**, backfill
   cannot help (the data is gone). The leader detects the empty backfill read at the compaction floor and
   switches to installing a snapshot instead (Flow 6) — an internal handoff on the leader's heartbeat
-  path, not a wire status. A follower whose snapshot cannot be produced or delivered is retried with
+  path, with no wire status. A follower whose snapshot cannot be produced or delivered is retried with
   exponential backoff and reported through `IRaft.GetSnapshotStatuses`.
 
 For a full walkthrough, see the [Log Catch-Up & Backfill Developer Guide](log-backfill-developer-guide.md).
@@ -391,8 +387,7 @@ Because the WAL is durable, a restart is not a blank slate.
 
 The application's job is to make `OnLogRestored` rebuild its in-memory state from each entry, so that
 after replay the node is exactly where it was before the crash. Only then does it start participating
-again. This is why the WAL must record entries *before* callbacks run: the log, not memory, is the
-authority that survives a crash.
+again. This is why the WAL must record entries *before* callbacks run: only the log survives a crash.
 
 ### Flow 6 — Compaction and snapshots
 
@@ -449,8 +444,8 @@ pinning (see `RaftTransportAuthenticator`).
 **Discovery — `IDiscovery`**
 
 Static (fixed list), dynamic (application-managed), or multicast (local-network). Note: discovery feeds
-*peer connectivity*, but in a dynamically-membered cluster it is **not** the source of who may vote —
-that comes from the committed roster (next section).
+*peer connectivity* only. In a dynamically-membered cluster, the committed roster (next section)
+decides who may vote.
 
 ---
 
@@ -467,7 +462,7 @@ system partition managed by `RaftSystemCoordinator`:
 - **The membership roster** — the authoritative, versioned list of nodes and their roles (Learner vs.
   Voter). It is a *committed Raft record*, never derived from gossip or discovery, so quorum math is
   always consistent. A SWIM-style gossip layer spreads the roster faster and flags dead nodes, but it
-  is strictly advisory — only a committed membership change actually alters who can vote. Full details:
+  is strictly advisory — only a committed membership change alters who can vote. Full details:
   [Dynamic Membership guide](dynamic-membership-developer-guide.md).
 
 The principle shared by both: **truth by consensus, dissemination by gossip.** Anything that affects
@@ -479,7 +474,7 @@ To route a key to its partition, use `GetPartitionKey(key)` (or `GetPrefixPartit
 
 ---
 
-## Configuration you will actually touch
+## Common configuration
 
 Configuration lives in `RaftConfiguration.cs`. You do not need most of it; these are the knobs that
 come up in practice. Defaults shown.
@@ -526,7 +521,7 @@ come up in practice. Defaults shown.
 
 ---
 
-## Code map — where everything lives
+## Code map
 
 ```
 Kommander/
@@ -562,10 +557,10 @@ operations are serialized) → a WAL backend.
 
 ## Invariants you must not break
 
-These are the load-bearing rules. Violating one is how you introduce data loss or split brain.
+Violating any of these rules can cause data loss or split brain.
 
 1. **Write-ahead, always.** An entry is written to the WAL *before* it is acknowledged or applied. The
-   log, not memory, is the authority.
+   log is the authority.
 2. **Commit means quorum.** Never apply or report an entry as committed before a majority of voters
    holds it. Two quorums always overlap; that overlap is the entire safety argument.
 3. **No gaps, no divergent tails.** A follower's log must stay contiguous and consistent with the

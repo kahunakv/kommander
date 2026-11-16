@@ -7,7 +7,7 @@ target is the default single-threaded .NET WebAssembly runtime (`browser-wasm` w
 The mode is a separate build of the library. The compilation symbol `KOMMANDER_THREAD_FREE` turns
 it on. A normal build does not define the symbol, so normal behavior does not change.
 
-## Why a separate build
+## Runtime limits
 
 The single-threaded WebAssembly runtime has two hard limits:
 
@@ -42,7 +42,7 @@ one:
 
 Two settings in this example are necessary:
 
-- **`net10.0-browser`, not `net10.0`.** A WebAssembly app that targets plain `net10.0` gets the
+- **Target `net10.0-browser`.** A WebAssembly app that targets plain `net10.0` gets the
   normal assembly. The build then fails with `NETSDK1082`. If it builds, the node fails on the first
   `Thread.Start`.
 - **`JsonSerializerIsReflectionEnabledByDefault`.** A WebAssembly app turns off reflection-based

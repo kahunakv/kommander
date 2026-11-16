@@ -2,24 +2,23 @@
 
 This guide explains how Kommander keeps a **lagging follower** in sync with its leader: the
 **backfill** feature. It is written for two readers — someone who wants to *understand* how catch-up
-works, and someone who wants to *extend or debug* it. No prior Raft expertise is assumed; we build the
-idea up first, then walk the real flows and the code.
+works, and someone who wants to *extend or debug* it. No prior Raft expertise is assumed.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why backfill exists (the problem)](#why-backfill-exists-the-problem)
-3. [Two replication paths: live vs. backfill](#two-replication-paths-live-vs-backfill)
+2. [Purpose of backfill](#purpose-of-backfill)
+3. [Live and backfill replication paths](#live-and-backfill-replication-paths)
 4. [Core concepts](#core-concepts)
 5. [Flow 1 — Detecting a lagging follower](#flow-1--detecting-a-lagging-follower)
 6. [Flow 2 — Sending a bounded backfill round](#flow-2--sending-a-bounded-backfill-round)
 7. [Flow 3 — The follower's Log Matching check](#flow-3--the-followers-log-matching-check)
 8. [Flow 4 — Multi-round convergence](#flow-4--multi-round-convergence)
-9. [Flow 5 — When backfill can't help: the compaction floor](#flow-5--when-backfill-cant-help-the-compaction-floor)
-10. [Flow 6 — When the log is fine but the application is not: requested re-seed and withheld candidacy](#flow-6--when-the-log-is-fine-but-the-application-is-not-requested-re-seed-and-withheld-candidacy)
-11. [Why the live path is *not* anchored](#why-the-live-path-is-not-anchored)
+9. [Flow 5 — Snapshots below the compaction floor](#flow-5--snapshots-below-the-compaction-floor)
+10. [Flow 6 — Requested re-seed and withheld candidacy](#flow-6--requested-re-seed-and-withheld-candidacy)
+11. [The unanchored live path](#the-unanchored-live-path)
 12. [Configuration](#configuration)
 13. [Code map](#code-map)
 14. [Invariants you must not break](#invariants-you-must-not-break)
@@ -55,25 +54,24 @@ off to snapshot install internally, on the leader's own heartbeat path.
 
 ---
 
-## Why backfill exists (the problem)
+## Purpose of backfill
 
 Normal replication is a **broadcast**: when the leader commits a new entry, it pushes that entry to all
-followers right away. That works great for a follower that is *keeping up* — it gets entry N, then N+1,
+followers right away. This works for a follower that is *keeping up* — it gets entry N, then N+1,
 then N+2, in order.
 
-But it does nothing for a follower that **missed entries while it was away**. If a follower last saw
+It does nothing for a follower that **missed entries while it was away**. If a follower last saw
 entry 3 and the leader is now broadcasting entry 10, naively appending entry 10 would leave a **gap**
 (4–9 missing). A log with a gap is corrupt: replaying it would skip changes and the follower's state
 would silently diverge from everyone else's.
 
-So we need a second, dedicated mechanism whose whole job is "find the missing range and fill it in
-correctly, without ever creating a gap or a divergent tail." That mechanism is backfill.
+**Backfill** finds the missing range and fills it in without ever creating a gap or a divergent tail.
 
 ---
 
-## Two replication paths: live vs. backfill
+## Live and backfill replication paths
 
-This is the single most important thing to internalize. Kommander has **two** ways entries reach a
+Kommander has **two** ways entries reach a
 follower, and they behave differently **on purpose**.
 
 ```
@@ -99,7 +97,7 @@ follower, and they behave differently **on purpose**.
 | Bounded? | one entry/op at a time | `MaxBackfillEntriesPerRound` per round |
 | Enforces Log Matching? | no | yes |
 
-Why the live path is deliberately *not* anchored is covered in [its own section](#why-the-live-path-is-not-anchored) — it's a subtle but important correctness/liveness decision.
+The live path is unanchored for liveness; see [The unanchored live path](#the-unanchored-live-path).
 
 ---
 
@@ -147,8 +145,8 @@ There are **three** independent triggers, and only the first is gated by `Backfi
    leave it to the live path
 ```
 
-Why a threshold and not "any lag" on the first trigger? Because a follower that is one or two entries
-behind is almost certainly mid-broadcast and about to catch up on its own. Backfilling it would be
+The first trigger uses a threshold because a follower that is one or two entries
+behind is usually mid-broadcast and about to catch up on its own. Backfilling it would be
 wasted work and could race with the live path. The threshold draws the line between "transiently
 behind" and "genuinely lagging."
 
@@ -278,12 +276,12 @@ within the threshold — at which point the live path takes over again.
 
 ---
 
-## Flow 5 — When backfill can't help: the compaction floor
+## Flow 5 — Snapshots below the compaction floor
 
 Kommander **compacts** old log entries to bound disk usage (everything below the last checkpoint is
 removable). That creates a **compaction floor**: the earliest index the leader still has.
 
-If a follower needs entries *below* that floor, the leader literally cannot read them — they've been
+If a follower needs entries *below* that floor, the leader cannot read them — they've been
 trimmed. Backfill is out of options:
 
 ```
@@ -301,7 +299,7 @@ trimmed. Backfill is out of options:
 
 The empty backfill read at the compaction floor is the handoff signal — it is internal to the leader's
 heartbeat path; no status crosses the wire for it. Snapshot install is a separate mechanism (its own
-RPC and follower-side state replacement); backfill's job is just to *detect* the floor and hand off
+RPC and follower-side state replacement); backfill's job is only to *detect* the floor and hand off
 cleanly. Brand-new nodes joining a long-running cluster typically hit this path first, then switch to
 backfill once they're above the floor.
 
@@ -309,9 +307,9 @@ Operational notes on the handoff:
 
 - A follower whose snapshot **fails** (the export throws, a chunk is rejected) is retried with
   exponential backoff — heartbeat-interval base, capped at 30 s — instead of once per heartbeat, and a
-  follower that is merely **saturated** (pausing entry batches to drain its WAL queue) is never
+  follower that is **saturated** (pausing entry batches to drain its WAL queue) is never
   escalated to a snapshot at all.
-- The follower's **install is awaited, not timed**. The receiver acknowledges the last chunk as soon as
+- The follower's **install has no timeout**. The receiver acknowledges the last chunk as soon as
   the snapshot is staged and verified (`InstallPending`), and the leader then asks for the install's
   outcome in short calls of their own until the follower reports `Installed`, `SkippedAlreadyCovered`
   or a failure. The wait is bounded by progress: the follower reports how far its importer has read
@@ -321,7 +319,7 @@ Operational notes on the handoff:
   of the partition is already queued or running — its own earlier attempt's, or a previous leader's —
   and if so waits for that install instead of sending another snapshot. A follower runs one install
   per partition and stages nothing else for that partition meanwhile.
-- The floor is held on **every replica**, not only on the leader. The leader sends its live-replica
+- The floor is held on **every replica**, the leader included. The leader sends its live-replica
   retention floor (the slowest replica's durable position, or its own when its disk is the one behind)
   with every AppendLogs, and each follower holds its own compaction there within
   `CompactionLiveReplicaLagBudget`. A leader change therefore does not strand a replica that was being
@@ -331,14 +329,13 @@ Operational notes on the handoff:
   condition is recorded once per episode and reported — together with in-flight transfers, attempt
   counts and last errors — through `IRaft.GetSnapshotStatuses(partitionId)`.
 - A read that comes back **starting above the anchor** — no committed entry exists at the follower's
-  next index, because the run there is uncommitted or was compacted away — is refused rather than
-  shipped: an anchored batch that skips the gap would advance nothing and repeat forever. The refusal
+  next index, because the run there is uncommitted or was compacted away — is refused: an anchored batch that skips the gap would advance nothing and repeat forever. The refusal
   is logged **once per episode** (repeats drop to Debug, and there is a line when it clears) and the
   live condition is reported through `IRaft.GetBackfillStatuses(partitionId)`, which carries the
-  anchor, the first index the leader could actually read, and the last checkpoint — the checkpoint is
+  anchor, the first index the leader could read, and the last checkpoint — the checkpoint is
   what tells the two causes apart: at or above the first readable index means the anchor was
   compacted away and only a snapshot can seed that follower.
-- A follower whose reported frontiers **do not advance** although batches anchored at its very
+- A follower whose reported frontiers **do not advance** although batches anchored at its
   frontier are shipped and acknowledged cannot be converged by log shipping at all. The no-progress
   probe paces and re-anchors such batches; once the fruitless streak reaches the warning threshold
   (four ships) the leader also offers the follower a snapshot from its last checkpoint, through the
@@ -359,10 +356,10 @@ Operational notes on the handoff:
 - **A freshly seeded follower gets a grace.** An install hands the follower the lag the leader
   accrued while the snapshot was exported, sent and imported; the follower closes it from the log,
   and its frontiers can stand still for several ships while it does. After a confirmed install the
-  probe defers its escalation — not its pacing, not its Warning — for `BackfillNoProgressPauseCap`
+  probe defers only its escalation (pacing and the Warning continue) for `BackfillNoProgressPauseCap`
   plus the time the follower needs to close that lag at the commit rate the leader has sustained
   since, bounded by `BackfillSeededCatchUpGraceCap` (3 minutes). A refused backfill still escalates
-  at once: the grace is for the probe, whose verdict is inference, not for a floor the log cannot serve.
+  at once: the grace applies only to the probe, whose verdict is an inference.
 - **A follower that already reaches the checkpoint is not seeded.** Every escalation — a refused
   read, the no-progress probe, a compacted anchor — passes one gate before the export starts: when the
   follower's gap-aware commit frontier reaches the leader's last checkpoint, the snapshot would carry
@@ -385,7 +382,7 @@ Operational notes on the handoff:
 
 ---
 
-## Flow 6 — When the log is fine but the application is not: requested re-seed and withheld candidacy
+## Flow 6 — Requested re-seed and withheld candidacy
 
 Every trigger above starts from the **log**: a follower is missing entries, and backfill or a snapshot
 brings its log level with the leader's. There is a second failure shape the log cannot see — a
@@ -485,12 +482,9 @@ from feeding on itself:
   and keeps waiting; the wait still ends when the follower reports the install done, failed or lost,
   goes silent for `SnapshotChunkAckTimeout`, or this node stops leading.
 
-## Why the live path is *not* anchored
+## The unanchored live path
 
-This is the design decision people most often question, so it's worth stating plainly.
-
-It is tempting to anchor **every** append — live broadcasts too — so the Log Matching check runs
-everywhere. Kommander deliberately does **not** do this, because anchoring the live path causes a
+Kommander does not anchor live broadcasts, because anchoring the live path causes a
 **liveness failure**:
 
 - A live proposal is anchored at the latest index.
@@ -509,8 +503,8 @@ reverting to an unanchored live path fixed them. So:
   ultimately arrives through backfill, where it *is* checked.
 
 A practical consequence for contributors: the **`LogMismatch → backtrack` branch is not reachable from
-the live path** in production — only the backfill path can trigger it. It's exercised directly by unit
-tests rather than through a live proposal, and is retained as defensive scaffolding. If you ever make
+the live path** in production — only the backfill path can trigger it. Only unit tests exercise it
+directly, and is retained as defensive scaffolding. If you ever make
 the live path anchored "to be safe," re-read this section first.
 
 ---
@@ -591,7 +585,7 @@ non-leader or for a peer the leadership has not heard from.
 2. **No divergent committed tail.** Uncommitted entries that disagree with the leader are truncated and
    replaced during an anchored append; committed entries are never overwritten.
 3. **Log Matching lives on the backfill path.** Don't move the anchor onto the live broadcast path — it
-   reintroduces the `ProposalTimeout` livelock (see [its section](#why-the-live-path-is-not-anchored)).
+   reintroduces the `ProposalTimeout` livelock (see [its section](#the-unanchored-live-path)).
 4. **Backfill is bounded.** Honour `MaxBackfillEntriesPerRound` and one-round-in-flight; backfill must
    never starve live replication.
 5. **Below the floor, hand off — don't fake it.** If entries are below the compaction floor, hand off
@@ -607,7 +601,7 @@ The backfill behavior is covered at two layers:
   the leader's backtrack logic directly, including the mismatch branch that the live path can't reach.
 - **Cluster integration** — in `TestThreeNodeCluster`:
   - `BackfilledFollower_HasContiguousLog_MatchingLeader` — a lagging follower ends with a contiguous,
-    term/type-identical log (via `AssertContiguousLog`, not just matching `GetMaxLog`).
+    term/type-identical log (checked entry by entry via `AssertContiguousLog`).
   - `DivergentSuffix_Backfill_OverwritesStaleUncommittedEntries` — a divergent uncommitted tail is
     truncated and replaced.
   - `PausedStaleFollower_MultiRoundBackfill_ConvergesAcrossChunks` — a far-behind follower converges

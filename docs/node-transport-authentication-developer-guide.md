@@ -1,12 +1,12 @@
 # Node Transport Authentication — Developer Guide
 
 This guide explains how Kommander authenticates **node-to-node** traffic: the three modes, what each one
-actually proves, the properties they do *not* provide, and how to operate them. It is written for two
+proves, what it leaves unprotected, and how to operate them. It is written for two
 readers — an operator choosing a mode and rotating its credentials, and a developer extending the
 transport layer. It covers the REST and gRPC transports together, because they share one implementation
 and must not drift.
 
-The short version: `SharedSecret` authenticates *membership in the cluster*; `MutualTls` authenticates
+`SharedSecret` authenticates *membership in the cluster*; `MutualTls` authenticates
 *which node* is calling. If you need to tell your own nodes apart from each other, you need `MutualTls`.
 
 ---
@@ -15,7 +15,7 @@ The short version: `SharedSecret` authenticates *membership in the cluster*; `Mu
 
 1. [Summary](#summary)
 2. [The three modes](#the-three-modes)
-3. [What shared-secret mode does and does not prove](#what-shared-secret-mode-does-and-does-not-prove)
+3. [Shared-secret mode proves cluster membership only](#shared-secret-mode-proves-cluster-membership-only)
 4. [What a signature covers](#what-a-signature-covers)
 5. [Mutual TLS and the pinning model](#mutual-tls-and-the-pinning-model)
 6. [Transport security is separate from node authentication](#transport-security-is-separate-from-node-authentication)
@@ -70,21 +70,18 @@ sent or expected — there is nothing to sign, because the identity is a propert
 
 ---
 
-## What shared-secret mode does and does not prove
-
-This is the most important thing to understand about `SharedSecret`, and the reason it is not simply
-"the easy mTLS".
+## Shared-secret mode proves cluster membership only
 
 There is **one secret for the whole cluster**. Every node signs with it and verifies with it. The
-sending node's name travels as a header and is covered by the signature — but it is a *claim*, not a
-proof. Any holder of the secret can put any name there.
+sending node's name travels as a header and is covered by the signature — but it is only a
+*claim*: any holder of the secret can put any name there.
 
 The consequences:
 
 - **A compromised node can impersonate any other node.** It can cast votes as a peer, fabricate
   acknowledgements attributed to a peer, and send gossip claiming to originate from one.
 - **Revoking one node means rotating the cluster.** There is no per-node credential to remove.
-- **The mode answers "is this from inside the cluster?", not "which node is this?"**
+- **The mode proves that a request comes from inside the cluster. It does not identify the node.**
 
 None of this is a defect in the HMAC construction, which is sound. It is inherent to a symmetric
 cluster-wide key. If your threat model includes one node being compromised, use `MutualTls`, where each
@@ -107,7 +104,7 @@ request's contents and keep its signature valid.
 
 **One exception, by design.** The gRPC duplex `BatchRequests` stream is authenticated once, when the
 stream is established, before any message is read. There is no single request message to bind, so the
-per-message integrity of that stream rests on the transport (TLS) rather than on the signature. This is
+per-message integrity of that stream rests on the transport (TLS). This is
 the hot replication path; if you require per-message cryptographic integrity there, run with TLS
 enforced, which is the default.
 
@@ -131,8 +128,8 @@ Both directions are checked symmetrically: an expired *client* certificate is re
 and an expired *server* certificate is rejected by the client, even when the thumbprint matches.
 
 Thumbprints may be pasted in the format `openssl x509 -fingerprint -sha256` emits (colon-separated,
-any case); separators and case are normalized before comparison. Note that this is the SHA-256
-thumbprint, **not** the SHA-1 value shown by some tools and by `X509Certificate2.Thumbprint`.
+any case); separators and case are normalized before comparison. Use the SHA-256
+thumbprint. Some tools and `X509Certificate2.Thumbprint` show a SHA-1 value, which does not match.
 
 ---
 
@@ -205,7 +202,7 @@ time.
 
 ## Fail-closed startup checks
 
-The server refuses to start rather than run in a configuration that looks secure but is not:
+The server refuses to start in these insecure configurations:
 
 - authentication `Disabled` on a non-loopback bind, without `--allow-unauthenticated-cluster`;
 - `MutualTls` with no trusted client certificate thumbprint — an empty allow-list would trust every
@@ -225,7 +222,7 @@ keep a development node off the network.
 
 A snapshot install writes bytes straight into the application state machine and seeds a WAL checkpoint,
 which makes it the highest-leverage message in the protocol. Independently of transport security, the
-sender computes a SHA-256 over the whole snapshot and the receiver verifies it against what it actually
+sender computes a SHA-256 over the whole snapshot and the receiver verifies it against what it
 staged before anything is imported. A mismatch — tampering, or a truncated transfer that still satisfied
 the chunk-ordering rules — rejects the install.
 
@@ -263,5 +260,5 @@ skew.
 **Thumbprint** — a hash of a certificate's DER encoding, used here as its identity. Kommander uses
 SHA-256.
 
-**Pinning** — trusting a specific certificate by its thumbprint, rather than trusting whatever a
+**Pinning** — trusting a specific certificate by its thumbprint, with no chain to whatever a
 certificate authority has signed.

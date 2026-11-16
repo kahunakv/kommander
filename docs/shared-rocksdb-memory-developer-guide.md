@@ -5,8 +5,7 @@ RocksDB database share one memory budget instead of paying for two. It covers wh
 cache and a write-buffer manager), what is not, how to size the budget, and the ownership and lifetime
 rules you must follow to avoid leaks or crashes. It is written for two readers — an operator deciding
 whether to turn this on and how to size it, and a developer wiring it into a host application. No prior
-RocksDB internals are assumed; we build the idea up first, then walk the API, the sizing math, the
-lifetime contract, and the code.
+RocksDB internals are assumed.
 
 This feature is **opt-in and additive**. It changes only in-process memory objects — no on-disk format,
 WAL semantics, recovery mode, or wire behaviour. With it unset, the RocksDB WAL behaves byte-for-byte as
@@ -17,8 +16,8 @@ before.
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why two RocksDB instances double-pay for memory](#why-two-rocksdb-instances-double-pay-for-memory)
-3. [What is shared — and what is not](#what-is-shared--and-what-is-not)
+2. [Double memory cost of two RocksDB instances](#double-memory-cost-of-two-rocksdb-instances)
+3. [Shared resources](#shared-resources)
 4. [The unified budget](#the-unified-budget)
 5. [Flow 1 — Create the bundle once, inject it everywhere](#flow-1--create-the-bundle-once-inject-it-everywhere)
 6. [Flow 2 — How the WAL applies the bundle](#flow-2--how-the-wal-applies-the-bundle)
@@ -62,7 +61,7 @@ constructor parameter, and disposes it **after** all those databases are closed.
 
 ---
 
-## Why two RocksDB instances double-pay for memory
+## Double memory cost of two RocksDB instances
 
 `RocksDbWAL` (`Kommander/WAL/RocksDbWAL.cs`) opens its database with no memory tuning:
 
@@ -72,8 +71,8 @@ constructor parameter, and disposes it **after** all those databases are closed.
 - **No `write_buffer_size` / `max_write_buffer_number` override.** Each of the 10 column families gets
   RocksDB's default memtable sizing, with no *global* bound on total memtable memory.
 - **No custom `Env`.** It uses the process-wide `Env::Default()`, whose background thread pools are
-  *already* shared across every RocksDB instance in the process. The `Env` is therefore **not** a lever —
-  the block cache and the memtables are.
+  *already* shared across every RocksDB instance in the process. The levers are therefore
+  the block cache and the memtables.
 
 When the host runs a second RocksDB instance with its own cache, both of these are fully duplicated. The
 process pays for two block caches and two unbounded memtable footprints, even though one bounded budget
@@ -83,7 +82,7 @@ families.
 
 ---
 
-## What is shared — and what is not
+## Shared resources
 
 | Resource | Shared? | How |
 |---|---|---|
@@ -126,7 +125,7 @@ Two deliberate choices keep this safe under write load:
 
 - **Soft (non-strict-capacity) cache.** With memtables charged to the cache, a *hard* capacity limit
   would surface as write errors or stalls every time any sharing database flushed a memtable. A soft
-  limit lets the budget be a target, not a brick wall.
+  limit makes the budget a soft target.
 - **`allow_stall = false` on the WBM.** Prevents cross-database flush coupling from turning into write
   stalls. Size conservatively instead of relying on stalls for back-pressure.
 
@@ -210,7 +209,7 @@ budget. So if you share a WBM, plan for it:
 - Pick `write_buffer_size` so this WAL's `cf_count × write_buffer_size × max_write_buffer_number` is a
   **small, intended fraction** of `memtableBudgetBytes`, leaving headroom for the host's own database.
 - Apply matching, modest values on the host database too.
-- Document the numbers you chose so the coupling is intentional, not accidental.
+- Document the numbers you chose so the coupling is intentional.
 
 If write-path coupling turns out to be a problem, you have an escape hatch: **share only the `Cache`** —
 the larger, workload-agnostic win — and leave the WBM unset on the host side. The block cache alone
@@ -223,8 +222,8 @@ before committing to a WBM in production.
 
 ## Ownership and lifetime
 
-**The host owns the bundle. `RocksDbWAL` borrows it and never disposes it.** This is the single most
-important rule, and it is documented on both the type and the constructor.
+**The host owns the bundle. `RocksDbWAL` borrows it and never disposes it.** Both the type and the
+constructor document this rule.
 
 The native `Cache` and WBM are reference-counted (`shared_ptr`). When a database opens with them,
 `rocksdb_options_set_write_buffer_manager` copies the WBM's `shared_ptr` into the DB's options, and each
@@ -235,13 +234,13 @@ open DB holds its own reference to **both** objects. The consequences:
   their own.
 - **Disposing early will not crash.** Because the DBs hold their own references, disposing the bundle
   *before* closing the databases does **not** free memory out from under them — no use-after-free. It is
-  still a **usage error**, but for *budget-accounting* reasons (a charged-but-released cache leaves the
-  accounting inconsistent), not crash-safety.
+  still a **usage error**, because a charged-but-released cache leaves the budget accounting
+  inconsistent.
 - **Dispose is idempotent.** A `_disposed` guard makes repeated `Dispose()` calls safe no-ops.
 - **A finalizer backstops a forgotten `Dispose`.** If the host never disposes the bundle, a finalizer
   releases the raw WBM handle so it does not leak. (The managed `Cache` self-finalizes; the raw `IntPtr`
-  would not, hence the backstop.) Always dispose explicitly anyway — the finalizer is a safety net, not
-  the plan.
+  would not, hence the backstop.) Always dispose explicitly anyway — the finalizer is only a
+  safety net.
 
 Inside `Dispose`, the order is **WBM first, then the block cache**: the WBM holds a `shared_ptr` to the
 cache, so releasing it first lets the cache's refcount drop cleanly. The `Cache` has no managed `Dispose`
@@ -296,7 +295,7 @@ that already constructs the `RocksDbWAL`.
 | `RocksDbSharedResources.MemtableMemoryUsage` | Live memtable bytes tracked by the WBM (`rocksdb_write_buffer_manager_memory_usage`). | Rises on **writes** from *any* database sharing the bundle. The primary signal that sharing is real. |
 | `RocksDbSharedResources.BlockCache.GetUsage()` | Current block-cache occupancy. | Grows on **reads** (cached blocks) or via the WBM's cost-to-cache dummy entries. Do **not** rely on it alone for a write-only workload. |
 
-To confirm two databases truly share one budget, watch `MemtableMemoryUsage` rise as either one writes.
+To confirm two databases share one budget, watch `MemtableMemoryUsage` rise as either one writes.
 If you assert on `GetUsage()`, issue reads on both first to populate the block cache, or the counter may
 not move predictably under a pure-append workload.
 
@@ -360,7 +359,7 @@ Kommander.Tests/
   bundle both drive `MemtableMemoryUsage` up, proving a single WBM tracks both databases.
 - **Lifetime** — disposing the WALs then the bundle (correct order) does not crash; disposing the bundle
   *before* the WALs also does not crash (the DBs hold their own refcounts), documenting that early
-  disposal is a budget-accounting error, not a crash hazard.
+  disposal is only a budget-accounting error.
 
 Reminder: **never run multiple `dotnet test` commands at once.** The suite spins up in-process Raft
 clusters; concurrent runs produce false failures. Use a targeted `--filter` while iterating.

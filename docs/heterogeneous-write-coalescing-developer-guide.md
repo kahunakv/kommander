@@ -5,16 +5,15 @@ unrelated, per-entry-typed writes** for one partition and pay the per-proposal a
 while still getting an **independent result for every entry**. It is written for two readers: a developer
 building a consumer (a key/value store, a lock service, a transaction coordinator) who wants to stop making
 one `ReplicateLogs` call per record, and a developer extending the write path who needs the exact ordering,
-fencing, and durability rules. No prior Raft expertise is assumed; we build the idea up first, then walk the
-flows, the result contract, and the code.
+fencing, and durability rules. No prior Raft expertise is assumed.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why a second write API](#why-a-second-write-api)
-3. [The shape of a batch](#the-shape-of-a-batch)
+2. [`ReplicateEntries` versus `ReplicateLogs`](#replicateentries-versus-replicatelogs)
+3. [Batch structure](#batch-structure)
 4. [The per-entry generation fence](#the-per-entry-generation-fence)
 5. [Flow 1 — A heterogeneous auto-commit batch](#flow-1--a-heterogeneous-auto-commit-batch)
 6. [Flow 2 — A trailing manual group](#flow-2--a-trailing-manual-group)
@@ -64,7 +63,7 @@ dropped (reported `PartitionMoved`) while its siblings proceed.
 
 ---
 
-## Why a second write API
+## `ReplicateEntries` versus `ReplicateLogs`
 
 `ReplicateLogs` is the right tool when every payload in a call shares one type and one fate. It stays, and is
 unchanged. `ReplicateEntries` exists for the case it cannot express:
@@ -77,8 +76,8 @@ unchanged. `ReplicateEntries` exists for the case it cannot express:
 | Mix **auto-commit** records with a **manual** prepare in one call | ❌ two calls | ✅ auto prefix + trailing manual group |
 | Fence **individual** entries by partition generation | ❌ one fence for the call | ✅ per-entry fence |
 
-The win is **fewer proposals and fewer replication round trips**, plus a denser group commit. It is *not*
-net-new `fsync` savings the WAL scheduler cannot already achieve — see
+It saves **proposals and replication round trips** and gives a denser group commit. The `fsync` count
+stays at what the WAL scheduler already achieves — see
 [Ordering and durability guarantees](#ordering-and-durability-guarantees).
 
 > `ReplicateEntries` does **not** let you merge two *independent* manual tickets (for example prepares from
@@ -88,7 +87,7 @@ net-new `fsync` savings the WAL scheduler cannot already achieve — see
 
 ---
 
-## The shape of a batch
+## Batch structure
 
 You describe the batch as a list of `RaftProposalEntry`:
 
@@ -305,8 +304,8 @@ public readonly record struct RaftEntryResult(
   (`Status == PartitionMoved`, nothing appended).
 
 **Index alignment.** `Entries[i]` always describes the input entry at position `i`, regardless of how the
-entries were split into auto and manual groups internally. `LogIndex` values come from the position each
-entry was assigned in the log, not from a single commit index.
+entries were split into auto and manual groups internally. `LogIndex` values come from the log position
+assigned to each entry.
 
 ---
 
@@ -330,7 +329,7 @@ A batch-level rejection is atomic: nothing is appended, so there is no partial s
 **Auto commits before manual is proposed.** The auto group and the manual group are two separate proposals
 (the log commits or rolls back an entire proposal as a unit, and these two groups have different fates). They
 are proposed **sequentially** — the auto group commits first, then the manual group is proposed on top of it.
-This is a safety requirement, not just simplicity: if the two were posted together and the auto group failed
+This order is a safety requirement: if the two were posted together and the auto group failed
 to commit *after* the manual propose was already durable, a later `CommitLogs` on the manual ticket could
 advance the commit index past the uncommitted auto entries. Committing auto first makes the manual group a
 clean uncommitted suffix on a committed prefix.
@@ -339,12 +338,12 @@ clean uncommitted suffix on a committed prefix.
 guaranteed single `fsync` spanning both. Auto-commit-only batches are one proposal and ride one
 group-committed write; a batch with a manual group is two proposals whose WAL writes coalesce only as the
 scheduler's group commit happens to merge them with concurrent traffic. `ReplicateEntries` reduces the number
-of *proposals* and *round trips*, not the scheduler's floor on syncs — see the
+of *proposals* and *round trips*; the scheduler's floor on syncs stays the same — see the
 [WAL Write Durability guide](wal-commit-durability-developer-guide.md) for the sync mechanics and the
 `WalGroupCommitLingerMs` lever that raises coalescing density.
 
 **No ordering across entries beyond "auto before manual."** A batch is a set with one commit boundary per
-group, not a sequence with cross-entry dependencies. Do not assume any order between two entries in the same
+group and no cross-entry dependencies. Do not assume any order between two entries in the same
 group.
 
 ---
@@ -441,7 +440,7 @@ Kommander.Tests/
 
 ## Testing
 
-`Kommander.Tests/TestReplicateEntries.cs` runs on a real two-node in-memory cluster so the follower actually
+`Kommander.Tests/TestReplicateEntries.cs` runs on a real two-node in-memory cluster so the follower
 receives each batch:
 
 - **Heterogeneous auto-commit** — a mixed-type batch commits as one proposal; per-entry indices are

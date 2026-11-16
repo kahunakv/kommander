@@ -5,12 +5,10 @@ per-partition cost growing out of control. It covers two complementary mechanism
 
 1. **The shared executor pool** — many partitions share a small fixed set of worker threads instead of
    each owning a dedicated OS thread.
-2. **Hot-set `CheckLeader`** — the leader-check timer ticks only the *active* partitions every cycle,
-   not all of them.
+2. **Hot-set `CheckLeader`** — the leader-check timer ticks only the *active* partitions every cycle.
 
 It is written for two readers — someone who wants to *understand* why thousands of idle partitions are
-cheap, and someone who wants to *extend or debug* the scheduler. No prior Raft expertise is assumed; we
-build the ideas up first, then walk the real flows and the code.
+cheap, and someone who wants to *extend or debug* the scheduler. No prior Raft expertise is assumed.
 
 This guide is the **threads-and-CPU** half of partition scaling. Its sibling, the
 [Partition Quiescence Developer Guide](partition-quiescence-developer-guide.md), is the **network**
@@ -22,14 +20,14 @@ together; the hot set reuses the quiesced state that quiescence already tracks.
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why this exists (the problem)](#why-this-exists-the-problem)
+2. [Linear per-partition costs](#linear-per-partition-costs)
 3. [Core concepts](#core-concepts)
 4. [Flow 1 — A partition becomes runnable and is drained](#flow-1--a-partition-becomes-runnable-and-is-drained)
 5. [Flow 2 — The single-owner guarantee on a shared pool](#flow-2--the-single-owner-guarantee-on-a-shared-pool)
 6. [Flow 3 — CheckLeader ticks only the hot set](#flow-3--checkleader-ticks-only-the-hot-set)
 7. [Flow 4 — An idle partition leaves the hot set, and comes back](#flow-4--an-idle-partition-leaves-the-hot-set-and-comes-back)
 8. [Flow 5 — Failover for a quiet partition](#flow-5--failover-for-a-quiet-partition)
-9. [What this does *not* do](#what-this-does-not-do)
+9. [Scope limits](#scope-limits)
 10. [Configuration](#configuration)
 11. [Code map](#code-map)
 12. [Invariants you must not break](#invariants-you-must-not-break)
@@ -54,7 +52,7 @@ pool thread picks it up, drains a bounded chunk, and moves on. Serial execution 
 
 Separately, a timer fires every 250 ms asking each partition "are you still the leader / do you need an
 election?" Ticking *all* `M` partitions four times a second is wasteful when most are idle. So the
-timer keeps a **hot set** — the partitions that are actually active — and ticks only those on the fast
+timer keeps a **hot set** — the partitions that are active — and ticks only those on the fast
 cycle, with a slower full **safety sweep** every ~5 s as a backstop.
 
 Result: an idle partition costs **no thread and no periodic tick**. Only the partitions doing work pay
@@ -62,7 +60,7 @@ for scheduling.
 
 ---
 
-## Why this exists (the problem)
+## Linear per-partition costs
 
 The target is a deployment with **many partitions, most of them idle**. Two costs used to grow linearly
 with the partition count `M` and dominated before anything else:
@@ -182,8 +180,8 @@ Two mechanisms cover it:
 
 1. **SWIM-driven wake (fast path).** When the failure detector marks a node `Suspect` or `Dead`, every
    quiet partition that believed that node was its leader is **promoted back into the hot set**
-   immediately, so it gets a `CheckLeader` tick on the very next fast cycle and can start an election.
-   Failover latency for a quiet partition is therefore bounded by SWIM detection, not by the slow sweep.
+   immediately, so it gets a `CheckLeader` tick on the next fast cycle and can start an election.
+   Failover latency for a quiet partition is therefore bounded by SWIM detection.
 2. **The safety sweep (backstop).** Even with no SWIM signal, the full sweep every ~5 s visits every
    partition and re-checks leadership.
 
@@ -193,9 +191,7 @@ So a quiet partition is cheap *and* still fails over promptly. (For the SWIM voc
 
 ---
 
-## What this does *not* do
-
-To set expectations clearly:
+## Scope limits
 
 - **It does not release per-partition memory.** A resident partition still keeps a thin in-memory
   footprint (its executor, priority queues, and state machine). The shared pool removes the *thread*
@@ -203,7 +199,7 @@ To set expectations clearly:
   partitions this is modest; declaring tens of thousands of partitions you never touch is not free.
 - **It does not close WAL handles for idle partitions.** Kommander's WAL is a **single instance shared
   by all partitions** (sharded internally), so there is no per-partition file handle to release in the
-  first place — open handles scale with the number of shards, not the number of partitions. There is
+  first place — open handles scale with the shard count. There is
   deliberately no "cold tier" that detaches the WAL.
 - **It does not change Raft.** Terms, quorum, the commit rules, the log format, and the
   replication/commit path are all untouched. This is purely about *where work runs and what gets
@@ -218,25 +214,25 @@ To set expectations clearly:
 | `EnableSharedExecutorPool` | `true` | Master switch. `true` = many partitions share a bounded thread pool. `false` = the original one-OS-thread-per-partition model, and every `CheckLeader` tick becomes a full sweep. Both settings are Raft-safe. |
 | `PartitionExecutorPoolSize` | `0` | Number of pool worker threads. `0` auto-sizes to `Environment.ProcessorCount`; values below 0 are clamped to 1. |
 
-### The pool is fixed-size — there is no autoscaling
+### Fixed pool size
 
 The pool allocates exactly `PartitionExecutorPoolSize` (or `Environment.ProcessorCount` when `0`)
 threads at construction and **never grows or shrinks them**. The thread count is fixed for the life of
 the `RaftManager`; changing it means changing the config and restarting. This is deliberate — the value
-of the pool is that it is a small *bounded* `P ≪ M`; autoscaling toward `M` would reintroduce the very
+of the pool is that it is a small *bounded* `P ≪ M`; autoscaling toward `M` would reintroduce the
 thread-per-partition cost the pool exists to remove.
 
-### How to size it
+### Pool sizing
 
 The pool size governs **how many partitions can be mid-drain at the same instant** — it scales with the
-number of *simultaneously busy* partitions, **not** the total partition count. Ten thousand idle
+number of *simultaneously busy* partitions. Ten thousand idle
 partitions need zero extra threads.
 
-The key fact for sizing: **pool threads are CPU-bound, not I/O-bound.** When the state machine writes to
+For sizing, **pool threads are CPU-bound.** When the state machine writes to
 the WAL it *enqueues* the write and returns immediately (`Pending`); it does not block waiting for the
 disk. The actual fsync runs on a **separate** I/O pool sized by `WriteIOThreads` (default 4), and the
 reply completes later via callback. So a pool thread spends its time on state-machine logic,
-serialization, and draining queues — not parked on disk. That gives a clean division of dials:
+serialization, and draining queues. That gives a clean division of dials:
 
 | Bottleneck | Knob to turn |
 |---|---|
@@ -251,18 +247,18 @@ Practical guidance:
   saturated** — ops queuing behind busy partitions while cores sit idle. That means threads are stalling
   (e.g. a custom state-machine callback that blocks). Adding threads helps only when threads are
   *waiting*, never when cores are *full*.
-- **Don't raise it when CPU is already saturated** — more threads just add context-switching. You're
+- **Don't raise it when CPU is already saturated** — more threads add context-switching. You're
   compute-bound; spread partitions across more nodes instead.
 - **Never set it to the partition count** — that recreates the per-partition memory cost the pool exists
   to remove.
-- If disk is the bottleneck (WAL writes backing up), tune **`WriteIOThreads`**, not the executor pool.
+- If disk is the bottleneck (WAL writes backing up), tune **`WriteIOThreads`**.
 
 To decide empirically, watch per-dispatch latency (and the executor's slow-message warnings),
 client-queue depth / rejections, and CPU utilization together: rising latency *with spare CPU* → too few
 (or stalling) threads → increase; rising latency *with CPU saturated* → the pool is not the bottleneck,
 leave it. The bounded drain quantum keeps even a small pool making progress across many partitions (a
-busy partition yields after its quantum), so pool size affects **tail latency under contention**, not
-correctness or liveness.
+busy partition yields after its quantum), so pool size affects only **tail latency under
+contention**.
 
 ### Other notes
 

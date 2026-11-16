@@ -3,18 +3,17 @@
 This guide explains how an application stores **cluster-wide control state on the system partition
 (P0)** and, in particular, how to move from **full-snapshot-per-mutation** replication to cheap
 **delta** replication without ever losing state. It is written for someone integrating an application
-state machine on top of Kommander. No prior Raft expertise is assumed; we build the idea up first,
-then walk the contract and the flows.
+state machine on top of Kommander. No prior Raft expertise is assumed.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Background: what the system partition is for](#background-what-the-system-partition-is-for)
-3. [The problem with full-snapshot-per-mutation](#the-problem-with-full-snapshot-per-mutation)
-4. [Why deltas need a repair path](#why-deltas-need-a-repair-path)
-5. [The two safety nets](#the-two-safety-nets)
+2. [Background: the system partition](#background-the-system-partition)
+3. [Cost of full-snapshot-per-mutation](#cost-of-full-snapshot-per-mutation)
+4. [Delta repair path](#delta-repair-path)
+5. [Safety nets: state transfer and retain floor](#safety-nets-state-transfer-and-retain-floor)
 6. [The consumer contract (five steps)](#the-consumer-contract-five-steps)
 7. [Flow 1 — Steady-state delta replication](#flow-1--steady-state-delta-replication)
 8. [Flow 2 — Repairing a below-floor follower](#flow-2--repairing-a-below-floor-follower)
@@ -58,7 +57,7 @@ of this guide explains each and the flows behind them.
 
 ---
 
-## Background: what the system partition is for
+## Background: the system partition
 
 Every Kommander cluster has a system partition with id `0` (`RaftSystemConfig.SystemPartition`). It
 carries two kinds of entries:
@@ -75,7 +74,7 @@ that the whole cluster must agree on.
 
 ---
 
-## The problem with full-snapshot-per-mutation
+## Cost of full-snapshot-per-mutation
 
 To survive compaction **without** any snapshot hook, the only safe pattern on P0 is:
 
@@ -88,13 +87,13 @@ The cost is that a trivial change (renewing one lease out of thousands) still wr
 fsyncs a multi-kilobyte record. Replication becomes **O(total state) per mutation**. For a hot,
 frequently-touched registry this dominates WAL and network traffic.
 
-Deltas fix the cost — one entry per change — but a delta is **not** self-contained. Once old deltas are
+Deltas cost one entry per change. A delta is **not** self-contained. Once old deltas are
 compacted away, a node that starts below that point cannot reconstruct the full state from the deltas
 that remain. That is the gap this feature closes.
 
 ---
 
-## Why deltas need a repair path
+## Delta repair path
 
 A node can end up **below the compaction floor** (needing entries the leader has already deleted) in
 two ways:
@@ -110,7 +109,7 @@ obtain the **whole state**. That is what `IRaftSystemStateTransfer` provides.
 
 ---
 
-## The two safety nets
+## Safety nets: state transfer and retain floor
 
 Delta safety rests on two mechanisms. You opt into both by following the contract.
 
@@ -268,7 +267,7 @@ and checkpoint seeding.
 
 If the local WAL was compacted below `d`'s tail (e.g. the retain floor was not asserted in time), the
 node instead rejoins **below the floor** and is repaired by [Flow 2](#flow-2--repairing-a-below-floor-follower)
-— the leader's snapshot. Either way it converges; the retain floor just avoids a network transfer.
+— the leader's snapshot. Either way it converges; the retain floor avoids a network transfer.
 
 The **`log.Id <= d` skip** is essential — without it you double-apply deltas already in your baseline.
 `RaftLog.Id` is the committed index and is authoritative for this comparison.
@@ -282,7 +281,7 @@ The **`log.Id <= d` skip** is essential — without it you double-apply deltas a
   is what makes compaction eligible to reclaim space.
 - **Retain floor.** `SetMinRetainIndex(0, d + 1)` clamps that boundary so entries above your durable
   local snapshot are never deleted. Passing `0` or a negative value means *no protection* (compaction
-  is free to go up to the checkpoint) — it does **not** mean "protect everything."
+  is free to go up to the checkpoint).
 - **Interaction.** The effective deletion boundary is always the **lower** of the checkpoint and the
   retain floor. You cannot accidentally retain *more* by lowering the checkpoint, nor delete *more* by
   raising the floor.
@@ -332,8 +331,8 @@ Everything you need is on `IRaft` and two small types — no internal Kommander 
    import is retried cleanly — but only if you did not leave a half-applied state behind.
 3. **Register the transfer on every node.** Registration is not replicated. A node that imports without
    the hook registered rejects the snapshot; a node that joins below the compaction floor without it is
-   rejected as permanently blocked — its `JoinCluster` fails fast with an `InvalidOperationException`
-   rather than converging, so it can never become a voter until the transfer is registered.
+   rejected as permanently blocked — its `JoinCluster` fails fast with an `InvalidOperationException`,
+   so it can never become a voter until the transfer is registered.
 4. **Never write the `_RaftSystem` type on P0.** It is reserved; `ReplicateLogs` throws.
 5. **Skip restored entries at or below your local snapshot index.** Apply only `RaftLog.Id > d`, or you
    double-apply.

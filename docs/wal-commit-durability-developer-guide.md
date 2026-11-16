@@ -4,15 +4,14 @@ This guide explains how Kommander makes a write **durable** on the persistent WA
 SQLite), why a committed write costs **two** disk syncs by default, and the two knobs that reduce that
 cost: **group commit** (a throughput lever) and the **single-fsync commit fast path** (a latency lever).
 It is written for two readers — an operator deciding whether to turn these on and how to tune them, and a
-developer who wants to understand or extend the write path. No prior Raft expertise is assumed; we build
-the idea up first, then walk the real flows, the configuration, and the code.
+developer who wants to understand or extend the write path. No prior Raft expertise is assumed.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why a committed write costs two fsyncs](#why-a-committed-write-costs-two-fsyncs)
+2. [Two fsyncs per committed write](#two-fsyncs-per-committed-write)
 3. [Lever 1 — Group commit (throughput)](#lever-1--group-commit-throughput)
 4. [Lever 2 — The single-fsync fast path (latency)](#lever-2--the-single-fsync-fast-path-latency)
 5. [Flow 1 — A committed write, by default](#flow-1--a-committed-write-by-default)
@@ -20,9 +19,9 @@ the idea up first, then walk the real flows, the configuration, and the code.
 7. [Flow 3 — The fast path: ack on propose-quorum-durable](#flow-3--the-fast-path-ack-on-propose-quorum-durable)
 8. [Flow 4 — The lazy commit marker](#flow-4--the-lazy-commit-marker)
 9. [Flow 5 — Crash and recovery](#flow-5--crash-and-recovery)
-10. [Why the fast path is safe](#why-the-fast-path-is-safe)
+10. [Fast-path safety](#fast-path-safety)
 11. [Configuration](#configuration)
-12. [Full disk (ENOSPC) and how the WAL recovers](#full-disk-enospc-and-how-the-wal-recovers)
+12. [Full-disk (ENOSPC) recovery](#full-disk-enospc-recovery)
 13. [Storage corruption and lost writes](#storage-corruption-and-lost-writes)
 14. [Observability](#observability)
 15. [Code map](#code-map)
@@ -47,8 +46,8 @@ Two `fsync`s sit on the critical path of every write, one after the other. On an
 
 There are two independent ways to spend less time syncing:
 
-- **Group commit** packs *many concurrent writes* into *one* `fsync`. It raises **throughput** but does
-  not shorten any single write's path (each write still waits for its own two syncs). Always on; tunable
+- **Group commit** packs *many concurrent writes* into *one* `fsync`. It raises **throughput**; each write
+  still waits for its own two syncs. Always on; tunable
   via `WalGroupCommitLingerMs`.
 - **The single-fsync fast path** (`WalSingleFsyncCommit`) removes the **second** `fsync` from a write's
   critical path: it acknowledges the client the moment a **quorum holds the entry durably** (the true
@@ -62,7 +61,7 @@ There are two independent ways to spend less time syncing:
 
 ---
 
-## Why a committed write costs two fsyncs
+## Two fsyncs per committed write
 
 A committed write traverses Raft's two phases, and the persistent WAL syncs on each:
 
@@ -96,7 +95,7 @@ batch can even mix one partition's propose with another's commit into the same s
 throughput stays high under concurrency.
 
 By default this batching is **opportunistic**: a worker syncs whatever happens to be ready the instant it
-wakes. Where ready work *trickles in* rather than arriving all at once — notably the follower append
+wakes. Where ready work *trickles in* — notably the follower append
 path, paced by replication RPCs — opportunistic batching leaves each arrival to force a near-solo sync.
 
 `WalGroupCommitLingerMs` turns on **deferred** group commit: after taking the first ready partition, the
@@ -174,12 +173,12 @@ marker:
 
 A single-voter leader is its own quorum, so the propose sync that just completed already satisfies this;
 the fast path applies there too. The client now waits for **one** sync (propose) plus the quorum
-round-trip, not two.
+round-trip.
 
 ### The leader's propose sync overlaps the followers'
 
 With `FanOutBeforeLocalWrite` on (the default), the leader sends a proposal to its followers as soon as its
-own `Proposed` write is **queued**, not once it is durable. The leader's sync and the followers' syncs run
+own `Proposed` write is **queued**, before it is durable. The leader's sync and the followers' syncs run
 at the same time instead of one after the other:
 
 ```
@@ -192,7 +191,7 @@ The quorum still counts the leader only once its own write is durable (`RaftProp
 two follower acks are not enough while the leader's copy is still queued. So everything that runs at quorum
 (the commit marker, the leader's applies, backfill reads up to the commit index) still finds the batch on
 the leader's disk. The one visible difference is a failed leader write. The followers may already hold the
-batch and a later leader can commit it, so the caller gets `ProposalOutcomeUnknown`, not the storage error.
+batch and a later leader can commit it, so the caller gets `ProposalOutcomeUnknown`.
 The promotion barrier keeps the serial order.
 
 ### The follower acks before it applies
@@ -265,14 +264,14 @@ The true frontier above that lower bound is then re-supplied:
   `Proposed` and apply them — idempotent.
 
   **`BackfillThreshold` does not gate this.** The threshold encodes "a small gap rides on normal
-  replication", which is true of a follower that is merely behind and false of a regressed one: its
+  replication", which is true of a follower that is behind and false of a regressed one: its
   missing entries are already-committed history, so no future propose broadcast carries them, and the
-  idle-tail trigger in `SendHeartbeat` deliberately refuses to push merely-restored committed state
+  idle-tail trigger in `SendHeartbeat` deliberately refuses to push committed state that only came from a restore
   (the `liveCommitFloor` guard). A sub-threshold regression left to the threshold would only be repaired
   when unrelated writes happened to push the gap past it — never, on an idle cluster. A commit frontier
   cannot legitimately move backwards, so the signature is unambiguous and is repaired at any gap size.
-  The batch is anchored to the frontier the follower just reported, not to `nextIndex` — the latter
-  tracks the monotonic `matchIndex` and still points above exactly the range that regressed.
+  The batch is anchored to the frontier the follower just reported. `nextIndex` tracks the
+  monotonic `matchIndex` and still points above the range that regressed, so it cannot anchor.
 - A restarted node that **wins election** re-commits the durable `Proposed` prefix once a current-term
   entry commits (standard Raft leader completeness).
 
@@ -284,15 +283,15 @@ The true frontier above that lower bound is then re-supplied:
 
 ---
 
-## Why the fast path is safe
+## Fast-path safety
 
 The load-bearing invariant is unchanged: **a write acknowledged to the client is durable on a quorum, and
 crash recovery yields the same committed prefix.** The fast path preserves it because:
 
 - **Ack timing.** A follower acknowledges a propose only *after* its own WAL write is durable. So when the
   leader observes a propose quorum, a quorum already holds the entry on disk — exactly Raft's commit
-  condition. Acking there does not ack before durability; it stops waiting for the *leader's second*
-  sync, not for quorum durability.
+  condition. Acking there does not ack before durability; it only stops waiting for the
+  *leader's second* sync.
 - **Lazy marker.** Losing a marker on a crash only demotes an entry to `Proposed` on disk. That entry was
   quorum-durable from its propose sync, so it is reconstructible (Flow 5). No *acknowledged* data is lost.
 - **The recovery anchor stays durable.** `CommittedCheckpoint` is always written sync, on both the
@@ -334,8 +333,8 @@ Tuning notes:
     it reconnects. On the fast path a restarted node's applied state is the *contiguous* committed prefix
     until re-supply lands (Flow 5).
 - **`WalGroupCommitLingerMs`** helps most when writes spread across **many partitions** and arrive
-  staggered (the follower append path). Start around `2` ms and measure; the win is denser batches and a
-  tighter tail, not a lower median. A larger value bounds the linger; the evidence gate keeps idle,
+  staggered (the follower append path). Start around `2` ms and measure; it gives denser batches and a
+  tighter tail; the median does not drop. A larger value bounds the linger; the evidence gate keeps idle,
   sequential and closed-loop load from paying any of it (a worker waits only while another partition has
   queued work that must become ready soon — check `TotalLingerWaits` and
   `TotalLingerPartitionsGathered` to see the gate and its hit rate in action).
@@ -344,13 +343,13 @@ Tuning notes:
 
 ---
 
-## Full disk (ENOSPC) and how the WAL recovers
+## Full-disk (ENOSPC) recovery
 
-A data volume that fills is an operational event, not a crash. Kommander keeps the node alive and
+A full data volume is an operational event. Kommander keeps the node alive and
 makes it heal on its own when space returns. This section describes what happens on the RocksDB
 backend, because RocksDB keeps error state of its own.
 
-### What a full disk does to the node
+### Full-disk effects on the node
 
 1. **Writes fail as a status.** `RocksDbWAL.Write` returns `Errored`. The Raft layer regresses its
    in-memory presence and commit frontiers to the durable log for the failed range
@@ -365,7 +364,7 @@ backend, because RocksDB keeps error state of its own.
 3. **The WAL logs once, then every 30 seconds** while writes keep failing, with the duration of the
    episode and the last error.
 
-### Why RocksDB does not always heal on its own
+### RocksDB self-recovery limits
 
 RocksDB keeps one background-error status per engine. Two shapes matter:
 
@@ -379,7 +378,7 @@ load, or the shared write-buffer manager asks for a flush, and the switch to a n
 This is what the field incident of 2026-09-01 showed: identical failures naming the same log file for
 many minutes after 24 GiB had been freed, until a process restart.
 
-### How `RocksDbWAL` recovers
+### `RocksDbWAL` recovery
 
 After a write-path failure the WAL asks two questions, without parsing error strings:
 
@@ -404,7 +403,7 @@ until space returns. An engine that resumed on its own passes question 2 and is 
 reopen itself fails (the open needs space too), the WAL stays closed, logs at `Critical`, and the next
 write-path failure retries the reopen.
 
-### What an operator sees
+### Operator signals
 
 - `Warning` — `RocksDB WAL at '…' rejected a write: …` on the first failure of an episode, then every
   30 seconds with the duration and count.
@@ -435,7 +434,7 @@ It used to ride the next log fsync, so a granted vote could reach the candidate 
 a power loss the node would grant a second candidate the same term, and two leaders could commit
 conflicting entries in it. Elections are rare, so one fsync per vote costs nothing measurable.
 
-### What the engine already refuses
+### Built-in engine checks
 
 RocksDB verifies a checksum on every block it reads and every log record it replays, and the WAL opens
 with `paranoid_checks`, `verify_sst_unique_id_in_manifest` and now `track_and_verify_wals_in_manifest`.
@@ -479,7 +478,7 @@ Three rules keep it honest:
   sweep to the cut, a truncating snapshot install to the boundary (a retained one raises it to the
   boundary), `DeletePartitionWAL` removes it.
 - The projection never counts an id buffered over a gap, so the watermark never exceeds what the node
-  really holds once the batch lands. A low watermark narrows what the check can detect; a high one would
+  holds once the batch lands. A low watermark narrows what the check can detect; a high one would
   report a loss that never happened, and that is the error the design rules out.
 
 On restore, after every frontier seed (checkpoint, compaction floor, soft floor), `CompleteRestoreAsync`
@@ -520,15 +519,15 @@ records its reconciliation (`MarkLostSyncedWritesReconciled`, metadata key
 a later event carries a higher id and quarantines partitions that reconciled the earlier one.
 
 The ledger carries the engine's identity (`raft_engine_identity`), so a ledger copied from another
-directory is reset, not believed; a torn slot is skipped in favour of the other; both slots unreadable
+directory is reset; a torn slot is skipped in favour of the other; both slots unreadable
 (not a crash shape) is treated as no ledger, with a warning. A directory from before the ledger is
 upgraded at its next open. A torn **unsynced** record — the residue of a real kill — was never attested
 and reopens healthy. With `syncWrites` off nothing is attested, because nothing is promised.
 
 Cost: one extra device round trip per synchronous engine write (an in-place sector write plus
 `fdatasync`, grouped across concurrent writers), on top of the engine's own fsync. The ledger uses the
-same primitive as the engine's log on each platform, not the full-device flush `FileStream.Flush(true)`
-issues on macOS.
+same primitive as the engine's log on each platform; it avoids the full-device flush that
+`FileStream.Flush(true)` issues on macOS.
 
 ### The hard-state ledger: a forgotten vote
 
@@ -541,7 +540,7 @@ term, or a vote in the same term the engine lacks — gets it written back befor
 The ledger is appended only after the engine's put returned, so it is ahead only when the engine lost
 the put; the quarantine below can therefore never lift onto a forgotten vote.
 
-### How the quarantine lifts after a lost tail
+### Quarantine release after a lost tail
 
 The surviving log may be a *stale prefix*: the cut can revert a leader's truncation as well as remove
 appended rows, so the same ids may hold entries from an older term, and there is no watermark to reach.
@@ -561,7 +560,7 @@ the partition votes and campaigns again once any of three facts proves its log i
 The election gates open on the live condition; the tick records the reconciliation in the backend and
 only then reports `Healthy`, so a probe that reads `Healthy` can be acted on safely.
 
-### Quarantine, not silence
+### Partition storage states
 
 The restore reports a `RaftRestoreStorageVerdict`; the state machine turns it into one of the
 `RaftPartitionStorageState` values, which `IRaft.GetPartitionStorageHealth` exposes for the host's
@@ -582,7 +581,7 @@ higher term is adopted, so a deposed leader's appends stay fenced.
 
 The ENOSPC recovery used to reopen the engine on any `RocksDbException`. A `Corruption` status — a
 compaction that read a damaged SST, a probe that hit a bad block — latched the same way, the reopen
-succeeded (the open verifies sizes and identities, not every block), the next compaction hit the damage
+succeeded (the open verifies only sizes and identities), the next compaction hit the damage
 again, and the WAL looped every probe interval with only `Warning` lines.
 
 `RocksDbWAL` now classifies the failure by the status prefix the C API exposes (`"Corruption:"`, the
@@ -593,7 +592,7 @@ An open that fails on `Corruption` logs at `Critical` and throws: the node does 
 data. `IWAL.GetFailStopReason` carries the engine's message, which names the damaged file; the state
 machine polls it on its tick and moves the partition to `EngineFailed`.
 
-### What an operator sees
+### Operator signals
 
 - `Critical` — `RocksDB WAL at '…' lost synced writes: the sync ledger '…' attests sequence A as durable, but the engine replayed only through sequence R …` (the engine, once per event)
 - `Critical` — `Restore found the storage engine lost synced writes: the surviving log is contiguous through P at term T …` (each partition)
@@ -618,7 +617,7 @@ machine polls it on its tick and moves the partition to `EngineFailed`.
 | Property | Meaning |
 |---|---|
 | `TotalBatchesWritten` | Number of `walAdapter.Write` calls — the batching/Write-call count. **Unchanged** by the fast path. |
-| `TotalSyncBatchesWritten` | Number of those calls that actually `fsync`ed — the **true sync count**. Equals `TotalBatchesWritten` with the fast path off; drops toward ~1× per committed write with it on. |
+| `TotalSyncBatchesWritten` | Number of those calls that `fsync`ed — the **true sync count**. Equals `TotalBatchesWritten` with the fast path off; drops toward ~1× per committed write with it on. |
 | `TotalPartitionsBatched` | Sum of partitions across all batches; divided by `TotalBatchesWritten` gives **mean partitions per `fsync`** — the batch density the linger raises. |
 | `TotalLingerWaits` | Timed linger waits entered (the evidence gate admitted a wait). Must stay `0` under closed-loop / sequential load. |
 | `TotalLingerPartitionsGathered` | Partitions added to a batch by a linger wait; divided by `TotalLingerWaits` gives the linger's **hit rate**. |
@@ -681,7 +680,7 @@ Kommander.Tests/
    per-entry `Committed` markers only — never to checkpoints, proposed entries, or rollbacks.
 3. **Preserve the durable `Proposed` tail on restart.** `proposeIndex = maxLogId + 1` on the fast path;
    a later propose must not reuse ids that an acked-but-lazily-committed entry occupies.
-4. **Recover the *contiguous* committed prefix, not the last on-disk marker.** A lost marker leaves a gap;
+4. **Recover only the *contiguous* committed prefix.** A lost marker leaves a gap;
    recovery must stop the committed prefix at that gap and let re-supply/re-commit fill the rest.
 5. **Flag-off is sacred.** With `WalSingleFsyncCommit = false`, the write and recovery paths must be
    byte-for-byte the prior always-sync behaviour. The fast-path branches are gated on the flag.

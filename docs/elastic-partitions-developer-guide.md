@@ -11,8 +11,8 @@ internals, crash recovery, snapshot transfer, and the generation fence.
 
 ## Table of Contents
 
-1. [Background: What Is a Raft Partition?](#1-background-what-is-a-raft-partition)
-2. [Why Elastic Partitions?](#2-why-elastic-partitions)
+1. [Background: Raft Partitions](#1-background-raft-partitions)
+2. [Purpose of Elastic Partitions](#2-purpose-of-elastic-partitions)
 3. [Core Data Model](#3-core-data-model)
 4. [The System Partition](#4-the-system-partition)
 5. [The Coordinator: Single Consumer, All Map Mutations](#5-the-coordinator-single-consumer-all-map-mutations)
@@ -22,17 +22,17 @@ internals, crash recovery, snapshot transfer, and the generation fence.
 9. [Merging Partitions (Two-Phase Protocol)](#9-merging-partitions-two-phase-protocol)
 10. [The Generation Fence](#10-the-generation-fence)
 11. [Snapshot Transfer During Split](#11-snapshot-transfer-during-split)
-12. [Routing: How Keys Find Their Partition](#12-routing-how-keys-find-their-partition)
+12. [Key-to-Partition Routing](#12-key-to-partition-routing)
 13. [Crash Recovery](#13-crash-recovery)
 14. [The Partition Map: Serialization and Versioning](#14-the-partition-map-serialization-and-versioning)
 15. [Public API Reference](#15-public-api-reference)
 16. [Key Invariants and Safety Rules](#16-key-invariants-and-safety-rules)
-17. [Adding New Behavior: Where to Start](#17-adding-new-behavior-where-to-start)
+17. [Adding New Behavior](#17-adding-new-behavior)
 18. [Test Organization](#18-test-organization)
 
 ---
 
-## 1. Background: What Is a Raft Partition?
+## 1. Background: Raft Partitions
 
 Raft is a distributed consensus algorithm. A group of nodes (a "cluster") elect one
 **leader** and the rest are **followers**. The leader accepts writes, replicates them to
@@ -58,7 +58,7 @@ partitions can proceed in parallel without one leader becoming a bottleneck.
 
 ---
 
-## 2. Why Elastic Partitions?
+## 2. Purpose of Elastic Partitions
 
 A static partition count means you have to guess up front how many partitions your
 workload needs. Elastic partitions let you change the partition count at runtime without
@@ -319,9 +319,9 @@ Splitting is the most complex operation. It uses a **two-phase commit** to ensur
 cluster never enters a state where the same key range is owned by zero partitions or by
 two partitions simultaneously.
 
-### Why Two Phases?
+### Reason for Two Phases
 
-If the leader simply shrank partition 1 and created partition 2 in a single atomic step,
+If the leader shrank partition 1 and created partition 2 in a single atomic step,
 a crash between the two writes would leave the cluster with a gap in the hash ring.
 Two-phase commit makes the intermediate state explicit: while both partitions are in
 `Splitting`, the cluster knows a split is in progress and can resume it on restart.
@@ -547,13 +547,13 @@ Caller calls ReplicateLogs(partitionId=2, expectedGeneration=5)
         Executor: 5 != 6 → return PartitionMoved
 ```
 
-The check happens **inside the executor** (on the executor's thread, under the serialized
-drain cycle) — not on the caller's thread. This avoids the TOCTOU race that would exist
+The check happens **inside the executor**, on the executor's thread under the serialized
+drain cycle. This avoids the TOCTOU race that would exist
 if the caller checked `GetPartitionGeneration()` in application code and then called
 `ReplicateLogs` separately.
 
-The check also runs in `ExecuteBatchAsync` (the batching path that groups consecutive
-`ReplicateLogs` calls before a single WAL flush), not just in the single-item path.
+The check runs in the single-item path and in `ExecuteBatchAsync` (the batching path that
+groups consecutive `ReplicateLogs` calls before a single WAL flush).
 
 ### `GetPartitionGeneration(partitionId)`
 
@@ -590,7 +590,7 @@ public interface IRaftStateMachineTransfer
 }
 ```
 
-> **Not just splits:** when a follower falls below the leader's WAL compaction floor and no
+> **Also outside splits:** when a follower falls below the leader's WAL compaction floor and no
 > `IRaftPartitionStateTransfer` is registered, the catch-up path also calls `ExportRange` with a
 > *boundless* plan (only `TargetPartitionId` set, meaning "the entire partition") and installs it
 > on the follower via `ImportRange`. If your range transfer cannot serve whole-partition exports,
@@ -657,7 +657,7 @@ startup before `JoinCluster()`.
 
 ---
 
-## 12. Routing: How Keys Find Their Partition
+## 12. Key-to-Partition Routing
 
 Two routing methods exist for application code:
 
@@ -673,7 +673,7 @@ Both methods scan the live `partitions` dictionary and return the first `HashRan
 partition whose `[StartRange, EndRange]` interval contains the hash of the key.
 
 **`Unrouted` partitions are never returned.** An application that creates an `Unrouted`
-partition addresses it by its id directly, not through `GetPartitionKey`.
+partition addresses it directly by its id.
 
 **What if no partition covers the hash?** Both methods throw `RaftException`. This should
 not happen in a correctly maintained cluster (the initial `DivideIntoRanges` guarantees
@@ -750,14 +750,14 @@ original intent before the crash. The correct fix is to store the survivor's id 
 field exists, `Unrouted` merge crash recovery is best-effort for multi-partition
 scenarios.
 
-### When Does Crash Recovery NOT Run?
+### Cases Without Crash Recovery
 
 `InitializePartitions(crashRecovery: false)` is passed in two cases:
 
 - `ConfigReplicated` — live replication events on followers. Followers must never drive
   Phase 2 commits; only the leader does.
-- `LeaderChanged` as follower — a follower learning about a new leader only needs to
-  apply the partition map, not run crash recovery.
+- `LeaderChanged` as follower — a follower learning about a new leader only applies
+  the partition map.
 
 Crash recovery only runs on `RestoreCompleted` (WAL replay finished) and
 `LeaderChanged` as leader (a node winning an election should complete any in-progress
@@ -963,7 +963,7 @@ These invariants must hold at all times. Violation corrupts the partition map.
 
 ---
 
-## 17. Adding New Behavior: Where to Start
+## 17. Adding New Behavior
 
 ### Adding a new lifecycle operation
 
@@ -1026,8 +1026,7 @@ All elastic partition tests are in `Kommander.Tests/Scheduler/`.
 - `WaitForIdleAsync` uses a drain sentinel (not `Task.Delay`) to wait for the coordinator
   queue to empty. Always prefer it over fixed delays.
 - Crash recovery tests use `MakeConfigRestored` + `RaftSystemRequestType.RestoreCompleted`
-  to simulate WAL replay, **not** `MakeConfigReplicated` + `LeaderChanged`. This is the
-  correct sequence — `ConfigReplicated` is a live event; `ConfigRestored` is a replay
-  event.
+  to simulate WAL replay. `ConfigRestored` is the replay event; `ConfigReplicated` is a
+  live event and does not run crash recovery.
 - Tests that verify a follower does NOT drive Phase 2 set `ReplicateOverride` to record
   calls and assert the call count is zero after `WaitForIdleAsync`.

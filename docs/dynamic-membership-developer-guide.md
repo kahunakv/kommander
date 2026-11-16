@@ -1,22 +1,21 @@
 # Dynamic Cluster Membership — Developer Guide
 
-Welcome! This guide is for the next developer who has to **use, support, or extend** Kommander's
-dynamic membership system. It explains not just *how* the pieces work but *why* they were built this
-way, so when something misbehaves at 3 a.m. you understand the model well enough to reason about it.
+This guide is for developers who **use, support, or extend** Kommander's dynamic membership
+system. It explains *how* the pieces work and *why* they were built this way.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why this design? Motivations & advantages](#why-this-design-motivations--advantages)
+2. [Design rationale](#design-rationale)
 3. [Core concepts](#core-concepts)
 4. [The API surface](#the-api-surface)
 5. [Lifecycle walkthroughs](#lifecycle-walkthroughs)
-6. [Catch-up: how a new node gets up to date](#catch-up-how-a-new-node-gets-up-to-date)
+6. [New-node catch-up](#new-node-catch-up)
 7. [Failure detection (SWIM)](#failure-detection-swim)
 8. [Configuration reference](#configuration-reference)
-9. [Code map — where everything lives](#code-map--where-everything-lives)
+9. [Code map](#code-map)
 10. [Transport support matrix](#transport-support-matrix)
 11. [Operations runbook](#operations-runbook)
 12. [Troubleshooting](#troubleshooting)
@@ -29,7 +28,7 @@ way, so when something misbehaves at 3 a.m. you understand the model well enough
 ## Summary
 
 A Kommander cluster keeps a single **roster** — the authoritative list of who belongs to the cluster
-and in what role. The roster is not gossiped state or a config file; it is a **committed Raft record**
+and in what role. The roster is a **committed Raft record**
 living on the system partition (P0), versioned by `MembershipVersion`.
 
 Membership changes one node at a time through three operations — **AddMember**, **PromoteMember**,
@@ -39,7 +38,7 @@ toward quorum.
 
 On top of that sits a **gossip + SWIM** layer that spreads the roster faster and detects dead nodes —
 but it is strictly advisory. It can *recommend* a removal; only the P0 leader, through a committed
-`RemoveMember`, ever actually changes who can vote.
+`RemoveMember`, ever changes who can vote.
 
 That separation — **truth by consensus, dissemination by gossip** — is the whole design in one
 sentence.
@@ -59,11 +58,9 @@ sentence.
 
 ---
 
-## Why this design? Motivations & advantages
+## Design rationale
 
-If you only read one section to "get" the system, read this one.
-
-### The problem we started with
+### Original static membership
 
 Originally a cluster's member set was **static for the process lifetime**. The only source of peers
 was `IDiscovery`: `ClusterHandler.UpdateNodes()` did `manager.Nodes = discovery.GetNodes()` wholesale,
@@ -78,13 +75,12 @@ on a timer. That peer set fed quorum math directly. This made runtime membership
 - **No failure-driven removal.** A permanently dead voter degraded availability until an operator
   hand-edited discovery.
 
-### The design choices, and what each buys you
+### Design choices
 
-**1. The roster is consensus-anchored (committed on P0), not gossip-authoritative.**
-Membership is the one piece of state where disagreement is catastrophic — it's the denominator of
-every quorum. So we make it the *most* strongly consistent thing in the system, not the least. By
-storing the roster exactly like the partition map (same commit path, same versioning), it inherits
-P0's linearizability for free.
+**1. The roster is committed on P0.**
+Membership is the denominator of every quorum, so disagreement about it breaks safety. The roster is
+stored exactly like the partition map (same commit path, same versioning) and inherits P0's
+linearizability.
 *Advantage:* every node that has applied version *N* of the roster agrees on exactly who can vote.
 There is no window where two nodes compute quorum from different member sets.
 
@@ -94,12 +90,12 @@ A joining node receives replication but is excluded from quorum until it has nea
 throughout. And a far-behind node can never win an election to truncate history, because it isn't a
 voter and (belt and suspenders) Learners are gated out of campaigning entirely.
 
-**3. Changes are single-server (one node at a time), not joint consensus.**
-Raft offers two ways to change membership: joint consensus (Cold,new) or single-server changes. We
-chose single-server: add/promote/remove exactly one member per committed step.
+**3. Changes are single-server (one node at a time).**
+Raft offers two ways to change membership: joint consensus (Cold,new) or single-server changes. Kommander
+uses single-server: add/promote/remove exactly one member per committed step.
 *Advantage:* any two consecutive configurations differ by one member and therefore **always share a
 majority** — no two disjoint quorums can both commit. This gives the core safety guarantee with far
-less machinery than joint consensus, which is notoriously fiddly to implement correctly.
+less machinery than joint consensus.
 
 **4. `MembershipVersion` is an optimistic-concurrency fence.**
 Every change request carries the version it was computed against. The P0 leader rejects it
@@ -108,21 +104,20 @@ Every change request carries the version it was computed against. The P0 leader 
 *Advantage:* concurrent or racing membership operations are detected and serialized instead of
 silently clobbering each other — the same discipline the partition map already uses (`MapVersion`).
 
-**5. Gossip disseminates; it never decides.**
+**5. Gossip spreads committed rosters and reports failures.**
 The SWIM/gossip layer spreads the roster epidemically (so a node learns of a change in O(log N)
 rounds instead of waiting for Raft replication to reach it) and detects unreachable nodes. But it only
 ever carries *already-committed* rosters, and a `Dead` verdict is advisory input to the P0 leader.
 *Advantage:* you get fast, decentralized convergence and automatic failure handling **without** ever
 letting an eventually-consistent signal change who can commit. The quorum can't be corrupted by a
-malicious or buggy gossip message because gossip simply isn't on the path that decides quorum.
+malicious or buggy gossip message because gossip isn't on the path that decides quorum.
 
 **6. Discovery is demoted to seed contact.**
-`IDiscovery` is used to find *bootstrap contact points* and to seed the *initial* greenfield roster —
-not as the live membership authority.
+`IDiscovery` only finds *bootstrap contact points* and seeds the *initial* greenfield roster.
 *Advantage:* you can run on static discovery, Redis, multicast, or nothing at all (seed endpoints),
 and the membership semantics are identical because none of them are trusted for live membership.
 
-### The one-line summary of advantages
+### Summary of advantages
 
 | Property | How the design delivers it |
 |---|---|
@@ -189,10 +184,10 @@ public sealed class ClusterMember
   role back to `Voter`. Only one member may be `Leaving` at a time. (`LeaveCluster` also reports
   `LocalRole == Leaving` locally via a latch, without any committed role change, once its attempt
   to commit the removal has ended and teardown is next — that variant does not drain.)
-- **NotMember** — not a stored role; it's the value `RaftManager.LocalRole` returns when the local
-  node isn't in the committed roster at all.
+- **NotMember** — the value `RaftManager.LocalRole` returns when the local node isn't in the
+  committed roster at all. It is never stored.
 
-### Two layers, one strict contract
+### Consensus and gossip layers
 
 - **Layer 1 — Truth (consensus).** The committed roster on P0. Mutated only by `AddMember`,
   `PromoteMember`, `RemoveMember`, each going through the P0 leader's Raft log.
@@ -204,7 +199,7 @@ public sealed class ClusterMember
 The invariant that makes the whole thing safe: **quorum is computed only from committed voters.**
 Gossip, discovery, and learner presence never change quorum.
 
-### The system partition (P0) is special
+### Membership commits on the system partition (P0)
 
 All membership mutations commit on P0 (`RaftSystemConfig.SystemPartition == 0`). User partitions
 (P1, P2, …) are independent — you can keep writing to them while a join or removal is in progress,
@@ -384,8 +379,7 @@ added to move those ranges off it (Kahuna nightly, 2026-10-11, 2026-10-13 and 20
 > ⚠️ **Rolling-upgrade hazard:** a peer running a pre-drain version drops `Leaving` members from
 > its peer list (its `UpdateNodes` filter predates the role), which severs replication to the
 > draining node and wedges the drain. The drain's role-transition RPC (`SetMemberRole`) also does
-> not exist on old peers — it fails loudly there rather than silently degrading into an undrained
-> removal. Do not start a decommission drain against a mixed-version cluster.
+> not exist on old peers — it fails loudly there. Do not start a decommission drain against a mixed-version cluster.
 
 ---
 
@@ -474,7 +468,7 @@ versions, so it must be able to read its own eviction off whichever roster reach
 
 ---
 
-## Catch-up: how a new node gets up to date
+## New-node catch-up
 
 A Learner (or any follower whose log trails the leader) is caught up by **bounded log backfill**: the
 leader detects the follower's reported `MaxLogId` is below `commitIndex - BackfillThreshold` and ships
@@ -498,7 +492,7 @@ Kommander uses a SWIM-style detector to find crashed or partitioned nodes withou
 1. **Direct probe.** Each node periodically sends a `Ping` to one random peer.
 2. **Indirect probe.** If the direct ping times out (`PingTimeout`), the prober asks up to
    `IndirectPingFanout` other peers to relay a probe (`PingReq`) — this rules out a transient path
-   failure between just those two nodes.
+   failure between those two nodes.
 3. **Suspect.** If direct *and* all indirect probes fail, the target is marked `Suspect`.
 4. **Dead.** A `Suspect` that stays unreachable for `SuspicionTimeout` becomes `Dead`.
 5. **Evict.** Once `Dead` for `DeadMemberEvictionGrace`, the **P0 leader** (and only the P0 leader)
@@ -552,7 +546,7 @@ All on `RaftConfiguration`. Defaults shown are the current code defaults.
 
 ---
 
-## Code map — where everything lives
+## Code map
 
 When you need to change or debug membership, start here.
 
@@ -565,7 +559,7 @@ When you need to change or debug membership, start here.
   (`Requested | Evicted`); written by `TryRemoveMember` from the request's `RemovalReason`, read
   by `ClusterLeaveService` to decide whether an exclusion voids a leave request.
 
-### The commit path & drivers (the brain)
+### Commit path and drivers
 - `Kommander/System/RaftSystemCoordinator.cs`:
   - `TryAddMember` / `TryPromoteMember` / `TryRemoveMember` — the single-server mutations (validate
     version, mutate, bump, replicate). `TryRemoveMember` holds the `InsufficientVoters` guard and
@@ -626,7 +620,7 @@ When you need to change or debug membership, start here.
 
 ## Transport support matrix
 
-This is the most important table for avoiding surprises. "Wired" means the RPC actually crosses the
+"Wired" means the RPC crosses the
 network; "stub" means it returns a default and the feature is inert (or worse) on that transport.
 
 | Capability | InMemory | gRPC | REST |
@@ -704,8 +698,7 @@ operator checks.
 
 ## Invariants you must not break
 
-If you edit this subsystem, these are the load-bearing rules. Breaking one risks split-brain or lost
-commits.
+Breaking any of these rules risks split-brain or lost commits.
 
 1. **Quorum is computed only from committed voters.** Never let Learners, `Leaving` members, gossip,
    or discovery into the quorum denominator. (This bug has happened before — Learners were briefly
@@ -741,7 +734,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~
 > false failures. One suite at a time.
 
 When you change shared scheduling, WAL, partition state, or cluster coordination, run the full
-project, not just a filter.
+test project.
 
 ---
 

@@ -3,7 +3,7 @@
 This guide explains how Kommander stops an **idle partition** from wasting network and CPU on
 keep-alive traffic: the **quiescence** feature. It is written for two readers — someone who wants to
 *understand* why idle partitions go quiet, and someone who wants to *extend or debug* it. No prior Raft
-expertise is assumed; we build the idea up first, then walk the real flows and the code.
+expertise is assumed.
 
 Quiescence builds directly on the SWIM failure detector documented in the
 [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md) — read its
@@ -14,14 +14,14 @@ Quiescence builds directly on the SWIM failure detector documented in the
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why quiescence exists (the problem)](#why-quiescence-exists-the-problem)
-3. [The two jobs of a heartbeat](#the-two-jobs-of-a-heartbeat)
+2. [Per-partition heartbeat cost](#per-partition-heartbeat-cost)
+3. [Node liveness and partition leadership](#node-liveness-and-partition-leadership)
 4. [Core concepts](#core-concepts)
 5. [Flow 1 — A leader quiesces an idle partition](#flow-1--a-leader-quiesces-an-idle-partition)
 6. [Flow 2 — A quiesced follower stays calm](#flow-2--a-quiesced-follower-stays-calm)
 7. [Flow 3 — A write wakes the partition](#flow-3--a-write-wakes-the-partition)
 8. [Flow 4 — Failover when a quiesced leader dies](#flow-4--failover-when-a-quiesced-leader-dies)
-9. [The timing rule that keeps failover fast](#the-timing-rule-that-keeps-failover-fast)
+9. [Failover timing rule](#failover-timing-rule)
 10. [Configuration](#configuration)
 11. [Code map](#code-map)
 12. [Invariants you must not break](#invariants-you-must-not-break)
@@ -47,7 +47,7 @@ every interval, *carrying no data* — pure overhead that grows with the partiti
 > partitions it leads. The moment a write arrives (or the leader's node looks dead), the partition
 > **wakes up** and normal Raft resumes.
 
-The key insight: *"the leader is still alive"* is a fact about the **node**, not about each partition.
+*"The leader is still alive"* is a fact about the **node**.
 If node A leads 500 partitions, it shouldn't send 500 separate "still alive" messages to node B — SWIM
 already tells B that A is alive, once.
 
@@ -61,38 +61,33 @@ already tells B that A is alive, once.
 
 ---
 
-## Why quiescence exists (the problem)
+## Per-partition heartbeat cost
 
 Heartbeats in Kommander are **per-partition**. Each leader, on every leadership-check tick, sends an
 `AppendLogs` heartbeat to each follower of each partition it leads. A follower resets its election timer
 only when it receives *that partition's* heartbeat. So an idle 50-partition leader talking to two
 followers emits ~100 heartbeats per interval to say one thing 100 times: "I'm up."
 
-You cannot fix this by simply coalescing heartbeats ("one message proves liveness for all
-partitions") — an earlier attempt to do exactly that caused a **leader-flapping bug**, because one
+Coalescing heartbeats ("one message proves liveness for all partitions") is unsafe — an earlier attempt to do exactly that caused a **leader-flapping bug**, because one
 partition's heartbeat suppressed every other partition's, starving followers into perpetual elections.
-The reason that naive coalescing is unsafe is the subject of the next section.
 
-Quiescence takes a different route: instead of sending the keep-alive more cleverly, it **stops sending
-it at all** when there's nothing to keep alive, and falls back to a liveness signal that is *already*
+Quiescence **stops the keep-alive** when there's nothing to keep alive, and falls back to a liveness signal that is *already*
 node-scoped — SWIM.
 
 ---
 
-## The two jobs of a heartbeat
+## Node liveness and partition leadership
 
-This is the idea everything else hangs on. A Raft heartbeat quietly does **two** different jobs, and
-only one of them is about the node:
+A Raft heartbeat has a node-scoped job and a partition-scoped job:
 
 | Heartbeat job | Scope | Can SWIM cover it? |
 |---|---|---|
 | "This node is alive / reachable" | **node** | **Yes** — SWIM already does exactly this, once per node |
 | "I am still the leader of *this partition* in term *T*; suppress your election timer" | **partition** | **No** — leadership is per-partition; A can lead P1 but follow P5 |
 
-So we can't replace per-partition leadership assertion with a node ping — that's the part that must stay
-per-partition. But we *can* **avoid sending it when there's nothing to assert** (the partition is idle),
-and back the followers with the node-level detector so they stay calm while the leader's node is alive.
-That's quiescence.
+A node ping cannot replace the per-partition leadership assertion. Quiescence **stops sending the
+assertion while the partition is idle** and lets followers rely on the node-level detector while the
+leader's node is alive.
 
 ---
 
@@ -131,8 +126,7 @@ still quiesces `QuiesceAfter` later — the common case), and refreshed on every
 When the conditions are met, the leader does two things, once:
 
 1. Sends a **quiesce marker** — one final `AppendLogs` with `Quiesce = true` — to every follower. This
-   is a *deterministic handoff*: followers learn to quiesce at a known index/term rather than each
-   guessing from silence.
+   is a *deterministic handoff*: followers learn to quiesce at a known index/term.
 2. Sets its own `quiesced = true` and **stops emitting** that partition's periodic heartbeats.
 
 ```
@@ -142,7 +136,7 @@ When the conditions are met, the leader does two things, once:
      then: stop sending heartbeats for this partition
 ```
 
-The leader is still the leader — it still answers reads and will replicate the next write. It simply
+The leader is still the leader — it still answers reads and will replicate the next write. It
 stops the keep-alive chatter.
 
 ---
@@ -161,19 +155,17 @@ SWIM one question: *is the node I believe leads this partition still `Alive`?*
      else (Suspect or Dead)                 → un-quiesce and start a pre-vote election
 ```
 
-The peer check comes first because SWIM answers *is the node up?*, not *does it still host this
-range?* A leader whose replica was removed from the range (a placement trim of the leader) keeps
+The peer check comes first because SWIM reports only node liveness. A leader whose replica was removed from the range (a placement trim of the leader) keeps
 answering pings; on liveness alone every quiesced follower stayed calm and denied every pre-vote, and
 the range had no leader until a write woke it — which never came, because every read was redirected
 to the departed leader (Kahuna 1.12.7, 2026-10-18). The same peer check exempts the pre-vote deny
 gate. The map application that drops a partition's known leader from its replica set also puts the
-partition back in the hot set, so the tick that notices the vacancy runs within `CheckLeaderInterval`
-rather than at the next safety sweep (`UpdateNodesInterval`).
+partition back in the hot set, so the tick that notices the vacancy runs within `CheckLeaderInterval`,
+before the next safety sweep (`UpdateNodesInterval`).
 
-So a quiesced follower will sit silently through any amount of per-partition silence, as long as SWIM
-says the leader's node is up. It only challenges leadership when the **node** actually looks gone. This
-is why the leader can stop heartbeating without triggering spurious elections — exactly the failure mode
-the old naive coalescing caused.
+A quiesced follower stays silent through any amount of per-partition silence while SWIM says the
+leader's node is up, and challenges leadership only when the **node** looks gone. The leader can
+therefore stop heartbeating without the spurious elections that the old coalescing caused.
 
 ---
 
@@ -186,7 +178,7 @@ Quiescence is invisible to clients. The instant real work arrives, the partition
   (`Quiesce = false`).
 - **Follower side:** receiving *any* `AppendLogs` whose `Quiesce` flag is false clears the follower's
   `quiesced` flag and resets its heartbeat timer. (A quiesce marker sets it; any normal append clears
-  it — the follower simply mirrors the flag on the message.)
+  it — the follower mirrors the flag on the message.)
 
 ```
    client ──write──► leader
@@ -220,8 +212,7 @@ Because a quiesced follower watches SWIM, the failover path is:
    new leader elected; partition resumes (un-quiesced)
 ```
 
-The follower un-quiesces on **`Suspect`**, not on the slower `Dead` — see the next section for why that
-matters.
+The follower un-quiesces on **`Suspect`**, which arrives before `Dead`; the next section explains why.
 
 > **Documented limitation:** if the leader's *node* stays alive (still answering SWIM pings) but stops
 > driving one *specific* partition (e.g. that partition's executor wedges), quiesced followers will not
@@ -243,28 +234,28 @@ window. A leader cut off from its voters gets no answer and steps down when the 
 elapses, the same bound as a non-quiesced leader. Followers handle the probe as they handle any
 forced heartbeat: they leave quiescence on the append and re-enter it on the next quiesce marker.
 
-## The timing rule that keeps failover fast
+## Failover timing rule
 
-There is one **safety-relevant timing constraint**, and it's worth understanding because misconfiguring
-it would silently slow failover (or break it).
+There is one **safety-relevant timing constraint**. A misconfiguration of it silently slows or breaks
+failover.
 
 SWIM has two relevant moments after a leader dies:
 
 - **`Suspect`** — fires after roughly one `PingInterval` of failed probes (fast).
 - **`Dead`** — fires `SuspicionTimeout` *after* `Suspect` (slow; the default `SuspicionTimeout` is 5s).
 
-Quiesced followers deliberately trigger failover on **`Suspect`**, so detection is on the order of
-`PingInterval`, not `SuspicionTimeout`. For this to actually beat a normal election, SWIM's fast signal
+Quiesced followers deliberately trigger failover on **`Suspect`**, so detection time scales with
+`PingInterval`. For this to beat a normal election, SWIM's fast signal
 must arrive before the election timer would have fired anyway. Kommander enforces that at startup:
 
 > **`PingInterval < StartElectionTimeout`** — validated in `RaftConfiguration.Validate()`; the
 > constructor throws if violated.
 
-There is a second, more fundamental guard:
+Quiescence also requires SWIM:
 
 > **`EnableQuiescence` requires `PingInterval > 0`** — quiescence depends on SWIM. With SWIM disabled
 > (`PingInterval = 0`), a quiesced follower could never notice a dead leader and could never fail over.
-> `Validate()` rejects this combination so the footgun is caught at construction, not in production.
+> `Validate()` rejects this combination so the misconfiguration fails at construction.
 
 Both checks are skipped when `EnableQuiescence = false`, so the classic per-partition heartbeat model is
 always available as a clean off-switch.
@@ -278,7 +269,7 @@ always available as a clean off-switch.
 | `EnableQuiescence` | `true` | Master switch. `false` restores per-partition heartbeating on every interval, independent of idle time. |
 | `QuiesceAfter` | `1500 ms` | How long a partition must be idle (no proposals, no in-flight replication) before its leader quiesces it. ≈ 3× `HeartbeatInterval`. |
 
-Quiescence reuses the existing SWIM knobs rather than adding its own failure detector:
+Quiescence reuses the existing SWIM knobs:
 
 | Key | Default | Role in quiescence |
 |---|---|---|
@@ -317,9 +308,8 @@ detection (at the cost of more SWIM probe traffic). The defaults are valid out o
 - **Quiescence is local, never replicated.** The `quiesced` flag and `lastProposalAt` are per-node
   decisions. Never put them in the log or make a quiesce decision depend on another node's quiesce
   state — that would couple safety to a local optimization.
-- **A quiesced follower must still fail over.** It gates elections on SWIM `Suspect` (≠ `Alive`), not on
-  `Dead`. Keep `PingInterval < StartElectionTimeout` so this is no slower than a normal election.
-- **Liveness is not hosting.** A leader that left the partition's replica set is vacated even while its
+- **A quiesced follower must still fail over.** It gates elections on SWIM `Suspect` (≠ `Alive`). Keep `PingInterval < StartElectionTimeout` so this is no slower than a normal election.
+- **Check hosting before liveness.** A leader that left the partition's replica set is vacated even while its
   node is `Alive`. Both quiesced gates (the follower tick and the pre-vote deny) check peer membership
   before SWIM; keep that order.
 - **Quiescence requires SWIM.** `EnableQuiescence = true` with `PingInterval <= 0` is rejected at
@@ -353,11 +343,11 @@ Quiescence is covered at two layers:
     elections — the headline regression test);
   - the per-partition heartbeat counter (`raft.heartbeats_sent_total`) stops advancing after quiesce;
   - a write after quiesce un-quiesces, commits, and replicates to all nodes;
-  - a partitioned quiesced leader is replaced **well before `SuspicionTimeout`** (proving failover is
-    `Suspect`-driven, not `Dead`-driven);
+  - a partitioned quiesced leader is replaced **well before `SuspicionTimeout`** (proving that
+    `Suspect` drives failover);
   - feature-flag parity: with `EnableQuiescence = false`, heartbeats keep coming.
 
-Tests that deliberately disable SWIM (`PingInterval = 0`) or use very fast election timeouts set
+Tests that deliberately disable SWIM (`PingInterval = 0`) or use fast election timeouts set
 `EnableQuiescence = false`, since quiescence depends on SWIM and on the `PingInterval < StartElectionTimeout`
 invariant.
 

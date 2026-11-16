@@ -1,8 +1,8 @@
 # Per-Partition Log-Replication Rate Signal — Developer Guide
 
-Welcome! This guide is for the developer or operator who wants to **use or understand** Kommander's
-per-partition *log-replication rate* signal — the measurement that answers *"is this partition hot
-with work that splitting it could relieve?"* It assumes you know roughly what Kommander is (a
+This guide is for the developer or operator who wants to **use or understand** Kommander's
+per-partition *log-replication rate* signal — the measurement of whether a partition is hot
+with work that a split could relieve. It assumes you know roughly what Kommander is (a
 Raft-based distributed system with many partitions, each with its own leader) but **no prior knowledge
 of this signal**.
 
@@ -17,15 +17,15 @@ If you are brand new to Kommander, start with the [Architecture Overview](archit
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Why "operations per second" alone misleads](#why-operations-per-second-alone-misleads)
+2. [Limits of operations per second](#limits-of-operations-per-second)
 3. [Core concepts](#core-concepts)
-4. [The three signals, and how to read them together](#the-three-signals-and-how-to-read-them-together)
-5. [Reading it: the API](#reading-it-the-api)
-6. [Using it: what you must enable](#using-it-what-you-must-enable)
+4. [Combining the three signals](#combining-the-three-signals)
+5. [API](#api)
+6. [Required configuration](#required-configuration)
 7. [The consumer contract](#the-consumer-contract)
 8. [Observability](#observability)
-9. [Safety: what this can and cannot do](#safety-what-this-can-and-cannot-do)
-10. [Code map — where everything lives](#code-map--where-everything-lives)
+9. [Safety](#safety)
+10. [Code map](#code-map)
 11. [FAQ](#faq)
 
 ---
@@ -54,10 +54,10 @@ component (typically the embedding application's split policy) about where the h
 
 ---
 
-## Why "operations per second" alone misleads
+## Limits of operations per second
 
-It's tempting to trigger a split when `LogOpsPerSecond` crosses some threshold. That's a trap, because
-**throughput plateaus at the bottleneck.**
+A threshold on `LogOpsPerSecond` alone is a poor split trigger, because **throughput plateaus at the
+bottleneck.**
 
 For most workloads the bottleneck is the **fsync** — flushing the write to durable storage. Once a
 partition is fsync-bound, it commits at a fixed ceiling. A partition offered 1.1× its capacity and one
@@ -87,8 +87,8 @@ split relieves.
 An operation that flows through the leader's Raft log — an append that gets replicated and committed.
 In Kommander these are `ReplicateLogs` operations. This is what `LogOpsPerSecond` counts.
 
-### Path, not label
-The signal is defined by the **path an operation takes**, not by a read/write label. Only operations
+### Log-routed operations only
+The signal counts operations by the **path they take**. Only operations
 that go *through the log* count. A read served directly from the leader's in-memory state — one that
 appends no log entry — does **not** count, because splitting the partition wouldn't relieve it (it
 never touched the bottlenecked log pipeline in the first place). For most applications "log-routed"
@@ -97,12 +97,12 @@ too — correctly, because they consume the same serialized-commit capacity a sp
 
 A useful consequence: the signal is **leader-only by nature**. Only a leader issues `ReplicateLogs`; a
 follower applying replicated entries does so through a different path that isn't counted. So a
-follower's local rate for a partition it doesn't lead is naturally `0` — that's expected, not a bug.
+follower's local rate for a partition it doesn't lead is `0`, as expected.
 
 ### The rate is a smoothed average (EWMA)
 `LogOpsPerSecond` is an **exponentially weighted moving average** — it reacts to sustained traffic,
 ignores momentary blips, and decays toward zero on its own when a partition goes idle (half-life
-≈ 7 seconds). You're seeing recent, smoothed behavior, not an instantaneous tick or a lifetime total.
+≈ 7 seconds). The value shows recent, smoothed behavior.
 
 ### WAL queue depth
 The number of write operations queued for a partition in the WAL scheduler — its backlog. Because
@@ -118,7 +118,7 @@ overload) but resolves finer — use it only if depth alone is too coarse for yo
 
 > **Sticky when idle.** Unlike rate and depth, the wait estimate does **not** fall back to zero on its
 > own when a partition goes quiet — it holds its last value until the next write batch updates it. So a
-> high `CommitWaitMs` on a partition that has since gone idle is stale, not current. Never act on it
+> high `CommitWaitMs` on a partition that has since gone idle is stale. Never act on it
 > alone; always gate on `LogOpsPerSecond` (which *does* decay to ≈0 when idle) so a stale wait can't
 > trigger anything.
 
@@ -134,7 +134,7 @@ This means `0` is **ambiguous**: it could be "genuinely idle" or "not seen yet."
 that's fine, because both mean "not hot." If you need to distinguish them, check whether a report from
 the leader exists at all before trusting a `0`.
 
-### The group-commit caveat (read this before you act)
+### Group-commit caveat
 Kommander's WAL scheduler performs **cross-partition group commit**: when several partitions have
 writes ready, it flushes them together in **one fsync** (for RocksDB, a single shared write-ahead log
 across column families, batching up to a few hundred operations at a time). This has a critical
@@ -144,12 +144,12 @@ consequence for splitting:
 > still share the one fsync. It only adds consensus overhead. A split relieves an fsync bottleneck
 > **only when the new partition's leader lands on a different node** (a different disk / fsync path).
 
-So this signal answers *"is partition P hot?"* — it does **not** decide *where the relief should go.*
-Whoever consumes it must place the new leader on a different node, or the split is pointless.
+So this signal tells whether partition P is hot. The consumer must place the new leader on a
+different node, or the split is pointless.
 
 ---
 
-## The three signals, and how to read them together
+## Combining the three signals
 
 | Signal | What it measures | Saturates? | Idle behavior | Use it for |
 |---|---|---|---|---|
@@ -170,7 +170,7 @@ The intended reading (using depth as the saturation signal):
 
 ---
 
-## Reading it: the API
+## API
 
 All three accessors live on `IRaft` and can be called on **any** node for **any** partition:
 
@@ -191,17 +191,17 @@ Each accessor resolves the value the same way:
    the in-process measurement — no gossip lag, always available.
 2. **Remote path.** Otherwise the value comes from the most recent gossiped load report from the node
    that currently leads the partition. This trails reality by up to one report interval plus gossip
-   propagation (see [Using it](#using-it-what-you-must-enable)).
+   propagation (see [Required configuration](#required-configuration)).
 3. **Sentinel.** If neither applies, you get `0` (see [the `0` sentinel](#the-0-sentinel)).
 
 Across a leadership handoff a partition can briefly appear in two nodes' reports (the old leader's and
 the new one's). The accessor resolves this by preferring the report from the node the cluster
 *currently* considers the leader, falling back to the freshest report by logical-clock time — so you
-get the current leader's value, not a stale predecessor's.
+get the current leader's value.
 
 ---
 
-## Using it: what you must enable
+## Required configuration
 
 The **local fast-path always works** — a node can always read the live values for partitions it leads.
 
@@ -212,7 +212,7 @@ balancer's reporting is turned on:
 > **`EnableLeaderBalancer = true`** in their `RaftConfiguration`. With it off, no load reports are
 > built or gossiped, so every remote query returns the `0` sentinel forever.
 
-This is the single most common "why is it always zero?" cause. If you want cluster-wide visibility of
+A disabled balancer is the most common cause of a remote value that is always zero. If you want cluster-wide visibility of
 the signal, enable the balancer's reporting on your nodes.
 
 Once enabled, the freshness of remote values is governed by the same knobs the balancer uses:
@@ -224,19 +224,19 @@ Once enabled, the freshness of remote values is governed by the same knobs the b
 | `LeaderBalancerReportTtl` | `20s` | A report older than this is dropped; a silent node's values disappear (return `0`). |
 
 Net staleness of a remote value is one `GossipInterval` or more, because reports are not forwarded, layered on
-top of the rate's ≈7s smoothing half-life. In practice a remote reader reacts on the order of ~10
-seconds, not instantly. Plan your consumer's reaction window accordingly.
+top of the rate's ≈7s smoothing half-life. In practice a remote reader reacts in about 10
+seconds. Plan your consumer's reaction window accordingly.
 
 ---
 
 ## The consumer contract
 
 If you build something on top of this signal (for example, a split trigger in your application), follow
-these rules. Kommander measures and exposes — it does **not** enforce these for you.
+these rules. Kommander measures and exposes the signal; your consumer enforces the rules.
 
 1. **Combine rate and saturation.** Trigger on **high `LogOpsPerSecond` AND a sustained saturation
    signal** (`WalQueueDepth`, optionally `CommitWaitMs`) — never on rate alone. Rate plateaus at the
-   fsync ceiling and cannot, by itself, tell an overloaded partition from a merely busy one. Prefer
+   fsync ceiling and cannot, by itself, tell an overloaded partition from a busy one. Prefer
    `WalQueueDepth` (self-clearing); if you use `CommitWaitMs`, remember it is sticky when idle, so the
    `LogOpsPerSecond` half of this AND-condition is what protects you from acting on a stale wait.
 2. **Debounce.** A remote value lags by up to a report interval plus gossip propagation. Require the
@@ -252,8 +252,8 @@ these rules. Kommander measures and exposes — it does **not** enforce these fo
 
 ## Observability
 
-There is **no dedicated metric** for `LogOpsPerSecond` or `CommitWaitMs` — they are exposed through the
-`IRaft` accessors and the gossiped report, not as counters or gauges. Read them programmatically via
+There is **no dedicated metric** for `LogOpsPerSecond` or `CommitWaitMs` — they are exposed only through the
+`IRaft` accessors and the gossiped report. Read them programmatically via
 `GetPartitionLogOpsPerSecond` / `GetPartitionCommitWaitMs`.
 
 The WAL backlog, however, is already a published metric under the `Kommander` meter (consumable via
@@ -269,11 +269,11 @@ partition's `LogOpsPerSecond` (via the accessor) to confirm the rate has plateau
 
 ---
 
-## Safety: what this can and cannot do
+## Safety
 
 This signal is **purely advisory and read-only with respect to committed truth.**
 
-- It is a *measurement*, not an actuator. Reading it changes nothing about partitions, leadership, or
+- It is a read-only *measurement*. Reading it changes nothing about partitions, leadership, or
   the log.
 - A stale, missing, or imprecise value can at worst cause a *consumer* to make a suboptimal split
   decision (or none) — it can never violate Raft safety, because it never participates in consensus.
@@ -281,12 +281,12 @@ This signal is **purely advisory and read-only with respect to committed truth.*
   never written to the Raft log and never durable.
 - The `0` sentinel guarantees an "unknown" reads as "not hot," so missing data fails safe.
 
-In short: the only failure modes are "didn't notice a hot partition" or "thought a partition was
-hotter/cooler than it was," and both are the consumer's concern, not a correctness risk.
+The only failure modes are "didn't notice a hot partition" or "thought a partition was
+hotter/cooler than it was," and both are consumer concerns with no correctness risk.
 
 ---
 
-## Code map — where everything lives
+## Code map
 
 | Concern | Where |
 |---|---|
@@ -309,7 +309,7 @@ A good reading order: `PartitionLoadAccumulator` (how a rate is measured) → `R
 
 ## FAQ
 
-**Why not just split when `LogOpsPerSecond` is high?**
+**Why not split when `LogOpsPerSecond` is high?**
 Because throughput plateaus at the fsync ceiling, so a maxed-out partition and a wildly overloaded one
 look identical on rate. A saturation signal (`WalQueueDepth`, or `CommitWaitMs`) is what distinguishes
 them. Use rate plus one of those, never rate alone.
@@ -321,9 +321,9 @@ pressure measure but is **sticky when idle** (it holds its last value until the 
 always be paired with `LogOpsPerSecond` so a stale wait on a now-idle partition can't trigger anything.
 
 **I always get `0` for partitions another node leads. Why?**
-Almost certainly `EnableLeaderBalancer` is off, so no load reports are gossiped. The local fast-path
+The usual cause is that `EnableLeaderBalancer` is off, so no load reports are gossiped. The local fast-path
 still works for partitions *this* node leads; the remote path needs reporting enabled. See
-[Using it](#using-it-what-you-must-enable).
+[Required configuration](#required-configuration).
 
 **Is `0` "idle" or "no data"?**
 It can be either — the sentinel is intentionally ambiguous, and for a split decision both mean "not
@@ -335,12 +335,12 @@ No. It's a measurement only. It never participates in consensus and never mutate
 **Will splitting a hot partition always help?**
 Only if the new leader lands on a **different node**. fsync is shared across partitions on a node
 (group commit), so splitting in place relieves no capacity. The signal tells you *whether* a partition
-is hot, not *where* to put the relief — that placement is the consumer's responsibility.
+is hot; placement of the relief is the consumer's responsibility.
 
 **Why is a follower's rate for a partition zero even under heavy load?**
 The rate is leader-only by nature: only the leader's log-append path is counted. A follower applying
-replicated entries doesn't increment the rate. Ask the leader (or read the gossiped value), not a
-follower's local view.
+replicated entries doesn't increment the rate. Ask the leader, or read the
+gossiped value.
 
 **How fresh is a remote value?**
 One `GossipInterval` (default 5s) or more, because reports are not forwarded, on top of the rate's ≈7s
