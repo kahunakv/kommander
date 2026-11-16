@@ -358,16 +358,22 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Returns the metadata <see cref="SqliteConnection"/>, creating it on first access.
-    /// Must be called with <see cref="_metaDataLock"/> already held. Throws once the WAL is disposed,
-    /// so a late call can never reopen the metadata DB (callers that report a status check
-    /// <see cref="disposed"/> first).
+    /// Must be called with <see cref="_metaDataLock"/> already held. Throws instead of opening a new
+    /// connection once the WAL is disposed, so a late call can never reopen the metadata DB (callers
+    /// that report a status check <see cref="disposed"/> first).
+    /// <para>The disposed check sits below the open-connection return on purpose.
+    /// <see cref="Dispose"/> sets <see cref="disposed"/> before it takes <see cref="_metaDataLock"/>,
+    /// so the flag can turn true while a caller already holds the lock. That caller still has an open
+    /// connection, because <see cref="Dispose"/> closes it only under the lock, and it must finish on
+    /// it. A second check here failed such a call, and <see cref="SetMetaData"/> logged the
+    /// <see cref="ObjectDisposedException"/> as a storage error.</para>
     /// </summary>
     private SqliteConnection TryOpenMetaDataDatabase()
     {
-        ThrowIfDisposed();
-
         if (metaDataConnection is not null)
             return metaDataConnection;
+
+        ThrowIfDisposed();
 
         // The metadata DB can be opened before any shard, so the directory guard is needed on both
         // entry points, not just the shard one.
