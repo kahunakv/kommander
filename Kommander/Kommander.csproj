@@ -5,11 +5,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
-    <TargetFrameworks>net8.0;net10.0;net8.0-browser;net10.0-browser</TargetFrameworks>
+    <TargetFrameworks>net8.0;net10.0;net11.0;net8.0-browser;net10.0-browser;net11.0-browser</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.14.1</Version>
+    <Version>1.15.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -40,6 +40,12 @@
     <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
   </PropertyGroup>
 
+  <!-- True for net11.0, net11.0-browser and any later target. The package references that change
+       from .NET 11 use this property. -->
+  <PropertyGroup>
+    <KommanderNet11OrLater>$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net11.0'))</KommanderNet11OrLater>
+  </PropertyGroup>
+
   <PropertyGroup Condition="$(TargetFramework.EndsWith('-browser'))">
     <DefineConstants>$(DefineConstants);KOMMANDER_THREAD_FREE</DefineConstants>
   </PropertyGroup>
@@ -64,8 +70,11 @@
     <PackageReference Include="Flurl" Version="4.0.0" />
     <PackageReference Include="Flurl.Http" Version="4.0.2" />
 
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
-    <PackageReference Include="System.IO.Hashing" Version="10.0.14" />
+    <!-- .NET 11 ships this assembly in Microsoft.NETCore.App, and the SDK warns (NU1510) when a
+         net11.0 target references the package. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" Condition="'$(KommanderNet11OrLater)' != 'true'" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.14" Condition="'$(KommanderNet11OrLater)' != 'true'" />
+    <PackageReference Include="System.IO.Hashing" Version="11.0.0" Condition="'$(KommanderNet11OrLater)' == 'true'" />
     <PackageReference Include="Google.Protobuf" Version="3.36.2" />
     <PackageReference Include="Grpc.Net.Client" Version="2.85.0" />
     <PackageReference Include="Grpc.Tools" Version="2.85.0">
@@ -88,7 +97,20 @@
   <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
     <PackageReference Include="Grpc.AspNetCore" Version="2.85.0" />
     <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.85.0" />
+    <PackageReference Include="Kommander.RocksDB" Version="11.8.1.9003" />
+  </ItemGroup>
+
+  <!-- Microsoft.Data.Sqlite 11 moves to SQLitePCLRaw 3, which takes the native library from the
+       SQLite package (3.53.4 and later) and no longer from SQLitePCLRaw.lib.e_sqlite3. Both packages
+       ship runtimes/*/native/libe_sqlite3, so the net11.0 target must not keep the 2.x pin that the
+       older targets use to raise their native SQLite version. -->
+  <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser')) And '$(KommanderNet11OrLater)' != 'true'">
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser')) And '$(KommanderNet11OrLater)' == 'true'">
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="11.0.0" />
   </ItemGroup>
 
   <ItemGroup Condition="$(TargetFramework.EndsWith('-browser'))">
@@ -124,16 +146,6 @@
     <Protobuf Include="System\Protos\raft_system.proto">
       <Generator>MSBuild:Compile</Generator>
     </Protobuf>
-  </ItemGroup>
-
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <PackageReference Include="Kommander.RocksDB" Version="11.8.1.9003" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
-  </ItemGroup>
-
-  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
-    <PackageReference Include="Kommander.RocksDB" Version="11.8.1.9003" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
   </ItemGroup>
 
 </Project>

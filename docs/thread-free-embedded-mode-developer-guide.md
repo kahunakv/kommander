@@ -25,8 +25,8 @@ runtime's own timer code, it needs COOP/COEP headers, and it does not run under 
 
 ## How to get the thread-free build
 
-The package contains two browser target frameworks, `net8.0-browser` and `net10.0-browser`. Both
-define `KOMMANDER_THREAD_FREE`. A project gets them when its own target framework is a `-browser`
+The package contains three browser target frameworks, `net8.0-browser`, `net10.0-browser` and
+`net11.0-browser`. All three define `KOMMANDER_THREAD_FREE`. A project gets them when its own target framework is a `-browser`
 one:
 
 ```xml
@@ -132,11 +132,12 @@ Two checks cover the build. The CI workflow runs both.
    code blocks a thread. Library code resumes with `ConfigureAwait(false)`, so on normal .NET a
    blocked continuation moves to another thread and the test still passes.
 
-2. **Smoke check on single-threaded WebAssembly.** `scripts/run-wasm-smoke.sh` builds
+2. **Smoke check on single-threaded WebAssembly.** `scripts/run-wasm-smoke.sh` publishes
    `Kommander.WasmSmoke` for `browser-wasm` with `WasmEnableThreads` off and runs it under Node.js.
    The app starts a single node, waits for the election, commits five proposals, and leaves. A
    thread start, a blocking wait, or a stall makes it fail. It needs the .NET 10 SDK and Node.js,
-   but not the `wasm-tools` workload.
+   but not the `wasm-tools` workload. To check the `net11.0-browser` assembly, set
+   `SMOKE_FRAMEWORK=net11.0-browser`; this needs the .NET 11 SDK.
 
    ```sh
    scripts/run-wasm-smoke.sh

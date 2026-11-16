@@ -13,6 +13,9 @@
   -->
   <PropertyGroup>
     <TargetFramework>net10.0-browser</TargetFramework>
+    <!-- SMOKE_FRAMEWORK=net11.0-browser scripts/run-wasm-smoke.sh checks another browser target of
+         the package. -->
+    <TargetFramework Condition="'$(KommanderSmokeFramework)' != ''">$(KommanderSmokeFramework)</TargetFramework>
     <RuntimeIdentifier>browser-wasm</RuntimeIdentifier>
     <OutputType>Exe</OutputType>
     <WasmEnableThreads>false</WasmEnableThreads>

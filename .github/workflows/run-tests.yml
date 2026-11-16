@@ -27,6 +27,7 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+            11.0.x
       - name: Check determinism boundary
         # A new direct wall-clock or thread-pool read in the consensus path makes a simulation
         # run unreplayable, and the failure is silent: the run still passes. Fail the build here
@@ -42,6 +43,10 @@ jobs:
         # It fails on a Thread start or a blocking wait that the runtime refuses, on a deadlock, or on
         # missing commits. Normal .NET cannot catch a blocking wait: it has other threads to release it.
         run: bash scripts/run-wasm-smoke.sh
+      - name: Thread-free browser-wasm smoke (net11.0-browser)
+        # The package ships one thread-free assembly for each browser target framework. This step
+        # checks the net11.0-browser assembly in the same way.
+        run: SMOKE_FRAMEWORK=net11.0-browser bash scripts/run-wasm-smoke.sh
       - name: Mount a small filesystem for the ENOSPC tests
         # The RocksDB storage-error latch under test is native state and needs a volume that really
         # runs out of space. A tmpfs with a small size AND a small inode count: on a block-full tmpfs

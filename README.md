@@ -63,7 +63,7 @@ The library keeps storage, discovery, and communication pluggable. That separati
 
 ## Packages And Targets
 
-Kommander multi-targets `.NET 8.0` and `.NET 10.0`.
+Kommander multi-targets `.NET 8.0`, `.NET 10.0` and `.NET 11.0`.
 
 Install from NuGet:
 

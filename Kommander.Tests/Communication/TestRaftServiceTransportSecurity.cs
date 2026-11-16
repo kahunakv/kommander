@@ -346,8 +346,13 @@ public sealed class TestRaftServiceTransportSecurity
                 senderNode: "node1",
                 bodyHash);
 
+            // The corruption changes the first character only. That character carries six bits of the
+            // signature and no unused bits, so the result is still canonical base64url and reaches the
+            // signature comparison. Reversing the string moved the last character, whose low bits are
+            // unused, to the front, and its first character to the end: .NET 11 rejects non-zero unused
+            // bits in Convert.TryFromBase64Chars, so most reversals came back MalformedFields there.
             string signature = corruptSignature
-                ? new string([.. signed.Signature.Reverse()])
+                ? (signed.Signature[0] == 'A' ? "B" : "A") + signed.Signature[1..]
                 : signed.Signature;
 
             headers.Add(signed.SignatureHeaderName, signature);
