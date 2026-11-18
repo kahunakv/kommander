@@ -2570,11 +2570,13 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
     /// <summary>
     /// Logs each safety or liveness fence the configuration leaves off (see
-    /// <see cref="RaftSafetyOptionAudit"/>). A deviation someone chose is a warning; one that comes
-    /// with the shipped defaults is informational, because warning on every default startup trains
-    /// operators to ignore the message.
+    /// <see cref="RaftSafetyOptionAudit"/>). A deviation someone chose is a warning. Two kinds are
+    /// informational, because a warning on every startup that needs no action trains operators to
+    /// ignore the message: a deviation that comes with the shipped defaults, and one the host marked
+    /// in <see cref="RaftConfiguration.IntendedFenceDeviations"/>. A marked line carries the host's
+    /// reason. Internal so tests can check the level of each line without starting a node.
     /// </summary>
-    private static void LogSafetyOptionDeviations(RaftConfiguration configuration, ILogger<IRaft> logger)
+    internal static void LogSafetyOptionDeviations(RaftConfiguration configuration, ILogger<IRaft> logger)
     {
         bool warnEnabled = logger.IsEnabled(LogLevel.Warning);
         bool infoEnabled = logger.IsEnabled(LogLevel.Information);
@@ -2592,7 +2594,12 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             string safe = deviation.SafeValue;
             string hazard = deviation.Hazard;
 
-            if (deviation.IsShippedDefault)
+            if (deviation.IntendedReason is { } reason)
+            {
+                if (infoEnabled)
+                    logger.LogInfoSafetyFenceIntended(kind, option, current, safe, hazard, reason);
+            }
+            else if (deviation.IsShippedDefault)
             {
                 if (infoEnabled)
                     logger.LogInfoSafetyFenceNotEnabled(kind, option, current, safe, hazard);

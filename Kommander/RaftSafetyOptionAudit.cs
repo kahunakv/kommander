@@ -46,13 +46,19 @@ public enum RaftOptionKind
 /// are reported at Information — warning on every default startup would train operators to ignore
 /// the message. A deviation someone chose is reported at Warning.
 /// </param>
+/// <param name="IntendedReason">
+/// The reason from <see cref="RaftConfiguration.IntendedFenceDeviations"/> when the host marked this
+/// option as turned off on purpose, otherwise <see langword="null"/>. A marked deviation is reported
+/// at Information with this reason, whatever <paramref name="IsShippedDefault"/> says.
+/// </param>
 public sealed record RaftSafetyOptionDeviation(
     string Option,
     RaftOptionKind Kind,
     string CurrentValue,
     string SafeValue,
     string Hazard,
-    bool IsShippedDefault);
+    bool IsShippedDefault,
+    string? IntendedReason = null);
 
 /// <summary>
 /// Classifies every <see cref="RaftConfiguration"/> option, and reports the ones whose current
@@ -118,6 +124,9 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.EnableHostPumpedScheduling)] = RaftOptionKind.Liveness,
 #endif
         [nameof(RaftConfiguration.InvariantChecks)] = RaftOptionKind.Diagnostics,
+        // Diagnostics: a mark changes only the level of the startup audit line for a fence that is
+        // already off. It never turns a fence off or on.
+        [nameof(RaftConfiguration.IntendedFenceDeviations)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftStateMachineLog)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftWALMachineLog)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.ReadIOThreads)] = RaftOptionKind.Performance,
@@ -248,12 +257,45 @@ public static class RaftSafetyOptionAudit
     };
 
     /// <summary>
+    /// Every <see cref="RaftSafetyOptionDeviation.Option"/> name that <see cref="Inspect"/> can
+    /// report. <see cref="RaftConfiguration.Validate"/> accepts a key of
+    /// <see cref="RaftConfiguration.IntendedFenceDeviations"/> only from this set.
+    ///
+    /// <para>A test weakens every fence at once and requires the names it gets back to equal this
+    /// set, so a new check in <see cref="Inspect"/> fails that test until its name is added
+    /// here.</para>
+    /// </summary>
+    public static IReadOnlySet<string> ReportableOptions { get; } = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "TransportSecurity.NodeAuthenticationMode",
+        "TransportSecurity.RequireTls",
+        "TransportSecurity.AllowInsecureCertificateValidation",
+        nameof(RaftConfiguration.AllowLegacySnapshotSenders),
+        nameof(RaftConfiguration.LostAcknowledgedEntriesPolicy),
+        nameof(RaftConfiguration.EnableCheckQuorum),
+        nameof(RaftConfiguration.ApplicationDurabilityProvider),
+        nameof(RaftConfiguration.BackfillEnabled),
+        nameof(RaftConfiguration.SnapshotRescueMaxConsecutiveCycles),
+        nameof(RaftConfiguration.SnapshotRescueProbeInterval),
+        nameof(RaftConfiguration.SnapshotExportRetryCacheMaxBytes),
+        nameof(RaftConfiguration.CompactionLiveReplicaLagBudget),
+        nameof(RaftConfiguration.CompactionSilentPeerRetentionWindow),
+        nameof(RaftConfiguration.MaxOutboundQueueBytesPerPeer),
+    };
+
+    /// <summary>
     /// Returns every fence the given configuration leaves off or weakened, most protective concern
     /// first. An empty result means every fence this audit knows about is on.
     ///
     /// <para>Each entry names the option, the value in force, the value that keeps the fence on,
     /// and the hazard. A deviation is never an error: several are legitimate, and some are the
     /// shipped default. The point is that the choice is visible.</para>
+    ///
+    /// <para>An entry whose option the host marked in
+    /// <see cref="RaftConfiguration.IntendedFenceDeviations"/> carries the mark's reason in
+    /// <see cref="RaftSafetyOptionDeviation.IntendedReason"/>. The mark never removes the entry.
+    /// This method does not validate the marks, because it must not throw on the startup log path;
+    /// <see cref="RaftConfiguration.Validate"/> does that, and a null map reads as empty here.</para>
     /// </summary>
     public static IReadOnlyList<RaftSafetyOptionDeviation> Inspect(RaftConfiguration configuration)
     {
@@ -434,6 +476,16 @@ public static class RaftSafetyOptionAudit
                 "There is no per-peer outbound bound, so an unreachable peer can grow the "
                 + "dispatcher's queue until the node runs out of memory.",
                 IsShippedDefault: false));
+        }
+
+        IReadOnlyDictionary<string, string>? intended = configuration.IntendedFenceDeviations;
+        if (intended is { Count: > 0 })
+        {
+            for (int i = 0; i < deviations.Count; i++)
+            {
+                if (intended.TryGetValue(deviations[i].Option, out string? reason))
+                    deviations[i] = deviations[i] with { IntendedReason = reason };
+            }
         }
 
         return deviations;

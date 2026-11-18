@@ -484,6 +484,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Warning, Message = "[Kommander] {Kind} fence disabled by configuration: {Option}={Current} (protected value: {Safe}). {Hazard}")]
     public static partial void LogWarnSafetyFenceDisabled(this ILogger<IRaft> logger, string kind, string option, string current, string safe, string hazard);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[Kommander] {Kind} fence off by host intent: {Option}={Current} (protected value: {Safe}). {Hazard} Host reason: {Reason}")]
+    public static partial void LogInfoSafetyFenceIntended(this ILogger<IRaft> logger, string kind, string option, string current, string safe, string hazard, string reason);
+
     // ── RocksDbWAL ────────────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Information, Message = "RocksDB WAL at '{Path}' accepts writes again after {Count} failures over {Duration}")]

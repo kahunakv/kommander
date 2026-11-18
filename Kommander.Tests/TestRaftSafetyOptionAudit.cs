@@ -1,5 +1,6 @@
 using System.Reflection;
 using Kommander;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Tests;
 
@@ -159,5 +160,206 @@ public sealed class TestRaftSafetyOptionAudit
             if (deviation.Option == owner)
                 Assert.Equal(kind, deviation.Kind);
         }
+    }
+
+    private const string WitnessReason = "the other voters are in-process witnesses that store nothing";
+
+    /// <summary>
+    /// A standalone node with witness voters: check-quorum and backfill are off on purpose and
+    /// marked, while RequireTls is off without a mark.
+    /// </summary>
+    private static RaftConfiguration WitnessTopologyConfiguration()
+    {
+        RaftConfiguration configuration = new()
+        {
+            Host = "localhost",
+            Port = 8001,
+            EnableCheckQuorum = false,
+            BackfillEnabled = false,
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [nameof(RaftConfiguration.EnableCheckQuorum)] = WitnessReason,
+                [nameof(RaftConfiguration.BackfillEnabled)] = WitnessReason,
+            },
+        };
+        configuration.TransportSecurity.RequireTls = false;
+        return configuration;
+    }
+
+    [Fact]
+    public void AMarkedDeviationCarriesItsReason_AndStaysInTheReport()
+    {
+        IReadOnlyList<RaftSafetyOptionDeviation> deviations =
+            WitnessTopologyConfiguration().GetSafetyOptionDeviations();
+
+        RaftSafetyOptionDeviation checkQuorum =
+            Assert.Single(deviations, d => d.Option == nameof(RaftConfiguration.EnableCheckQuorum));
+        RaftSafetyOptionDeviation backfill =
+            Assert.Single(deviations, d => d.Option == nameof(RaftConfiguration.BackfillEnabled));
+        RaftSafetyOptionDeviation requireTls =
+            Assert.Single(deviations, d => d.Option == "TransportSecurity.RequireTls");
+
+        Assert.Equal(WitnessReason, checkQuorum.IntendedReason);
+        Assert.Equal(WitnessReason, backfill.IntendedReason);
+        Assert.Null(requireTls.IntendedReason);
+
+        // The mark changes nothing else about the entry.
+        Assert.False(checkQuorum.IsShippedDefault);
+        Assert.Equal("false", checkQuorum.CurrentValue);
+        Assert.Equal("true", checkQuorum.SafeValue);
+    }
+
+    [Fact]
+    public void AMarkOnAFenceThatIsOn_ReportsNoDeviationForIt()
+    {
+        RaftConfiguration configuration = new()
+        {
+            Host = "localhost",
+            Port = 8001,
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [nameof(RaftConfiguration.EnableCheckQuorum)] = WitnessReason,
+            },
+        };
+
+        Assert.DoesNotContain(
+            configuration.GetSafetyOptionDeviations(),
+            d => d.Option == nameof(RaftConfiguration.EnableCheckQuorum));
+    }
+
+    [Fact]
+    public void MarkedDeviationsLogAtInformationWithTheReason_UnmarkedChosenOnesStillWarn()
+    {
+        CapturingLogger logger = new();
+
+        RaftManager.LogSafetyOptionDeviations(WitnessTopologyConfiguration(), logger);
+
+        foreach (string option in new[] { "EnableCheckQuorum=false", "BackfillEnabled=false" })
+        {
+            (LogLevel Level, string Message) line = Assert.Single(logger.Messages, m => m.Message.Contains(option));
+            Assert.Equal(LogLevel.Information, line.Level);
+            Assert.Contains("fence off by host intent", line.Message);
+            Assert.Contains("Host reason: " + WitnessReason, line.Message);
+        }
+
+        (LogLevel Level, string Message) tls =
+            Assert.Single(logger.Messages, m => m.Message.Contains("TransportSecurity.RequireTls=false"));
+        Assert.Equal(LogLevel.Warning, tls.Level);
+        Assert.DoesNotContain("Host reason", tls.Message);
+    }
+
+    [Fact]
+    public void AMarkOnAShippedDefaultDeviation_LogsItsReason()
+    {
+        // Peer authentication ships off and already logs at Information. Marking it adds the reason.
+        RaftConfiguration configuration = new()
+        {
+            Host = "localhost",
+            Port = 8001,
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["TransportSecurity.NodeAuthenticationMode"] = "the node listens on loopback only",
+            },
+        };
+        CapturingLogger logger = new();
+
+        RaftManager.LogSafetyOptionDeviations(configuration, logger);
+
+        (LogLevel Level, string Message) line =
+            Assert.Single(logger.Messages, m => m.Message.Contains("TransportSecurity.NodeAuthenticationMode"));
+        Assert.Equal(LogLevel.Information, line.Level);
+        Assert.Contains("Host reason: the node listens on loopback only", line.Message);
+    }
+
+    [Fact]
+    public void Validate_AcceptsAMarkForEveryOptionTheAuditReports()
+    {
+        Dictionary<string, string> marks = new(StringComparer.Ordinal);
+        foreach (string option in RaftSafetyOptionAudit.ReportableOptions)
+            marks[option] = "reason for " + option;
+
+        RaftConfiguration configuration = new() { IntendedFenceDeviations = marks };
+
+        configuration.Validate();
+    }
+
+    [Theory]
+    [InlineData("EnableCheckquorum")]
+    [InlineData("RequireTls")]
+    [InlineData(nameof(RaftConfiguration.HeartbeatInterval))]
+    public void Validate_AMarkTheAuditNeverReports_Throws(string option)
+    {
+        RaftConfiguration configuration = new()
+        {
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.Ordinal) { [option] = WitnessReason },
+        };
+
+        RaftException ex = Assert.Throws<RaftException>(configuration.Validate);
+        Assert.Contains($"'{option}'", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_AMarkWithACaseInsensitiveMapStillNeedsTheExactName()
+    {
+        // The audit looks names up ordinally, so a key that only matches ignoring case would never
+        // lower the Warning. Validate checks the spelling whatever comparer the host's map uses.
+        RaftConfiguration configuration = new()
+        {
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["enablecheckquorum"] = WitnessReason,
+            },
+        };
+
+        Assert.Throws<RaftException>(configuration.Validate);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Validate_AMarkWithABlankReason_Throws(string reason)
+    {
+        RaftConfiguration configuration = new()
+        {
+            IntendedFenceDeviations = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [nameof(RaftConfiguration.BackfillEnabled)] = reason,
+            },
+        };
+
+        RaftException ex = Assert.Throws<RaftException>(configuration.Validate);
+        Assert.Contains(nameof(RaftConfiguration.BackfillEnabled), ex.Message);
+    }
+
+    [Fact]
+    public void Validate_ANullMarkMap_Throws_AndTheAuditReadsItAsEmpty()
+    {
+        RaftConfiguration configuration = new() { BackfillEnabled = false, IntendedFenceDeviations = null! };
+
+        Assert.Throws<RaftException>(configuration.Validate);
+
+        // The audit runs on the startup log path and must not throw.
+        RaftSafetyOptionDeviation backfill = Assert.Single(
+            configuration.GetSafetyOptionDeviations(),
+            d => d.Option == nameof(RaftConfiguration.BackfillEnabled));
+        Assert.Null(backfill.IntendedReason);
+    }
+
+    /// <summary>Records each log line with its level.</summary>
+    private sealed class CapturingLogger : ILogger<IRaft>
+    {
+        public List<(LogLevel Level, string Message)> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Messages.Add((logLevel, formatter(state, exception)));
     }
 }

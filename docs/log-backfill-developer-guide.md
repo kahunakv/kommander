@@ -171,6 +171,12 @@ backfill off for a node's partitions, set `BackfillEnabled = false`; it short-ci
 triggers *and* the snapshot fallback. Do that only when something else owns those peers' catch-up
 story, because nothing else re-ships entries they missed.
 
+The startup safety audit logs `BackfillEnabled=false` at Warning. A host that turns backfill off on
+purpose, for example a standalone node whose other voters are in-process witnesses, adds
+`BackfillEnabled` to `RaftConfiguration.IntendedFenceDeviations` with a one-sentence reason. The audit
+then logs the line at Information with that reason. `Validate` refuses a key that the audit never
+reports and a blank reason.
+
 > Note (`GetFollowerLagAsync`, `GetFollowerProgress`): the public `IRaft` API exposes a follower's lag so
 > applications and operators can observe catch-up progress. `GetFollowerLagAsync` is the protocol commit
 > frontier (an executor round-trip); `GetFollowerProgress` is a lock-free read of the leader's

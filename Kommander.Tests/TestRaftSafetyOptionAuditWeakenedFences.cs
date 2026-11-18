@@ -100,6 +100,46 @@ public sealed class TestRaftSafetyOptionAuditWeakenedFences
         }
     }
 
+    /// <summary>
+    /// With every fence weakened at once, the names the audit reports must equal
+    /// <see cref="RaftSafetyOptionAudit.ReportableOptions"/>. Validate accepts a mark only for a name
+    /// in that set, so a new check in Inspect that is missing from the set could never be marked.
+    /// </summary>
+    [Fact]
+    public void ReportableOptions_EqualsWhatTheAuditReportsWithEveryFenceWeakened()
+    {
+        RaftConfiguration configuration = new()
+        {
+            Host = "localhost",
+            Port = 8001,
+            AllowLegacySnapshotSenders = true,
+            LostAcknowledgedEntriesPolicy = LostAcknowledgedEntriesPolicy.AcceptAndLog,
+            EnableCheckQuorum = false,
+            ApplicationDurabilityProvider = null,
+            BackfillEnabled = false,
+            SnapshotRescueMaxConsecutiveCycles = 0,
+            SnapshotRescueProbeInterval = TimeSpan.Zero,
+            SnapshotExportRetryCacheMaxBytes = 0,
+            CompactionLiveReplicaLagBudget = 0,
+            CompactionSilentPeerRetentionWindow = TimeSpan.Zero,
+            MaxOutboundQueueBytesPerPeer = 0,
+        };
+        configuration.TransportSecurity.NodeAuthenticationMode = RaftNodeAuthenticationMode.Disabled;
+        configuration.TransportSecurity.RequireTls = false;
+        configuration.TransportSecurity.AllowInsecureCertificateValidation = true;
+
+        HashSet<string> reported = RaftSafetyOptionAudit.Inspect(configuration)
+            .Select(d => d.Option)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.True(
+            reported.SetEquals(RaftSafetyOptionAudit.ReportableOptions),
+            "Reported but not in ReportableOptions: "
+            + string.Join(", ", reported.Except(RaftSafetyOptionAudit.ReportableOptions))
+            + ". In ReportableOptions but not reported: "
+            + string.Join(", ", RaftSafetyOptionAudit.ReportableOptions.Except(reported)));
+    }
+
     /// <summary>A null configuration is a caller bug, not an empty report: it must throw.</summary>
     [Fact]
     public void Inspect_NullConfiguration_Throws()

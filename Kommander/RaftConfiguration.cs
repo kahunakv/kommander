@@ -357,6 +357,31 @@ public class RaftConfiguration
     public Diagnostics.RaftInvariantPolicy InvariantChecks { get; set; } = Diagnostics.RaftInvariants.DefaultPolicy;
 
     /// <summary>
+    /// Fences that the host turns off on purpose, keyed by the option name that
+    /// <see cref="RaftSafetyOptionAudit"/> reports, with the reason as the value. Empty by default.
+    ///
+    /// <para>The startup audit logs a weakened fence at Warning, because it cannot tell a host's
+    /// deliberate choice from an operator's mistake. A host whose topology makes a fence useless
+    /// marks it here, and the audit then logs that fence at Information with the reason. Example: a
+    /// standalone node whose other voters are in-process witnesses that store nothing turns off
+    /// <see cref="EnableCheckQuorum"/> and <see cref="BackfillEnabled"/>, because no other node can
+    /// lead and no witness needs catch-up.</para>
+    ///
+    /// <para>A mark changes only the log level. It never changes an option value, and the fence
+    /// still appears in <see cref="GetSafetyOptionDeviations"/>. A mark on a fence that is on has
+    /// no effect. Any option the audit reports can be marked, the transport-security options
+    /// included.</para>
+    ///
+    /// <para><see cref="Validate"/> refuses a null map, a key that is not in
+    /// <see cref="RaftSafetyOptionAudit.ReportableOptions"/>, and a blank reason. A misspelled key
+    /// would otherwise leave the Warning in place with nothing to say why. Keys are compared
+    /// ordinally, so spell nested options as the audit does, for example
+    /// <c>TransportSecurity.RequireTls</c>.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, string> IntendedFenceDeviations { get; set; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>
     /// Warning threshold (milliseconds) for the per-partition state-machine executor.
     /// If processing a single operation takes longer than this value, a warning is
     /// emitted to the logger to help identify scheduling hot spots.
@@ -2355,6 +2380,27 @@ public class RaftConfiguration
 
             // Resolve now so a bad path or password surfaces here rather than at first replication.
             TransportSecurity.GetClientCertificate();
+        }
+
+        // A mark that the audit can never match leaves the Warning it was meant to lower, and the
+        // log gives no hint why. Refuse it here with the key that is wrong.
+        if (IntendedFenceDeviations is null)
+            throw new RaftException(
+                "[Kommander] IntendedFenceDeviations must not be null. Leave it empty when no fence is " +
+                "turned off on purpose.");
+
+        foreach (KeyValuePair<string, string> mark in IntendedFenceDeviations)
+        {
+            if (!RaftSafetyOptionAudit.ReportableOptions.Contains(mark.Key))
+                throw new RaftException(
+                    $"[Kommander] IntendedFenceDeviations names '{mark.Key}', which the safety audit never " +
+                    "reports. Use one of: " +
+                    string.Join(", ", RaftSafetyOptionAudit.ReportableOptions.Order(StringComparer.Ordinal)) + ".");
+
+            if (string.IsNullOrWhiteSpace(mark.Value))
+                throw new RaftException(
+                    $"[Kommander] IntendedFenceDeviations['{mark.Key}'] has no reason. The startup log prints " +
+                    "the reason in place of a warning, so it must say why this fence is off.");
         }
 
         // PartitionExecutorPoolSize: no throw needed — the RaftExecutorPool constructor
