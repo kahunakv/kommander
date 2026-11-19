@@ -1,9 +1,11 @@
 
+using Kommander.Communication;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.System;
+using Kommander.Tests.Communication;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -27,10 +29,13 @@ public sealed class TestGracefulLeave
     }
 
     private static RaftManager MakeNode(
-        InMemoryCommunication communication,
+        ICommunication communication,
         string host, int port, int nodeId,
         IEnumerable<string> peers,
-        ILogger<IRaft> logger)
+        ILogger<IRaft> logger,
+        int votingTimeoutMs = 250,
+        int startElectionTimeoutMs = 100,
+        int endElectionTimeoutMs = 250)
     {
         RaftConfiguration config = new()
         {
@@ -41,13 +46,13 @@ public sealed class TestGracefulLeave
             InitialPartitions = 1,
             HeartbeatInterval = TimeSpan.FromMilliseconds(50),
             RecentHeartbeat = TimeSpan.FromMilliseconds(25),
-            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            VotingTimeout = TimeSpan.FromMilliseconds(votingTimeoutMs),
             CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
             UpdateNodesInterval = TimeSpan.FromMilliseconds(50),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
-            StartElectionTimeout = 100,
+            StartElectionTimeout = startElectionTimeoutMs,
             EnableQuiescence = false,
-            EndElectionTimeout = 250,
+            EndElectionTimeout = endElectionTimeoutMs,
         };
 
         return new RaftManager(
@@ -349,6 +354,296 @@ public sealed class TestGracefulLeave
             foreach (RaftManager n in nodes)
                 n.Dispose();
         }
+    }
+
+    // ── A leaver whose own voting rounds fail while it waits for a leader ──────
+
+    /// <summary>
+    /// The system-partition leader leaves a 3-node cluster and the election that follows does not
+    /// produce a leader at once: the second leaver becomes a candidate, and its voting rounds end
+    /// by <see cref="RaftConfiguration.VotingTimeout"/>. A split vote between the last two voters
+    /// has this shape, because each candidate holds its own vote until the round expires.
+    /// <para>
+    /// A leave that counted the polls of an open voting round as "no leader" gave up before the
+    /// round ended. The node then stopped with its removal uncommitted, and the survivor counted a
+    /// stopped node towards a quorum of two that it could never reach.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LeaveCluster_LeaverInsideAFailingVotingRound_WaitsForTheElectionAndCommitsItsRemoval()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // One voting round is longer than the five 200 ms polls a leave allows without a leader.
+        const int votingTimeoutMs = 1_000;
+
+        VoteRequestDroppingCommunication comm = new(new InMemoryCommunication());
+        RaftManager n1 = MakeNode(comm, "localhost", 9270, 1, ["localhost:9271", "localhost:9272"], _logger, votingTimeoutMs);
+        RaftManager n2 = MakeNode(comm, "localhost", 9271, 2, ["localhost:9270", "localhost:9272"], _logger, votingTimeoutMs);
+        RaftManager n3 = MakeNode(comm, "localhost", 9272, 3, ["localhost:9270", "localhost:9271"], _logger, votingTimeoutMs);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:9270"] = n1,
+            ["localhost:9271"] = n2,
+            ["localhost:9272"] = n3,
+        });
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForLeader(nodes, partitionId: 1, ct);
+
+            await WaitForCondition(
+                () => nodes.All(n => n.SystemCoordinator.GetMembership().Members.Count(m => m.Role == ClusterMemberRole.Voter) == 3), ct);
+
+            await WaitForLeader(nodes, RaftSystemConfig.SystemPartition, ct);
+
+            RaftManager? firstLeaver = null;
+            foreach (RaftManager n in nodes)
+            {
+                if (await n.AmILeaderQuick(RaftSystemConfig.SystemPartition))
+                    firstLeaver = n;
+            }
+
+            Assert.NotNull(firstLeaver);
+
+            RaftManager[] rest = [.. nodes.Where(n => !ReferenceEquals(n, firstLeaver))];
+            RaftManager survivor = rest[0];
+            RaftManager secondLeaver = rest[1];
+
+            // From here no election on the system partition can end. The survivor cannot campaign,
+            // and the vote requests of the second leaver are lost, so each voting round of the
+            // second leaver runs to the voting timeout.
+            string survivorEndpoint = survivor.LocalEndpoint;
+            comm.DropVoteRequests(request =>
+                request.Partition == RaftSystemConfig.SystemPartition &&
+                (!request.PreVote || request.Endpoint == survivorEndpoint));
+
+            await firstLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+
+            Assert.DoesNotContain(
+                firstLeaver.SystemCoordinator.GetMembership().Members, m => m.Endpoint == firstLeaver.LocalEndpoint);
+
+            ValueStopwatch sw = ValueStopwatch.StartNew();
+            Task secondLeave = secondLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+
+            RaftPartition systemPartition = secondLeaver.SystemPartition!;
+            ValueStopwatch candidateWait = ValueStopwatch.StartNew();
+
+            while (await systemPartition.GetState(ct) != RaftNodeState.Candidate)
+            {
+                Assert.True(candidateWait.GetElapsedMilliseconds() < TestTimeouts.Scale(5_000),
+                    "The second leaver did not become a candidate on the system partition.");
+
+                await Task.Delay(10, ct);
+            }
+
+            // The election stays open for longer than five polls. A leave that gave up on the
+            // leader inside the voting round returned before the end of this wait.
+            await Task.Delay(1_500, ct);
+
+            Assert.False(secondLeave.IsCompleted,
+                "The second leave stopped the node while a voting round was open on its system partition.");
+            Assert.True(comm.Dropped > 0, "No vote request was dropped, so no voting round was held open.");
+
+            comm.DeliverAllVoteRequests();
+            await secondLeave;
+            long elapsedMs = sw.GetElapsedMilliseconds();
+
+            Assert.True(elapsedMs < 9_000,
+                $"The second leave took {elapsedMs} ms: it ran out its deadline instead of committing the removal.");
+            Assert.DoesNotContain(
+                secondLeaver.SystemCoordinator.GetMembership().Members, m => m.Endpoint == secondLeaver.LocalEndpoint);
+
+            await WaitForCondition(
+                () =>
+                {
+                    ClusterMembership roster = survivor.SystemCoordinator.GetMembership();
+                    return roster.Members.Count == 1 &&
+                           roster.Members[0].Endpoint == survivor.LocalEndpoint &&
+                           roster.Members[0].Role == ClusterMemberRole.Voter;
+                },
+                ct, timeoutMs: 15_000);
+
+            // Alone in the roster, the survivor is a quorum of one and leads.
+            await WaitForLeader([survivor], RaftSystemConfig.SystemPartition, ct);
+            await WaitForLeader([survivor], partitionId: 1, ct);
+        }
+        finally
+        {
+            comm.DeliverAllVoteRequests();
+
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// One voting round of the second leaver fails, and the election timeout that follows is
+    /// longer than five 200 ms polls. During that timeout the second leaver is a follower with no
+    /// leader, so the polls count. The limit covers
+    /// <see cref="RaftConfiguration.EndElectionTimeout"/>, so the leaver is still there when its
+    /// next voting round starts, wins it, and commits its removal.
+    /// <para>
+    /// With a limit of five polls for every election timing, the leaver stopped during the
+    /// timeout with its removal uncommitted.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LeaveCluster_ElectionTimeoutLongerThanFivePollsAfterAFailedVotingRound_WaitsForTheNextElection()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        const int votingTimeoutMs = 300;
+        const int startElectionTimeoutMs = 1_200;
+        const int endElectionTimeoutMs = 1_500;
+
+        VoteRequestDroppingCommunication comm = new(new InMemoryCommunication());
+
+        RaftManager Node(int port, int nodeId, string[] peers) => MakeNode(
+            comm, "localhost", port, nodeId, peers, _logger, votingTimeoutMs, startElectionTimeoutMs, endElectionTimeoutMs);
+
+        RaftManager n1 = Node(9280, 1, ["localhost:9281", "localhost:9282"]);
+        RaftManager n2 = Node(9281, 2, ["localhost:9280", "localhost:9282"]);
+        RaftManager n3 = Node(9282, 3, ["localhost:9280", "localhost:9281"]);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:9280"] = n1,
+            ["localhost:9281"] = n2,
+            ["localhost:9282"] = n3,
+        });
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForLeader(nodes, partitionId: 1, ct);
+
+            await WaitForCondition(
+                () => nodes.All(n => n.SystemCoordinator.GetMembership().Members.Count(m => m.Role == ClusterMemberRole.Voter) == 3), ct);
+
+            await WaitForLeader(nodes, RaftSystemConfig.SystemPartition, ct);
+
+            RaftManager? firstLeaver = null;
+            foreach (RaftManager n in nodes)
+            {
+                if (await n.AmILeaderQuick(RaftSystemConfig.SystemPartition))
+                    firstLeaver = n;
+            }
+
+            Assert.NotNull(firstLeaver);
+
+            RaftManager[] rest = [.. nodes.Where(n => !ReferenceEquals(n, firstLeaver))];
+            RaftManager survivor = rest[0];
+            RaftManager secondLeaver = rest[1];
+
+            // The survivor cannot campaign on the system partition, so only the second leaver can
+            // become its leader. The vote requests of the first voting round of the second leaver
+            // are lost, so that round fails. The term of the round identifies it.
+            string survivorEndpoint = survivor.LocalEndpoint;
+            string secondLeaverEndpoint = secondLeaver.LocalEndpoint;
+            long failedTerm = -1;
+
+            comm.DropVoteRequests(request =>
+            {
+                if (request.Partition != RaftSystemConfig.SystemPartition)
+                    return false;
+
+                if (request.Endpoint == survivorEndpoint)
+                    return true;
+
+                if (request.PreVote || request.Endpoint != secondLeaverEndpoint)
+                    return false;
+
+                long firstTerm = Interlocked.CompareExchange(ref failedTerm, request.Term, -1);
+                return firstTerm == -1 || firstTerm == request.Term;
+            });
+
+            await firstLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+
+            Assert.DoesNotContain(
+                firstLeaver.SystemCoordinator.GetMembership().Members, m => m.Endpoint == firstLeaver.LocalEndpoint);
+
+            ValueStopwatch sw = ValueStopwatch.StartNew();
+            await secondLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+            long elapsedMs = sw.GetElapsedMilliseconds();
+
+            Assert.True(Volatile.Read(ref failedTerm) != -1, "No voting round of the second leaver failed.");
+            Assert.True(elapsedMs < 9_000,
+                $"The second leave took {elapsedMs} ms: it ran out its deadline instead of committing the removal.");
+            Assert.DoesNotContain(
+                secondLeaver.SystemCoordinator.GetMembership().Members, m => m.Endpoint == secondLeaver.LocalEndpoint);
+
+            comm.DeliverAllVoteRequests();
+
+            await WaitForCondition(
+                () =>
+                {
+                    ClusterMembership roster = survivor.SystemCoordinator.GetMembership();
+                    return roster.Members.Count == 1 &&
+                           roster.Members[0].Endpoint == survivor.LocalEndpoint &&
+                           roster.Members[0].Role == ClusterMemberRole.Voter;
+                },
+                ct, timeoutMs: 15_000);
+
+            // Alone in the roster, the survivor is a quorum of one and leads.
+            await WaitForLeader([survivor], RaftSystemConfig.SystemPartition, ct);
+            await WaitForLeader([survivor], partitionId: 1, ct);
+        }
+        finally
+        {
+            comm.DeliverAllVoteRequests();
+
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The leader-unknown limit of the commit loops for some election timings: five polls for
+    /// short timeouts, and the election timeout plus the check-leader tick plus two polls for
+    /// longer ones.
+    /// </summary>
+    [Theory]
+    [InlineData(250, 25, 5)]
+    [InlineData(400, 25, 5)]
+    [InlineData(600, 0, 5)]
+    [InlineData(601, 0, 6)]
+    [InlineData(1_200, 75, 9)]
+    [InlineData(1_500, 25, 10)]
+    [InlineData(4_000, 250, 24)]
+    [InlineData(0, 0, 5)]
+    [InlineData(-5, -1, 5)]
+    public void LeaderlessPollLimit_CoversTheElectionTimeoutAndTheCheckLeaderTick(
+        int endElectionTimeoutMs, int checkLeaderIntervalMs, int expectedPolls)
+    {
+        Assert.Equal(
+            expectedPolls,
+            ClusterLeaveService.LeaderlessPollLimit(endElectionTimeoutMs, TimeSpan.FromMilliseconds(checkLeaderIntervalMs)));
+    }
+
+    /// <summary>
+    /// The largest election timing gives a limit inside the range of <see cref="int"/>.
+    /// </summary>
+    [Fact]
+    public void LeaderlessPollLimit_LargestTiming_DoesNotOverflow()
+    {
+        Assert.Equal(
+            21_474_839,
+            ClusterLeaveService.LeaderlessPollLimit(int.MaxValue, TimeSpan.MaxValue));
     }
 
     // ── Runtime decommission: RequestLeaveAsync ──────────────────────────────

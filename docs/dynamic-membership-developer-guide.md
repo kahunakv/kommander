@@ -328,6 +328,16 @@ and loses the election. A leaver that stopped campaigning first would leave P0 l
 whole deadline and then stop with its removal uncommitted, and the survivors would count a dead
 node towards quorum.
 
+While P0 has no leader, the commit attempt polls for one every 200 ms. The attempt ends with
+`NoLeader` when P0 has no leader and no open voting round on this node for 5 consecutive polls, or
+for `EndElectionTimeout` plus `CheckLeaderInterval` plus two polls when that is longer (24 polls,
+about 4.6 s, with the default timing). A P0 that is quiet for that long has no quorum, and a
+shutdown then stops without the full 10 s deadline. A poll made while this node is a candidate on P0 does not count, and the count starts
+again when the voting round ends. A split vote between the last two voters keeps both of them
+candidates for the full `VotingTimeout`. A leaver that stopped inside that round would stop with
+its removal uncommitted, and the survivor would count a stopped node towards a quorum of two. The
+10 s deadline applies in all cases. `RequestLeaveAsync` uses the same rule.
+
 ### Decommission a node (drain, then leave)
 
 ```csharp

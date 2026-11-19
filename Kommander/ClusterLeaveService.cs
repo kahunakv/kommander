@@ -1094,10 +1094,74 @@ internal sealed class ClusterLeaveService : IDisposable
     }
 
     /// <summary>
+    /// Delay between two polls for the system-partition leader in the commit loops.
+    /// <see cref="LeaderlessPollLimit()"/> converts an election timeout to a poll count with it.
+    /// </summary>
+    private const int LeaderPollIntervalMs = 200;
+
+    /// <summary>
+    /// The smallest value of <see cref="LeaderlessPollLimit()"/> (5 polls, about 1 s).
+    /// </summary>
+    private const int MinLeaderlessPolls = 5;
+
+    /// <summary>
+    /// The number of consecutive polls that find the system partition with no leader and no open
+    /// voting round, after which a commit loop stops.
+    /// <para>
+    /// A partition that can elect a leader is quiet for one election timeout at most: a voter
+    /// starts its next pre-vote within <see cref="RaftConfiguration.EndElectionTimeout"/> of the
+    /// last leader contact or of a voting round that failed, on the next tick of
+    /// <see cref="RaftConfiguration.CheckLeaderInterval"/>. The limit covers that timeout and
+    /// that tick, plus two polls: one for the poll that starts the count and one for the pre-vote
+    /// exchange. A partition that is quiet for longer has no quorum (the peers stopped), and a
+    /// shutdown must stop without the full deadline of the loop.
+    /// </para>
+    /// </summary>
+    private int LeaderlessPollLimit() =>
+        LeaderlessPollLimit(configuration.EndElectionTimeout, configuration.CheckLeaderInterval);
+
+    /// <summary>
+    /// <see cref="LeaderlessPollLimit()"/> for the given election timing. Negative values count as
+    /// zero, and the result stays in the range of <see cref="int"/>.
+    /// </summary>
+    internal static int LeaderlessPollLimit(int endElectionTimeoutMs, TimeSpan checkLeaderInterval)
+    {
+        long quietMs =
+            Math.Max(0L, endElectionTimeoutMs) +
+            (long)Math.Clamp(checkLeaderInterval.TotalMilliseconds, 0, int.MaxValue);
+
+        long quietPolls = (quietMs + LeaderPollIntervalMs - 1) / LeaderPollIntervalMs;
+
+        return (int)Math.Min(int.MaxValue, Math.Max(MinLeaderlessPolls, quietPolls + 2));
+    }
+
+    /// <summary>
+    /// True while a voting round is open on the local system partition.
+    /// <para>
+    /// A node becomes a candidate when a quorum granted its pre-vote, or when the leader told it
+    /// to take over (step-down notice, leadership transfer). The partition is then electing a
+    /// leader, and the round ends within <see cref="RaftConfiguration.VotingTimeout"/> with a
+    /// leader or with a return to follower. The state also reads candidate between an election
+    /// win and the publication of the leadership.
+    /// </para>
+    /// <para>
+    /// The commit loops do not count a poll made in this state towards
+    /// <see cref="LeaderlessPollLimit()"/>. A split vote between the last two voters keeps both of
+    /// them candidates for the full voting timeout. A leaver that counted those polls stopped
+    /// inside the round with its removal uncommitted, and the survivor then counted a stopped
+    /// node towards a quorum of two.
+    /// </para>
+    /// </summary>
+    private static async ValueTask<bool> IsVotingAsync(RaftPartition? systemPartition) =>
+        systemPartition is not null &&
+        await systemPartition.GetState().ConfigureAwait(false) == RaftNodeState.Candidate;
+
+    /// <summary>
     /// Commits a roster role transition for the local node, retrying against the current P0
     /// leader until it commits or a 10 s deadline expires — the same discipline as
     /// <see cref="CommitGracefulLeaveAsync"/> (self fast-path when this node is the leader,
-    /// 3 s per-attempt bound, capped polling while the leader is unknown).
+    /// 3 s per-attempt bound, capped polling while the leader is unknown and no voting round is
+    /// open).
     /// <para>
     /// Returns the coordinator's verdict. Terminal verdicts
     /// (<see cref="RaftOperationStatus.InsufficientVoters"/>,
@@ -1114,7 +1178,7 @@ internal sealed class ClusterLeaveService : IDisposable
     {
         const int deadlineMs = 10_000;
         const int attemptTimeoutMs = 3_000;
-        const int maxEmptyLeaderPolls = 5;
+        int maxEmptyLeaderPolls = LeaderlessPollLimit();
 
         ValueStopwatch sw = ValueStopwatch.StartNew();
         SetMemberRoleRequest request = new(localEndpoint, configuration.NodeId, targetRole);
@@ -1136,10 +1200,14 @@ internal sealed class ClusterLeaveService : IDisposable
 
                 if (string.IsNullOrEmpty(leaderEndpoint))
                 {
-                    if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
+                    // A poll inside an open voting round does not count, and the count starts
+                    // again after the round (see IsVotingAsync).
+                    if (await IsVotingAsync(systemPartition).ConfigureAwait(false))
+                        emptyLeaderPolls = 0;
+                    else if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
                         return (RaftOperationStatus.NodeIsNotLeader, 0);
 
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(LeaderPollIntervalMs, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
@@ -1192,10 +1260,13 @@ internal sealed class ClusterLeaveService : IDisposable
     /// a 10 s deadline expires.  Each individual <c>SendLeave</c> call is bounded by a 3 s
     /// per-attempt token so a stopped or unreachable node never blocks indefinitely.
     /// <para>
-    /// <b>Empty-leader cap:</b> when the P0 leader cannot be resolved (election in progress or
-    /// partition still starting), the loop polls at most <c>maxEmptyLeaderPolls</c> times before
-    /// giving up. This prevents the 10 s spin during shutdown when the system partition is already
-    /// draining and will never elect a new leader.
+    /// <b>Empty-leader cap:</b> when the P0 leader cannot be resolved and no voting round is open
+    /// on the local system partition, the loop polls at most <see cref="LeaderlessPollLimit()"/>
+    /// times before giving up. This prevents the 10 s spin during shutdown when the system
+    /// partition is already draining and will never elect a new leader. A poll inside an open
+    /// voting round does not count, and the count starts again after the round: the partition is
+    /// electing a leader, and this node can be the one that has to win (see
+    /// <see cref="IsVotingAsync"/>).
     /// </para>
     /// <para>
     /// <b>Cancellation:</b> <paramref name="cancellationToken"/> is observed in all waits so a
@@ -1208,9 +1279,9 @@ internal sealed class ClusterLeaveService : IDisposable
     {
         const int deadlineMs = 10_000;
         const int attemptTimeoutMs = 3_000;
-        // After this many consecutive "leader unknown" polls (5 × 200 ms = 1 s), give up.
-        // The full deadlineMs only applies while we are actively contacting a known leader.
-        const int maxEmptyLeaderPolls = 5;
+        // After this many consecutive "leader unknown" polls outside a voting round, give up.
+        // The full deadlineMs applies while a known leader is contacted or an election runs.
+        int maxEmptyLeaderPolls = LeaderlessPollLimit();
 
         ValueStopwatch sw = ValueStopwatch.StartNew();
         LeaveRequest request = new(localEndpoint, configuration.NodeId);
@@ -1236,13 +1307,19 @@ internal sealed class ClusterLeaveService : IDisposable
 
                 if (string.IsNullOrEmpty(leaderEndpoint))
                 {
-                    if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
+                    // A poll inside an open voting round does not count, and the count starts
+                    // again after the round (see IsVotingAsync).
+                    if (await IsVotingAsync(systemPartition).ConfigureAwait(false))
+                    {
+                        emptyLeaderPolls = 0;
+                    }
+                    else if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
                     {
                         logger.LogInfoLeaveClusterLeaderUnknown(emptyLeaderPolls);
                         return Unconfirmed(LeaveClusterOutcome.NoLeader);
                     }
 
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(LeaderPollIntervalMs, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
