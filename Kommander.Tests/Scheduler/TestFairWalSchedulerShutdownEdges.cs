@@ -145,6 +145,99 @@ public sealed class TestFairWalSchedulerShutdownEdges
         Assert.Equal([1L, 2L], order);
     }
 
+    // ── the shutdown drain empties a deep backlog ───────────────────────────
+
+    /// <summary>
+    /// Stop completes every accepted write however deep one partition's queue is. A batch takes at
+    /// most <c>MaxWalBatchSize</c> (256) operations of a partition, so a queue deeper than that needs
+    /// several passes. The drain used to make one pass over the ready-queue and one over the
+    /// partitions and then let the worker exit: with 1,500 writes queued it completed 513 and left
+    /// 987 callbacks unfired, each one a caller waiting for ever on a write nobody would make.
+    /// </summary>
+    [Fact]
+    public async Task Stop_DeepBacklogOnOnePartition_CompletesEveryAcceptedWriteInOrder()
+    {
+        const int total = 1_500;
+
+        GatedWal wal = new();
+        ConcurrentQueue<long> completed = new();
+
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        void OnComplete(RaftWalCompletion c) => completed.Enqueue(c.OperationId);
+
+        scheduler.Enqueue(MakeOp(1, 1, OnComplete));
+        await WaitUntilAsync(() => wal.BlockedWriters == 1, 5_000, "the worker must be held inside Write");
+
+        for (long i = 2; i <= total; i++)
+            scheduler.Enqueue(MakeOp(1, i, OnComplete));
+
+        Task stopTask = Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        wal.Release();
+
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        long[] order = completed.ToArray();
+        Assert.Equal(total, order.Length);
+        Assert.Equal(Enumerable.Range(1, total).Select(i => (long)i), order);
+    }
+
+    /// <summary>
+    /// The same with several workers and several partitions: four partitions are in flight on four
+    /// workers when Stop is called, two more are ready with no worker free, and each of the six has
+    /// 3,000 writes queued. Every write completes, each partition in submission order, and no
+    /// write completes twice. The order is what shows that two draining workers never held one
+    /// partition at the same time.
+    /// </summary>
+    [Fact]
+    public async Task Stop_DeepBacklogsOnManyPartitions_EveryWorkerDrainsItsOwn_InOrder()
+    {
+        const int workers = 4;
+        const int partitions = 6;
+        const int perPartition = 3_000;
+
+        GatedWal wal = new();
+        ConcurrentQueue<(int Partition, long OpId)> completed = new();
+
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: workers);
+        scheduler.Start();
+
+        void OnComplete(RaftWalCompletion c) => completed.Enqueue((c.PartitionId, c.OperationId));
+
+        // One write per worker, each on its own partition, each held inside the engine.
+        for (int p = 1; p <= workers; p++)
+        {
+            int expected = p;
+            scheduler.Enqueue(MakeOp(p, 1, OnComplete));
+            await WaitUntilAsync(() => wal.BlockedWriters == expected, 5_000, $"worker {expected} must be held inside Write");
+        }
+
+        for (int p = 1; p <= partitions; p++)
+        {
+            for (long i = p <= workers ? 2 : 1; i <= perPartition; i++)
+                scheduler.Enqueue(MakeOp(p, i, OnComplete));
+        }
+
+        Task stopTask = Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        wal.Release();
+
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        (int Partition, long OpId)[] all = completed.ToArray();
+        Assert.Equal(partitions * perPartition, all.Length);
+
+        for (int p = 1; p <= partitions; p++)
+        {
+            long[] order = all.Where(e => e.Partition == p).Select(e => e.OpId).ToArray();
+            Assert.Equal(Enumerable.Range(1, perPartition).Select(i => (long)i), order);
+        }
+    }
+
     // ── a throwing metadata write must not kill the worker ──────────────────
 
     /// <summary>

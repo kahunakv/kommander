@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Scheduling;
 using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
 
@@ -42,6 +43,12 @@ namespace Kommander.WAL.IO;
 ///   <item>Graceful drain on <see cref="Stop"/> — all operations accepted before
 ///       <see cref="Stop"/> is called are guaranteed to complete (or error) before
 ///       worker threads exit.</item>
+///   <item>Cheap idle workers: the ready-queue is a <see cref="ParkedWorkerQueue{T}"/>. A worker
+///       with nothing to write is parked on its own event, and an enqueue that makes a partition
+///       ready wakes one worker, or none while a worker is in its short spin for the next id. The
+///       queue used to be a <c>BlockingCollection</c>, where every idle worker spun before it
+///       parked on every take; at ten thousand small batches a second that was two thirds of
+///       the workers' CPU.</item>
 /// </list>
 ///
 /// <para><b>Concurrency model:</b> up to <c>workerCount</c> workers can hold
@@ -277,15 +284,22 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     // ── Global ready-queue ─────────────────────────────────────────────────
 
-    // Partition IDs that have at least one pending operation waiting to be drained.
-    // Bounded to 2× the max possible concurrent partitions to apply light
-    // back-pressure at the signalling layer as well.
-    private readonly BlockingCollection<int> _readyPartitions;
+    /// <summary>
+    /// Ids of partitions with at least one pending operation waiting to be drained, and the workers
+    /// parked for them.
+    ///
+    /// <para>Unbounded on purpose. A partition is in it at most once (<see cref="PartitionState.Scheduled"/>),
+    /// so its length is bounded by the number of partitions, not by the write rate; the bound on
+    /// pending work is the per-partition depth limit. The earlier bounded collection capped the
+    /// number of distinct ready partitions instead: a full one blocked <see cref="Enqueue"/> under
+    /// the partition lock, and left a partition that could not be put back after a write to be
+    /// rescheduled by its next enqueue.</para>
+    /// </summary>
+    private readonly ParkedWorkerQueue<int> _readyPartitions;
 
     // ── Worker threads ─────────────────────────────────────────────────────
 
     private readonly Thread[] _workers;
-    private readonly CancellationTokenSource _cts = new();
     private volatile bool _stopping;
     private bool _started;
 
@@ -351,6 +365,28 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     public long TotalLingerPartitionsGathered => Interlocked.Read(ref _totalLingerPartitionsGathered);
 
+    /// <summary>
+    /// Times a parked worker was woken for a ready partition. Each one is a thread hand-off with an OS
+    /// wake cost; against <see cref="TotalBatchesWritten"/> it gives the hand-offs per engine write.
+    /// </summary>
+    public long WorkerWakeups => _readyPartitions.Wakeups;
+
+    /// <summary>
+    /// Wake-ups after which the worker found no partition ready. A worker takes every ready partition
+    /// into its group, so a second worker woken for the same burst finds nothing.
+    /// </summary>
+    public long EmptyWorkerWakeups => _readyPartitions.EmptyWakeups;
+
+    /// <summary>Test seam: workers parked, or about to park. Exact only while the scheduler is quiet.</summary>
+    internal int IdleWorkerCount => _readyPartitions.IdleWorkerCount;
+
+    /// <summary>
+    /// Test seam: workers inside the linger's timed wait, where an arrival wakes them first.
+    /// <see cref="TotalLingerWaits"/> is counted just before a worker enters that wait, so a test
+    /// that needs the worker to be the one woken waits for this instead.
+    /// </summary>
+    internal int LingeringWorkerCount => _readyPartitions.TimedWaiterCount;
+
     // ── Construction ──────────────────────────────────────────────────────
 
     /// <param name="walAdapter">Synchronous storage adapter invoked on worker threads.</param>
@@ -389,6 +425,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// group batch whose logs are all per-entry <c>Committed</c> markers is written sync-off so it rides
     /// the next durable write instead of forcing its own fsync. Off (default) keeps every batch sync.
     /// </param>
+    /// <param name="maxSpinBeforePark">
+    /// Upper bound of how long one idle worker polls the ready-queue before it parks. Null means the
+    /// default (20 µs); <see cref="TimeSpan.Zero"/> disables the spin, so every enqueue that finds no
+    /// busy worker is a kernel wake. See <see cref="RaftConfiguration.IdleWorkerMaxSpinBeforePark"/>.
+    /// </param>
     public FairWalScheduler(
         IWAL walAdapter,
         ILogger<IRaft> logger,
@@ -401,7 +442,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         bool lazyCommitMarkers = false,
         Kommander.Time.IMonotonicTickSource? tickSource = null,
         bool manualExecution = false,
-        int markerDeferralMs = 0)
+        int markerDeferralMs = 0,
+        TimeSpan? maxSpinBeforePark = null)
     {
         this.manualExecution = manualExecution;
         this.tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
@@ -426,17 +468,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
 
-        // CA1416: BlockingCollection<T> is flagged unsupported on 'browser'. The browser targets
-        // define KOMMANDER_THREAD_FREE and run in manual mode only (refused below otherwise), where
-        // the collection is used from one thread and never blocks. Same reason as at its TryAdd in
-        // ProcessGroupBatch.
-#pragma warning disable CA1416
-        _readyPartitions = new BlockingCollection<int>(boundedCapacity: workerCount * 64);
-#pragma warning restore CA1416
-
-        // The ready-queue capacity is still sized from the resolved worker count, so manual mode
-        // and threaded mode admit the same number of ready partitions. Only the threads differ.
+        // Manual mode has no workers: the ready-queue is then only a queue, pumped by the caller.
         _workers = new Thread[manualExecution ? 0 : workerCount];
+        _readyPartitions = new ParkedWorkerQueue<int>(_workers.Length, maxSpinBeforePark);
 
 #if KOMMANDER_THREAD_FREE
         // The thread-free build has no worker threads. RaftConfiguration.Validate already refuses
@@ -477,6 +511,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             static (_, source) => new PartitionState(source),
             tickSource);
 
+        bool scheduled = false;
+
         lock (state.Lock)
         {
             if (state.Depth >= maxQueueDepthPerPartition)
@@ -514,11 +550,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (!state.Scheduled && !state.InFlight)
             {
                 state.Scheduled = true;
-                // TryAdd with a short timeout so we don't block the caller.
-                // If the ready-queue is full (workers are overloaded), we still
-                // accept the op but wake a worker via a forced add.
-                if (!_readyPartitions.TryAdd(partitionId))
-                    _readyPartitions.Add(partitionId, _cts.Token);
+                _readyPartitions.Publish(partitionId);
+                scheduled = true;
             }
         }
 
@@ -526,6 +559,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // completion callback delivered before this call returns.
         if (manualExecution)
             DrainInline();
+        else if (scheduled)
+        {
+            // The wake comes after the id is published, which is all the handshake needs, and outside
+            // the partition lock, which the woken worker takes first thing to drain this partition.
+            _readyPartitions.WakeOne();
+        }
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -666,8 +705,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     ///
     /// <para>When called, no new operations are accepted.  All operations that were
     /// already <see cref="Enqueue"/>d before this call will be processed and their
-    /// <c>OnComplete</c> callbacks fired before worker threads exit.  Callers should
-    /// wait for all expected completions before assuming the system is quiescent.</para>
+    /// <c>OnComplete</c> callbacks fired before worker threads exit, however deep a partition's
+    /// queue is: each worker drains until nothing is left that it can claim (see
+    /// <c>DrainRemaining</c>).  Callers should wait for all expected completions before assuming
+    /// the system is quiescent.</para>
     /// </summary>
     public void Stop()
     {
@@ -682,15 +723,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         if (manualExecution)
         {
             PumpUntilIdle();
-            _cts.Cancel();
             return;
         }
 
-        // Give workers a signal to drain remaining items and then exit.
-        // We do this by cancelling after a best-effort drain pass.
-        // Workers complete in-flight batches and then re-check the queue.
-        // Once all queues are empty and cancellation is signalled, they exit.
-        _cts.Cancel();
+        // Wake every parked or lingering worker. Each finishes the batch it holds, sees the request on
+        // its next take, drains what is still queued (DrainRemaining) and exits.
+        _readyPartitions.RequestStop();
 
         foreach (Thread worker in _workers)
             worker.Join();
@@ -732,7 +770,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             throw new InvalidOperationException(
                 "FairWalScheduler.PumpOnce requires manual mode; this scheduler owns worker threads.");
 
-        if (!_readyPartitions.TryTake(out int partitionId))
+        if (!_readyPartitions.TryDequeue(out int partitionId))
             return false;
 
         List<int> partitionGroup = new(maxGroupBatchPartitions) { partitionId };
@@ -745,7 +783,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         List<(int, List<RaftLog>)> logGroups = new(maxGroupBatchPartitions);
         Dictionary<int, long> acknowledgedPresence = new(maxGroupBatchPartitions);
 
-        while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
+        while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryDequeue(out int extraId))
             partitionGroup.Add(extraId);
 
         ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
@@ -789,25 +827,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // Pre-allocated per-partition acknowledged-presence fold passed alongside — cleared and reused.
         Dictionary<int, long> acknowledgedPresence = new(maxGroupBatchPartitions);
 
-        CancellationToken token = _cts.Token;
-
         while (true)
         {
-            // Block until at least one partition is ready.
-            int partitionId;
-            try
+            // Park until at least one partition is ready. False means Stop ran: drain what is
+            // still queued, then exit.
+            if (!_readyPartitions.Take(workerId, handOn: false, out int partitionId))
             {
-                partitionId = _readyPartitions.Take(token);
-            }
-            catch (OperationCanceledException)
-            {
-                // Drain remaining items before exiting.
                 DrainRemaining(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
-                break;
-            }
-            catch (ObjectDisposedException)
-            {
-                // Collection was disposed during shutdown; exit immediately.
                 break;
             }
 
@@ -818,7 +844,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             partitionGroup.Add(partitionId);
 
             // (1) Opportunistic sweep: take whatever is *already* ready, non-blocking.
-            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
+            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryDequeue(out int extraId))
                 partitionGroup.Add(extraId);
 
             // (2) Deferred linger (opt-in): if the batch is not yet full and a window is
@@ -833,7 +859,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             //     follower appends paced by replication RPCs) rather than arriving all at
             //     once like a leader's local proposes.
             if (lingerTicks > 0 && partitionGroup.Count < maxGroupBatchPartitions)
-                LingerForMoreReadyPartitions(partitionGroup, token);
+                LingerForMoreReadyPartitions(partitionGroup, workerId);
+
+            // This worker is about to be busy with the engine. An id it leaves behind — the group
+            // is full, or the id arrived as the linger ended — needs another worker now: its producer
+            // may have counted on this one (it was spinning or lingering when the id was published).
+            _readyPartitions.HandOnIfQueued();
 
             ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
         }
@@ -868,11 +899,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// linger is honoured exactly; an arrival ends the wait immediately. Kernel timed-wait
     /// granularity still rounds a sub-millisecond remainder up to ~1 ms.</para>
     ///
+    /// <para>While it waits the worker is registered with the ready-queue as a timed waiter, and
+    /// an enqueue wakes a timed waiter before any parked worker: the arrival is exactly what this
+    /// worker waits for. Another worker that returns to the queue at that moment can still take the
+    /// id first; the wait then resumes for what is left of the window.</para>
+    ///
     /// <para>Only <em>when</em> the group fsync fires changes; never <em>whether</em> a write
     /// is durable before its completion callback runs. Per-partition ordering and the
     /// <c>Scheduled</c>/<c>InFlight</c> ready-queue discipline are untouched.</para>
     /// </summary>
-    private void LingerForMoreReadyPartitions(List<int> partitionGroup, CancellationToken token)
+    private void LingerForMoreReadyPartitions(List<int> partitionGroup, int workerId)
     {
         long deadline = tickSource.GetTimestamp() + lingerTicks;
 
@@ -887,20 +923,17 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             int waitMs = (int)Math.Ceiling(remainingTicks * 1000.0 / tickSource.Frequency);
 
-            int extraId;
-            try
+            Interlocked.Increment(ref _totalLingerWaits);
+
+            if (!_readyPartitions.TryTake(workerId, waitMs, out int extraId, out bool timedOut))
             {
-                Interlocked.Increment(ref _totalLingerWaits);
-                if (!_readyPartitions.TryTake(out extraId, waitMs, token))
-                    break; // window exhausted: the expected arrival was slower than the budget.
-            }
-            catch (OperationCanceledException)
-            {
-                break; // shutdown: process what we have; WorkerLoop's next Take drains the rest.
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
+                // Timed out: the expected arrival was slower than the budget. A stop request reads as
+                // a timeout too: process what we have; WorkerLoop's next take drains the rest.
+                if (timedOut)
+                    break;
+
+                // Woken, and another worker took the id first. Wait again for what is left.
+                continue;
             }
 
             partitionGroup.Add(extraId);
@@ -908,7 +941,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             // Grab whatever arrived alongside without waiting again; the loop then re-checks
             // the remaining window and whether anything else is worth waiting for.
-            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int moreId))
+            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryDequeue(out int moreId))
             {
                 partitionGroup.Add(moreId);
                 Interlocked.Increment(ref _totalLingerPartitionsGathered);
@@ -1048,8 +1081,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 // announcement. Its worker then found nothing to release, so release it here: the
                 // id is announced before this read, and that worker reads the queue after its
                 // decrement, so one of the two always sees the other.
+                // This worker may still hold other partitions to write, so the ids need a worker
+                // of their own.
                 if (Volatile.Read(ref _syncWritesInFlight) == 0)
-                    RescheduleDeferredMarkers(engineIdle: true);
+                    RescheduleDeferredMarkers(engineIdle: true, wake: true);
 
                 continue;
             }
@@ -1347,25 +1382,22 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
                 if (state.Ops.Count > 0 && !state.Scheduled)
                 {
-                    // Only mark Scheduled=true when the partition ID is actually
-                    // inserted into the ready-queue.  If the bounded queue is full,
-                    // TryAdd returns false; leaving Scheduled=false lets the next
-                    // Enqueue call re-schedule the partition rather than stranding it.
-                    // CA1416: BlockingCollection<T>.TryAdd is flagged unsupported on 'browser', but
-                    // the browser targets define KOMMANDER_THREAD_FREE and only run in manual mode
-                    // (the constructor refuses threaded mode), where the collection is used from one thread.
-#pragma warning disable CA1416
-                    if (_readyPartitions.TryAdd(pid))
-                        state.Scheduled = true;
-#pragma warning restore CA1416
+                    // No parked worker is woken: the thread running this batch goes back to the
+                    // ready-queue as soon as the batch returns (a worker's next take, a pump's next
+                    // pass, the shutdown drain) and takes the id itself. Waking one here only
+                    // produced a worker that found the queue already swept. A lingering worker is
+                    // woken: this id is the arrival its evidence gate made it wait for.
+                    state.Scheduled = true;
+                    _readyPartitions.EnqueueFromWorker(pid);
                 }
             }
         }
 
         // After this batch's own callbacks, so the order of its completions is as it always was.
         // The callbacks are also what brings each partition's next propose, which takes its held
-        // markers with it; what is still held here has no write of its own coming.
-        RescheduleDeferredMarkers(engineIdle);
+        // markers with it; what is still held here has no write of its own coming. No parked
+        // worker is woken, for the reason above.
+        RescheduleDeferredMarkers(engineIdle, wake: false);
     }
 
     private static long MarkerDeferralTicks(bool lazyCommitMarkers, bool manualExecution, int markerDeferralMs, long ticksPerSecond) =>
@@ -1438,7 +1470,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// are still in progress then, a young batch stays held, and each of those writes calls this
     /// again when it ends. The last one to end passes <paramref name="engineIdle"/>.</para>
     /// </summary>
-    private void RescheduleDeferredMarkers(bool engineIdle)
+    /// <param name="engineIdle">True when no synced write is in progress.</param>
+    /// <param name="wake">
+    /// Whether to wake a parked worker for the ids put back. False when the caller returns to the
+    /// ready-queue right after and takes them itself; a lingering worker is woken either way. One
+    /// wake covers all of them: a worker takes every ready id into its group.
+    /// </param>
+    private void RescheduleDeferredMarkers(bool engineIdle, bool wake)
     {
 #if !KOMMANDER_THREAD_FREE
         // The thread-free build runs in manual mode only, where nothing is ever held.
@@ -1446,12 +1484,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             return;
 
         long nowTicks = tickSource.GetTimestamp();
+        bool scheduledAny = false;
 
         // One pass over what is queued now: an id put back below is not looked at again in this call.
         for (int remaining = _deferredMarkerPartitions.Count; remaining > 0; remaining--)
         {
             if (!_deferredMarkerPartitions.TryDequeue(out int pid))
-                return;
+                break;
 
             if (!_partitions.TryGetValue(pid, out PartitionState? state))
                 continue;
@@ -1481,21 +1520,23 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
                 else
                 {
-                    if (_readyPartitions.TryAdd(pid))
-                    {
-                        state.Scheduled = true;
-                        state.DeferredQueued = false;
-                    }
-                    else
-                    {
-                        // The ready-queue is full; try again at the next completion.
-                        keepQueued = true;
-                    }
+                    state.Scheduled = true;
+                    state.DeferredQueued = false;
+                    _readyPartitions.Publish(pid);
+                    scheduledAny = true;
                 }
             }
 
             if (keepQueued)
                 _deferredMarkerPartitions.Enqueue(pid);
+        }
+
+        if (scheduledAny)
+        {
+            if (wake)
+                _readyPartitions.WakeOne();
+            else
+                _readyPartitions.WakeTimedWaiter();
         }
 #endif
     }
@@ -1503,8 +1544,29 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 #if !KOMMANDER_THREAD_FREE
     // Shutdown drain of the worker loop, which the thread-free build does not have.
     /// <summary>
-    /// After the CTS fires, drain any partitions that were already in
-    /// the ready-queue but not yet processed.
+    /// The shutdown drain of one worker: writes everything this worker can claim, in as many passes
+    /// as it takes, and returns when nothing is left to claim. Runs after <see cref="Stop"/> closed
+    /// admission, once the worker finished the batch it held.
+    ///
+    /// <para><b>Why it loops.</b> A batch takes at most <see cref="maxBatchSize"/> operations of a
+    /// partition, and the batch's tail puts the partition back in the ready-queue when more are
+    /// queued. A drain that made one pass and returned left that id in the queue with no worker to
+    /// take it: every operation beyond the first few batches kept its callback unfired, and whoever
+    /// waited on it waited for ever. Each pass here drains at least one operation of every partition
+    /// it takes and admission is closed, so the loop ends.</para>
+    ///
+    /// <para><b>Why a partition is claimed through the ready-queue.</b> Only the thread that
+    /// dequeued a partition's id may drain it; that is what keeps one writer per partition. The
+    /// sweep below therefore does not process a partition it finds with work: it schedules it, under
+    /// the partition lock and only when it is neither scheduled nor in flight, and the dequeue that
+    /// follows decides which worker gets it. Processing it directly, as this once did, let a second
+    /// draining worker take the same partition's id from the queue meanwhile and clear its in-flight
+    /// flag under the first.</para>
+    ///
+    /// <para><b>Why returning with partitions still in flight is enough.</b> A partition in flight
+    /// belongs to a worker that is inside its write. That worker puts the partition back when the
+    /// write ends, finds the stop request on its next take, and runs this drain itself. So every
+    /// id that is published during shutdown is published by a worker that drains afterwards.</para>
     /// </summary>
     private void DrainRemaining(
         List<int> partitionGroup,
@@ -1513,36 +1575,38 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         List<(int, List<RaftLog>)> logGroups,
         Dictionary<int, long> acknowledgedPresence)
     {
-        // Drain everything still in the ready-queue as one group-commit batch.
-        partitionGroup.Clear();
-        while (_readyPartitions.TryTake(out int pid))
-            partitionGroup.Add(pid);
-
-        if (partitionGroup.Count > 0)
-            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
-
-        // Also sweep all partition states for any items that were enqueued
-        // but whose partitionId was not yet in the ready-queue (should not
-        // happen in normal operation, but guards against race at shutdown).
-        // IMPORTANT: skip partitions that are currently in-flight (InFlight=true).
-        // The worker executing that batch will clear InFlight in its post-I/O
-        // lock section and re-add the partition to _readyPartitions if items
-        // remain; this worker's own DrainRemaining first phase (TryTake loop)
-        // will then pick it up, preserving the single-writer-per-partition
-        // invariant even during shutdown.
-        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+        while (true)
         {
-            PartitionState state = kv.Value;
-            bool shouldProcess;
-            lock (state.Lock)
-                shouldProcess = (state.Ops.Count > 0 || state.DeferredMarkers is { Count: > 0 }) && !state.InFlight;
-
-            if (shouldProcess)
+            // Schedule every partition that holds work nobody owns. In normal operation there is
+            // none: an operation is scheduled when it is enqueued. This covers held commit markers,
+            // which wait for a write that will not come now, and any partition a race at shutdown
+            // left unscheduled.
+            foreach (KeyValuePair<int, PartitionState> kv in _partitions)
             {
-                partitionGroup.Clear();
-                partitionGroup.Add(kv.Key);
-                ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
+                PartitionState state = kv.Value;
+
+                lock (state.Lock)
+                {
+                    bool hasWork = state.Ops.Count > 0 || state.DeferredMarkers is { Count: > 0 };
+
+                    if (hasWork && !state.Scheduled && !state.InFlight)
+                    {
+                        state.Scheduled = true;
+                        _readyPartitions.Publish(kv.Key);
+                    }
+                }
             }
+
+            // Take everything ready as one group-commit batch. No partition-count cap here, unlike
+            // the worker loop: ProcessGroupBatch grows its scratch lists on demand.
+            partitionGroup.Clear();
+            while (_readyPartitions.TryDequeue(out int pid))
+                partitionGroup.Add(pid);
+
+            if (partitionGroup.Count == 0)
+                return;
+
+            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups, acknowledgedPresence);
         }
     }
 #endif
@@ -1772,7 +1836,6 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // thread can touch _readyPartitions after it is disposed.
         if (!_stopping)
             Stop();
-        _cts.Dispose();
         _readyPartitions.Dispose();
     }
 }

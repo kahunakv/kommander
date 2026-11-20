@@ -735,7 +735,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             logger,
             configuration.ReadIOThreads,
             inlineExecution: !configuration.EnableInternalSchedulingThreads,
-            name: "wal");
+            name: "wal",
+            maxSpinBeforePark: configuration.IdleWorkerMaxSpinBeforePark);
         walScheduler = new(
             walAdapter,
             logger,
@@ -751,7 +752,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             // With the fast path the leader's commit takes effect when the propose quorum is
             // durable, so nothing waits for a marker write any more and a marker batch can ride its
             // partition's next write instead of holding the partition behind another one's sync.
-            markerDeferralMs: configuration.WalSingleFsyncCommit ? FairWalScheduler.DefaultMarkerDeferralMs : 0);
+            markerDeferralMs: configuration.WalSingleFsyncCommit ? FairWalScheduler.DefaultMarkerDeferralMs : 0,
+            maxSpinBeforePark: configuration.IdleWorkerMaxSpinBeforePark);
         walScheduler.TraceSink = configuration.WalTraceSink;
 
         loadReportService = new LoadReportService(
@@ -768,7 +770,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             executorPool = new Scheduling.RaftExecutorPool(
                 configuration.PartitionExecutorPoolSize,
                 manualExecution: !configuration.EnableInternalSchedulingThreads,
-                logger: logger);
+                logger: logger,
+                maxSpinBeforePark: configuration.IdleWorkerMaxSpinBeforePark);
 
             // Start the pool here, where it is created, rather than in JoinCluster.
             // A partition executor in pool mode depends on a *running* pool: Start()

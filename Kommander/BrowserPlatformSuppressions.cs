@@ -14,36 +14,6 @@
 
 using System.Diagnostics.CodeAnalysis;
 
-// ── Write-ahead-log write scheduler (manual mode) ──────────────────────────────────────────────
-// In the browser build the scheduler is always in manual mode: RaftConfiguration.Validate refuses
-// scheduling threads, and the constructor throws without manual mode. The ready queue is then only
-// a bookkeeping queue. Every Take with a wait lives in the worker loop, which does not compile here.
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairWalScheduler.#ctor(Kommander.WAL.IWAL,Microsoft.Extensions.Logging.ILogger{Kommander.IRaft},System.Int32,System.Int32,System.Int32,System.Int32,System.Int32,System.Int32,System.Boolean,Kommander.Time.IMonotonicTickSource,System.Boolean)",
-    Justification = "Constructs the BlockingCollection only. Construction does not block.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairWalScheduler.Enqueue(Kommander.WAL.Data.WALWriteOperation)",
-    Justification = "TryAdd does not block. The blocking Add runs only when the bounded ready queue is full, and in manual mode Enqueue drains the queue inline before it returns, so the queue never fills.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairWalScheduler.PumpOnce~System.Boolean",
-    Justification = "TryTake with no timeout does not block. Verified on the single-threaded runtime.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairWalScheduler.ProcessGroupBatch(System.Collections.Generic.List{System.Int32},System.Collections.Generic.List{System.ValueTuple{System.Int32,System.Collections.Generic.List{Kommander.WAL.Data.WALWriteOperation}}},System.Collections.Generic.List{System.Collections.Generic.List{Kommander.WAL.Data.WALWriteOperation}},System.Collections.Generic.List{System.ValueTuple{System.Int32,System.Collections.Generic.List{Kommander.Data.RaftLog}}})",
-    Justification = "TryAdd with no timeout does not block. On a full queue it returns false and the partition is rescheduled by the next Enqueue.")]
-
-[assembly: SuppressMessage("Interoperability", "CA1416",
-    Scope = "member",
-    Target = "~M:Kommander.WAL.IO.FairWalScheduler.Dispose",
-    Justification = "Disposes the BlockingCollection. Dispose does not block.")]
-
 // ── Write-ahead-log read scheduler (inline mode) ───────────────────────────────────────────────
 // In the browser build every read runs inline on the caller: RaftManager builds the scheduler with
 // inlineExecution when scheduling threads are off, and Start throws without it. A read is finished

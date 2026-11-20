@@ -162,6 +162,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.GrpcMaxMessageBytes)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableSharedExecutorPool)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.PartitionExecutorPoolSize)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.IdleWorkerMaxSpinBeforePark)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.EnableQuiescence)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.QuiesceAfter)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LeadershipBarrierTimeout)] = RaftOptionKind.Liveness,

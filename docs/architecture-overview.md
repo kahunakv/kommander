@@ -499,6 +499,7 @@ come up in practice. Defaults shown.
 | Setting | Default | What it does |
 |---|---|---|
 | `ReadIOThreads` / `WriteIOThreads` | 8 / 4 | fair-scheduler threads for WAL reads/writes |
+| `IdleWorkerMaxSpinBeforePark` | 20 µs | longest spin of one idle worker per pool (executor pool, WAL write and read schedulers) before it parks |
 | `MaxWalBatchSize` | 256 | max entries coalesced into one WAL write |
 | `MaxQueuedClientProposalsPerPartition` | 2048 | backpressure on client proposals |
 

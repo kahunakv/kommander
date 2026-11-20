@@ -213,6 +213,7 @@ So a quiet partition is cheap *and* still fails over promptly. (For the SWIM voc
 |---|---|---|
 | `EnableSharedExecutorPool` | `true` | Master switch. `true` = many partitions share a bounded thread pool. `false` = the original one-OS-thread-per-partition model, and every `CheckLeader` tick becomes a full sweep. Both settings are Raft-safe. |
 | `PartitionExecutorPoolSize` | `0` | Number of pool worker threads. `0` auto-sizes to `Environment.ProcessorCount`; values below 0 are clamped to 1. |
+| `IdleWorkerMaxSpinBeforePark` | `20 µs` | Upper bound of how long one idle pool thread polls the ready-queue before it parks. See "Idle pool threads" below. The same setting applies to the WAL write and read schedulers. |
 
 ### Fixed pool size
 
@@ -221,6 +222,29 @@ threads at construction and **never grows or shrinks them**. The thread count is
 the `RaftManager`; changing it means changing the config and restarting. This is deliberate — the value
 of the pool is that it is a small *bounded* `P ≪ M`; autoscaling toward `M` would reintroduce the
 thread-per-partition cost the pool exists to remove.
+
+### Idle pool threads
+
+A pool thread with nothing to drain is **parked on its own event** and uses no CPU. Scheduling an
+executor wakes exactly one parked thread; the others stay asleep. So a large pool on a quiet node is
+free, and the pool size can follow the number of busy partitions without a cost per idle thread.
+
+Two details keep the hand-off cheap when work arrives in a fast stream:
+
+- **One spinner.** After it runs out of work, one thread (never more) keeps polling the ready-queue
+  for a moment before it parks. An executor scheduled inside that moment is taken with no system
+  call and no wake-up delay. The window adapts: a few spins that find nothing close it, and work that
+  arrives soon after a park reopens it. `IdleWorkerMaxSpinBeforePark` is its upper bound: `Zero`
+  turns the spin off (least CPU, every hand-off to an idle pool is a kernel wake), a larger value
+  trades CPU for a shorter round on a host with idle cores.
+- **No wake for a thread's own re-schedule.** An executor that still has work after its quantum is put
+  back in the ready-queue by the thread that drained it, and that thread takes it again (or wakes a
+  parked thread for it if it takes another partition first).
+
+The pool used to park every thread on one semaphore, which spins on each wait: with small frequent
+rounds most of the pool's CPU was that spin. `RaftExecutorPool.WorkerWakeups` and
+`EmptyWorkerWakeups` count the hand-offs; the WAL write scheduler has the same handshake and the same
+two counters (`FairWalScheduler.WorkerWakeups`, `EmptyWorkerWakeups`).
 
 ### Pool sizing
 
@@ -280,7 +304,8 @@ contention**.
 | `Kommander/RaftTimerService.cs` | `TriggerCheckLeader`: ticks the system partition always, the hot set on fast cycles, and the full set on the periodic safety sweep. |
 | `Kommander/RaftManager.cs` | Owns the pool (created and started in the constructor), the hot-set map, `MarkPartitionHot`/`MarkPartitionCool`, the SWIM-driven wake, and hot-set eviction on partition removal. |
 | `Kommander/RaftPartition.cs` | Wires the quiesce-state-change callback that keeps hot-set membership in sync. |
-| `Kommander/RaftConfiguration.cs` | `EnableSharedExecutorPool`, `PartitionExecutorPoolSize`. |
+| `Kommander/RaftConfiguration.cs` | `EnableSharedExecutorPool`, `PartitionExecutorPoolSize`, `IdleWorkerMaxSpinBeforePark`. |
+| `Kommander/Scheduling/ParkedWorkerQueue.cs` | The ready-queue and idle-thread handshake shared by the pool and the WAL write scheduler. |
 
 ---
 

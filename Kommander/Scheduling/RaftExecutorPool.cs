@@ -1,5 +1,4 @@
 
-using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Scheduling;
@@ -14,22 +13,36 @@ namespace Kommander.Scheduling;
 /// thread holds the run-lock for a given partition at any instant, so the state machine
 /// still executes serially — exactly as with a dedicated thread.</para>
 ///
-/// <para><b>Scheduling:</b> when a partition has work, it is added to the global
-/// <c>_ready</c> queue by <see cref="Schedule"/>.  Idle pool threads park on a
-/// <c>SemaphoreSlim</c>; each release wakes one thread which dequeues one executor
-/// and calls <see cref="RaftPartitionExecutor.DrainOnPool"/>.  Cooperative
-/// yield-after-quantum behaviour is handled inside <c>DrainOnPool</c> via the existing
-/// per-class drain quanta.</para>
+/// <para><b>Scheduling:</b> when a partition has work, <see cref="Schedule"/> adds it to the
+/// ready queue, a <see cref="ParkedWorkerQueue{T}"/>. An idle pool thread is parked on its own
+/// event and costs nothing; a schedule wakes exactly one of them, or none while a worker is in
+/// its short spin for the next item. The woken thread dequeues one executor and calls
+/// <see cref="RaftPartitionExecutor.DrainOnPool"/>. Cooperative yield-after-quantum behaviour is
+/// handled inside <c>DrainOnPool</c> via the existing per-class drain quanta.</para>
 ///
-/// <para>Controlled by <see cref="RaftConfiguration.EnableSharedExecutorPool"/> and
-/// <see cref="RaftConfiguration.PartitionExecutorPoolSize"/>.</para>
+/// <para>The pool used to park every thread on one <c>SemaphoreSlim</c>, which spins before it
+/// parks on each wait. With a serial stream of small rounds that spin was most of the pool's CPU;
+/// see <see cref="ParkedWorkerQueue{T}"/>.</para>
+///
+/// <para>Controlled by <see cref="RaftConfiguration.EnableSharedExecutorPool"/>,
+/// <see cref="RaftConfiguration.PartitionExecutorPoolSize"/> and
+/// <see cref="RaftConfiguration.IdleWorkerMaxSpinBeforePark"/>.</para>
 /// </summary>
 public sealed class RaftExecutorPool : IDisposable
 {
     private readonly Thread[] _workers;
-    private readonly ConcurrentQueue<RaftPartitionExecutor> _ready = new();
+
+    /// <summary>Executors with work, and the pool threads parked for them.</summary>
+    private readonly ParkedWorkerQueue<RaftPartitionExecutor> _ready;
+
+#if KOMMANDER_THREAD_FREE
+    /// <summary>
+    /// The host pump's wake signal: one permit per <see cref="Schedule"/>. The thread-free build has no
+    /// pool threads to park, so this is its only waiter; see <see cref="WaitForWorkAsync"/>.
+    /// </summary>
     private readonly SemaphoreSlim _workAvailable = new(0, int.MaxValue);
-    private readonly CancellationTokenSource _cts = new();
+#endif
+
     private bool _started;
     private bool _stopped;
 
@@ -54,7 +67,12 @@ public sealed class RaftExecutorPool : IDisposable
     /// Sink for a failure that escapes an executor drain. Optional: a pool without one still
     /// survives the failure, it only cannot say so.
     /// </param>
-    public RaftExecutorPool(int poolSize, bool manualExecution = false, ILogger? logger = null)
+    /// <param name="maxSpinBeforePark">
+    /// Upper bound of how long one idle pool thread polls the ready queue before it parks. Null means
+    /// the default (20 µs); <see cref="TimeSpan.Zero"/> disables the spin, so every schedule that
+    /// finds no busy thread is a kernel wake. See <see cref="RaftConfiguration.IdleWorkerMaxSpinBeforePark"/>.
+    /// </param>
+    public RaftExecutorPool(int poolSize, bool manualExecution = false, ILogger? logger = null, TimeSpan? maxSpinBeforePark = null)
     {
         _manualExecution = manualExecution;
         _logger = logger;
@@ -74,13 +92,16 @@ public sealed class RaftExecutorPool : IDisposable
 
         for (int i = 0; i < _workers.Length; i++)
         {
-            _workers[i] = new Thread(WorkerLoop)
+            int worker = i;
+            _workers[i] = new Thread(() => WorkerLoop(worker))
             {
                 IsBackground = true,
                 Name = $"RaftExecutorPool-{i}"
             };
         }
 #endif
+
+        _ready = new ParkedWorkerQueue<RaftPartitionExecutor>(_workers.Length, maxSpinBeforePark);
     }
 
     /// <summary>True when this pool owns no threads and a caller drives every drain.</summary>
@@ -142,8 +163,7 @@ public sealed class RaftExecutorPool : IDisposable
     /// <summary>
     /// Waits until an executor is scheduled, the timeout expires, or the token is cancelled.
     ///
-    /// <para>Reuses the wake signal that a threaded pool parks its workers on: every
-    /// <see cref="Schedule"/> releases one permit, in manual mode too. The permits are counts, not
+    /// <para>Every <see cref="Schedule"/> releases one permit. The permits are counts, not
     /// flags, so a burst of schedules leaves surplus permits that wake the host pump for nothing.
     /// That costs one empty pass each and loses no wake. The wait is asynchronous, so it never
     /// blocks the one thread of a single-threaded host.</para>
@@ -154,6 +174,18 @@ public sealed class RaftExecutorPool : IDisposable
 
     /// <summary>Number of pool threads.</summary>
     public int PoolSize => _workers.Length;
+
+    /// <summary>
+    /// Times a parked pool thread was woken by a schedule. Each one is a thread hand-off with an OS
+    /// wake cost; against the executor operations served it gives the hand-offs per operation.
+    /// </summary>
+    public long WorkerWakeups => _ready.Wakeups;
+
+    /// <summary>Wake-ups after which the pool thread found no executor ready: another thread took it first.</summary>
+    public long EmptyWorkerWakeups => _ready.EmptyWakeups;
+
+    /// <summary>Test seam: pool threads parked, or about to park. Exact only while the pool is quiet.</summary>
+    internal int IdleWorkerCount => _ready.IdleWorkerCount;
 
     /// <summary>
     /// Starts all pool worker threads.  Safe to call only once.
@@ -178,13 +210,24 @@ public sealed class RaftExecutorPool : IDisposable
     /// flag has been set (CAS 0→1) before calling this method to prevent duplicate
     /// scheduling.
     /// </summary>
-    internal void Schedule(RaftPartitionExecutor executor)
+    /// <param name="executor">The executor with work.</param>
+    /// <param name="fromDrain">
+    /// True only for the re-schedule at the end of <see cref="RaftPartitionExecutor.DrainOnPoolAsync"/>.
+    /// The pool thread that ran that drain goes back to the ready queue as soon as the drain returns,
+    /// so it takes the executor itself (or wakes a parked thread for it when it takes another one
+    /// first). Waking a second thread there only produced a thread that found nothing.
+    /// </param>
+    internal void Schedule(RaftPartitionExecutor executor, bool fromDrain = false)
     {
-        _ready.Enqueue(executor);
+        // A schedule that lands after Stop has no thread to wake: the idle stack is empty by then.
+        // The executor behind it is stopping too (RaftManager stops every partition before the pool),
+        // so nothing a thread could still have done is lost.
+        if (fromDrain)
+            _ready.EnqueueFromWorker(executor);
+        else
+            _ready.Enqueue(executor);
 
-        // A schedule that lands after Dispose has no thread to wake. The executor behind it is
-        // stopping too (RaftManager stops every partition before the pool), so dropping the wake
-        // loses nothing a thread could still have done.
+#if KOMMANDER_THREAD_FREE
         try
         {
             _workAvailable.Release();
@@ -192,27 +235,15 @@ public sealed class RaftExecutorPool : IDisposable
         catch (ObjectDisposedException)
         {
         }
+#endif
     }
 
 #if !KOMMANDER_THREAD_FREE
-    private void WorkerLoop()
+    private void WorkerLoop(int worker)
     {
-        CancellationToken token = _cts.Token;
-
-        while (true)
+        // Take returns false once Stop ran, whatever is still queued: see the precondition on Stop.
+        while (_ready.Take(worker, handOn: true, out RaftPartitionExecutor? executor))
         {
-            try
-            {
-                _workAvailable.Wait(token);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            if (!_ready.TryDequeue(out RaftPartitionExecutor? executor))
-                continue;
-
             try
             {
                 executor.DrainOnPool();
@@ -250,25 +281,29 @@ public sealed class RaftExecutorPool : IDisposable
             return;
 
         _stopped = true;
-        _cts.Cancel();
 
-        // _workers is empty in manual mode. Release(0) throws, so the wake-and-join is skipped:
-        // there is no parked worker to wake and no thread to join.
-        if (_started && _workers.Length > 0)
+        // Wakes every parked thread; each sees the request on its next take and exits. A thread
+        // inside a drain finishes it first.
+        _ready.RequestStop();
+
+#if !KOMMANDER_THREAD_FREE
+        // _workers is empty in manual mode: there is no thread to join.
+        if (_started)
         {
-            // Wake all parked workers so they observe cancellation and exit.
-            _workAvailable.Release(_workers.Length);
-
             foreach (Thread t in _workers)
                 t.Join();
         }
+#endif
     }
 
     public void Dispose()
     {
         GC.SuppressFinalize(this);
         Stop();
-        _cts.Dispose();
+        _ready.Dispose();
+
+#if KOMMANDER_THREAD_FREE
         _workAvailable.Dispose();
+#endif
     }
 }

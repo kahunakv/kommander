@@ -49,3 +49,8 @@ Kommander/RaftPartitionStateMachine.cs|wall-clock-ticks 1
 # must read the same clock. It only sets how long an idle read worker burns CPU before it parks;
 # it decides nothing about elections, commits, or applies.
 Kommander/WAL/IO/FairReadScheduler.cs|wall-clock-ticks 4
+# The same spin-before-park window, for the executor pool's threads and the WAL write workers
+# (ParkedWorkerQueue): the spin deadline and the park length, read on the clock Thread.SpinWait
+# burns. It sets how long an idle worker polls before it parks and decides nothing else. A
+# simulation never reaches it: with manual execution these pools have no worker threads.
+Kommander/Scheduling/ParkedWorkerQueue.cs|wall-clock-ticks 4

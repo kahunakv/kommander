@@ -319,6 +319,7 @@ In `RaftConfiguration.cs`:
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write` (one `fsync` on RocksDB). |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |
 | `WriteIOThreads` | `4` | WAL scheduler worker threads — how many writes can sync concurrently across partitions. |
+| `IdleWorkerMaxSpinBeforePark` | `20 µs` | Upper bound of how long one idle WAL worker polls the ready-queue before it parks. An idle worker is parked on its own event and costs nothing; an enqueue that makes a partition ready wakes one worker (a lingering worker first), or none while a worker is in this spin. `Zero` turns the spin off. Shared with the executor pool and the read scheduler. |
 
 Tuning notes:
 

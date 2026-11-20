@@ -866,6 +866,25 @@ public class RaftConfiguration
     /// </summary>
     public int PartitionExecutorPoolSize { get; set; }
 
+    /// <summary>
+    /// Upper bound of how long one idle worker thread of a scheduling pool polls its ready queue
+    /// before it parks. Applies to the shared executor pool, the WAL write scheduler and the WAL
+    /// read scheduler, each on its own.
+    ///
+    /// <para>An idle worker is parked on its own event and costs nothing; a piece of work wakes
+    /// one of them with a kernel wake. The spin is the alternative for a busy stream: one worker per
+    /// pool (never more) keeps polling for a moment after it runs out of work, and work that
+    /// arrives inside that moment is taken with no system call and no wake-up delay. The window
+    /// adapts: it closes after a few spins that found nothing and reopens when work arrives soon
+    /// after a park, so a slow stream pays nothing for it.</para>
+    ///
+    /// <para>This is a trade of CPU for hand-off latency, and only that: it never changes what is
+    /// written or acknowledged. <see cref="TimeSpan.Zero"/> disables the spin, which costs the least
+    /// CPU and makes every hand-off to an idle pool a kernel wake. Raise it on a host with idle
+    /// cores where the round time matters more than the CPU. Default 20 µs.</para>
+    /// </summary>
+    public TimeSpan IdleWorkerMaxSpinBeforePark { get; set; } = TimeSpan.FromMicroseconds(20);
+
     // ── Quiescence ───────────────────────────────────────────────────────────
 
     /// <summary>

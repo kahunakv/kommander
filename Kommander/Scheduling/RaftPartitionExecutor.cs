@@ -733,7 +733,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         // for work that may have arrived between AreQueuesEmpty() and the clear.
         if (!AreQueuesEmpty())
         {
-            _pool!.Schedule(this); // _inQueue stays 1
+            _pool!.Schedule(this, fromDrain: true); // _inQueue stays 1
         }
         else
         {
@@ -746,7 +746,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             //    _inQueue → Stop() now blocks on _stopTcs forever with nobody scheduled.
             //    Including _stopping in the condition ensures we re-schedule in that case.
             if ((!AreQueuesEmpty() || _stopping) && Interlocked.CompareExchange(ref _inQueue, 1, 0) == 0)
-                _pool!.Schedule(this);
+                _pool!.Schedule(this, fromDrain: true);
         }
     }
 

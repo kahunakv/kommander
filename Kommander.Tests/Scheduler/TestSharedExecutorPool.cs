@@ -464,6 +464,153 @@ public sealed class TestSharedExecutorPool
         }
     }
 
+    // ── Parked-worker handshake ───────────────────────────────────────────
+    //
+    // The pool parked its threads on one SemaphoreSlim; it now uses ParkedWorkerQueue. Tests that
+    // count wake-ups build the pool with a zero spin bound, so every hand-off is a park and a wake
+    // and the counts are exact.
+
+    private static readonly TimeSpan HandoffTimeout = TimeSpan.FromSeconds(30);
+
+    private static async Task WaitUntil(Func<bool> condition, string because)
+    {
+        global::System.Diagnostics.Stopwatch watch = global::System.Diagnostics.Stopwatch.StartNew();
+
+        while (!condition())
+        {
+            if (watch.Elapsed > HandoffTimeout)
+                Assert.Fail($"Timed out waiting: {because}");
+
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// The lost-wake race: an executor scheduled between a pool thread's last empty dequeue and its park
+    /// must be drained. Awaiting each operation before the next puts every schedule right where the
+    /// thread is heading to sleep. A lost wake has no safety net (the park has no timeout), so it shows
+    /// as a hang.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(20)]
+    public async Task PoolMode_LostWakeRace_EveryScheduleIsDrained(int spinMicroseconds)
+    {
+        using RaftExecutorPool pool = new(2, maxSpinBeforePark: TimeSpan.FromMicroseconds(spinMicroseconds));
+        pool.Start();
+
+        var (executor, _) = BuildExecutor(pool, partitionId: 0);
+        try
+        {
+            await executor.RestoreTask.WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+
+            Task loop = Task.Run(async () =>
+            {
+                for (int i = 0; i < 10_000; i++)
+                {
+                    Thread.SpinWait(i % 64);
+                    await executor.DrainAsync(TestContext.Current.CancellationToken);
+                }
+            }, TestContext.Current.CancellationToken);
+
+            await loop.WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            executor.Stop();
+            executor.Dispose();
+        }
+    }
+
+    /// <summary>Many callers over more partitions than pool threads: every operation is answered.</summary>
+    [Fact]
+    public async Task PoolMode_ManyCallers_MorePartitionsThanThreads_AllAnswered()
+    {
+        using RaftExecutorPool pool = new(4);
+        pool.Start();
+
+        RaftPartitionExecutor[] executors = Enumerable.Range(0, 12).Select(i => BuildExecutor(pool, i).executor).ToArray();
+        try
+        {
+            await Task.WhenAll(executors.Select(e => e.RestoreTask)).WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+
+            Task[] callers = new Task[8];
+            for (int c = 0; c < callers.Length; c++)
+            {
+                int caller = c;
+                callers[c] = Task.Run(async () =>
+                {
+                    Random random = new(caller);
+                    for (int i = 0; i < 3_000; i++)
+                    {
+                        if (random.Next(8) == 0)
+                            Thread.SpinWait(random.Next(500));
+
+                        await executors[(i + caller) % executors.Length].DrainAsync(TestContext.Current.CancellationToken);
+                    }
+                }, TestContext.Current.CancellationToken);
+            }
+
+            await Task.WhenAll(callers).WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            foreach (RaftPartitionExecutor executor in executors)
+            {
+                executor.Stop();
+                executor.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// One wake per operation for a serial caller, with four pool threads: three stay parked, and no
+    /// woken thread finds the ready queue empty. The executor's own re-schedule at the end of a drain
+    /// wakes nobody.
+    /// </summary>
+    [Fact]
+    public async Task PoolMode_SerialOperations_OneWakeEach_NoneEmpty()
+    {
+        using RaftExecutorPool pool = new(4, maxSpinBeforePark: TimeSpan.Zero);
+        pool.Start();
+
+        var (executor, _) = BuildExecutor(pool, partitionId: 0);
+        try
+        {
+            await executor.RestoreTask.WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+            await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+            await WaitUntil(() => pool.IdleWorkerCount == 4, "all pool threads parked");
+
+            long wakeupsBefore = pool.WorkerWakeups;
+            long emptyBefore = pool.EmptyWorkerWakeups;
+
+            for (int i = 0; i < 10; i++)
+            {
+                await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+                await WaitUntil(() => pool.IdleWorkerCount == 4, "all pool threads parked");
+            }
+
+            Assert.Equal(10, pool.WorkerWakeups - wakeupsBefore);
+            Assert.Equal(0, pool.EmptyWorkerWakeups - emptyBefore);
+        }
+        finally
+        {
+            executor.Stop();
+            executor.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Pool_Stop_WhileThreadsParked_Returns()
+    {
+        RaftExecutorPool pool = new(4, maxSpinBeforePark: TimeSpan.Zero);
+        pool.Start();
+
+        await WaitUntil(() => pool.IdleWorkerCount == 4, "all pool threads parked");
+
+        await Task.Run(pool.Dispose, TestContext.Current.CancellationToken).WaitAsync(HandoffTimeout, TestContext.Current.CancellationToken);
+    }
+
     // ── Dedicated-thread mode still works (flag=false path) ───────────────
 
     [Fact]
