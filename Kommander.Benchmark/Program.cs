@@ -131,10 +131,14 @@ CountingCommunication.TrafficSnapshot traffic = default;
 foreach ((string endpoint, CountingCommunication.TrafficSnapshot end) in trafficEnd)
     traffic = Add(traffic, end - trafficStart.GetValueOrDefault(endpoint));
 
+// A single-voter arm has no follower: the per-follower figures are 0, not a division by zero
+// (NaN does not serialize to JSON).
+bool replicated = calls > 0 && followers > 0;
+
 TrafficStats trafficStats = new(
-    calls > 0 ? (double)traffic.Frames / calls / followers : 0,
+    replicated ? (double)traffic.Frames / calls / followers : 0,
     traffic.Frames > 0 ? (double)traffic.Entries / traffic.Frames : 0,
-    calls > 0 ? (double)traffic.LogBytes / calls / followers : 0,
+    replicated ? (double)traffic.LogBytes / calls / followers : 0,
     calls > 0 ? (double)(acksEnd - acksStart) / calls : 0,
     traffic.Heartbeats / seconds);
 

@@ -121,19 +121,49 @@ public static class BenchmarkReport
         {
             sb.AppendLine();
             sb.AppendLine("  Round stages (raft.round.stage_ms; leader chain in order, then its split):");
+            string resume = RoundStageInstrumentation.StageName(RoundStage.LeaderResume);
+            string[] resumeHalves =
+            [
+                RoundStageInstrumentation.StageName(RoundStage.LeaderResumeFetch),
+                RoundStageInstrumentation.StageName(RoundStage.LeaderResumeHop),
+            ];
+
             foreach (string name in RoundStageInstrumentation.AllStageNames)
             {
-                if (stages.TryGetValue(name, out StageStats? s))
-                    sb.AppendLine(Inv($"    {name,-24} n={s.Count,9:N0}  mean={s.MeanMs,8:0.000}  p50={s.P50Ms,8:0.000}  p99={s.P99Ms,8:0.000} ms"));
+                // The halves of leader.resume are listed under it, not at the end where the enum has them.
+                if (resumeHalves.Contains(name))
+                    continue;
+
+                AppendStage(sb, stages, name, name);
+
+                if (name == resume)
+                {
+                    foreach (string half in resumeHalves)
+                        AppendStage(sb, stages, half, "  " + half);
+                }
             }
 
-            string[] chain = ["leader.queue", "leader.propose", "leader.wal", "leader.wal_completion", "leader.fanout", "leader.replication", "leader.resume"];
+            // The stages in series differ by path. With the fan-out ahead of the leader's own write
+            // (the default, and only when there is a voter peer to send to), that write runs beside
+            // the replication and is not part of the series. A single-voter partition, or the option
+            // off, writes first; a single voter also records no replication stage.
+            bool fanOutFirst = c.Nodes > 1 && c.FanOutBeforeLocalWrite != false;
+            string[] chain = fanOutFirst
+                ? ["leader.queue", "leader.propose", "leader.fanout", "leader.replication", resume]
+                : ["leader.queue", "leader.propose", "leader.wal", "leader.wal_completion", "leader.fanout", "leader.replication", resume];
+
             double chainSum = chain.Sum(n => stages.TryGetValue(n, out StageStats? s) ? s.MeanMs : 0);
             if (stages.TryGetValue("leader.round", out StageStats? round))
                 sb.AppendLine(Inv($"    leader chain sum {chainSum:0.000} ms of round {round.MeanMs:0.000} ms (rest: gateway and waiter registration)"));
         }
 
         return sb.ToString();
+    }
+
+    private static void AppendStage(StringBuilder sb, Dictionary<string, StageStats> stages, string name, string shown)
+    {
+        if (stages.TryGetValue(name, out StageStats? s))
+            sb.AppendLine(Inv($"    {shown,-24} n={s.Count,9:N0}  mean={s.MeanMs,8:0.000}  p50={s.P50Ms,8:0.000}  p99={s.P99Ms,8:0.000} ms"));
     }
 
     /// <summary>

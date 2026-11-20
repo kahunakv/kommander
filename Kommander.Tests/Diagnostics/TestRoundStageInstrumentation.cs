@@ -10,7 +10,7 @@ namespace Kommander.Tests.Diagnostics;
 
 /// <summary>
 /// Pins the shape of the <c>raft.round.stage_ms</c> histogram (<see cref="RoundStageInstrumentation"/>)
-/// on a three-node in-memory cluster.
+/// on a three-node in-memory cluster, and the split of <c>leader.resume</c> on a single-voter one.
 ///
 /// <para>The assertions are structural, never on absolute timings: every successful call records
 /// each leader-chain stage once; the follower stages appear; and, per call, the serial stages of
@@ -101,6 +101,8 @@ public sealed class TestRoundStageInstrumentation
                 Assert.Equal(Calls, stages[stage].Count);
             }
 
+            AssertResumeHalvesAddUp(stages);
+
             Assert.True(stages["leader.ack"].Count == Calls, "one quorum-making ack per call");
             Assert.True(stages["leader.ack_queue"].Count >= Calls, "every ack waits in the executor queue");
             Assert.True(stages["leader.commit_wal"].Count >= Calls - 1, "the commit marker is written for each call");
@@ -157,6 +159,88 @@ public sealed class TestRoundStageInstrumentation
             foreach (RaftManager node in nodes)
                 node.Dispose();
         }
+    }
+
+
+    /// <summary>
+    /// On a single-voter partition the leader's own write makes the quorum, so the ticket is released
+    /// in the propose completion's executor turn, and that turn then applies the batch. The caller
+    /// learns its ticket from that turn's answer and only then asks for its waiter, so the request
+    /// cannot be served before the apply ends: <c>leader.resume_fetch</c> must carry at least the
+    /// apply time. The apply here spins for a known time on the stage clock, which makes that a
+    /// lower bound and not a timing guess.
+    ///
+    /// <para>Without the fetch stamp the half reads zero and the whole wait lands in
+    /// <c>leader.resume_hop</c>, which is what this test catches.</para>
+    /// </summary>
+    [Fact]
+    public async Task SingleVoter_ResumeFetchCarriesTheApplyThatRunsAfterTheRelease()
+    {
+        const int applyMs = 2;
+
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        RaftManager node = MakeNode(new InMemoryCommunication(), 8944, []);
+
+        node.OnReplicationReceived += (_, _) =>
+        {
+            ValueStopwatch spin = ValueStopwatch.StartNew();
+            while (spin.GetElapsedMilliseconds() < applyMs)
+                Thread.SpinWait(8);
+
+            return Task.FromResult(true);
+        };
+
+        using StageRecorder recorder = new();
+
+        try
+        {
+            await node.JoinCluster(ct);
+            RaftManager leader = await FindLeader([node], partitionId: 1, ct);
+
+            // Warm the path so the first measured call is not a leadership-barrier edge case.
+            Assert.True((await leader.ReplicateLogs(1, "stage", [new byte[32]], cancellationToken: ct)).Success);
+
+            RoundStageInstrumentation.Enabled = true;
+            recorder.Clear();
+
+            for (int i = 0; i < Calls; i++)
+            {
+                RaftReplicationResult result = await leader.ReplicateLogs(1, "stage", [new byte[64]], cancellationToken: ct);
+                Assert.True(result.Success, $"call {i}: {result.Status}");
+            }
+
+            RoundStageInstrumentation.Enabled = false;
+
+            Dictionary<string, (long Count, double SumMs)> stages = recorder.Snapshot();
+
+            Assert.Empty(recorder.NegativeStages);
+            Assert.Equal(Calls, stages["leader.round"].Count);
+            Assert.Equal(Calls, stages["leader.resume"].Count);
+            AssertResumeHalvesAddUp(stages);
+
+            double fetchMs = stages["leader.resume_fetch"].SumMs;
+            Assert.True(
+                fetchMs >= Calls * applyMs,
+                $"leader.resume_fetch is {fetchMs:0.000} ms over {Calls} calls, below the {Calls * applyMs} ms of apply the waiter fetch waits behind (leader.resume {stages["leader.resume"].SumMs:0.000} ms, leader.resume_hop {stages["leader.resume_hop"].SumMs:0.000} ms)");
+        }
+        finally
+        {
+            RoundStageInstrumentation.Enabled = false;
+            node.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The two halves of <c>leader.resume</c> are recorded with it: one sample each per call, and
+    /// they add up to it (the tolerance is for the conversion of ticks to milliseconds).
+    /// </summary>
+    private static void AssertResumeHalvesAddUp(Dictionary<string, (long Count, double SumMs)> stages)
+    {
+        Assert.Equal(Calls, stages["leader.resume_fetch"].Count);
+        Assert.Equal(Calls, stages["leader.resume_hop"].Count);
+
+        double halvesMs = stages["leader.resume_fetch"].SumMs + stages["leader.resume_hop"].SumMs;
+        Assert.Equal(stages["leader.resume"].SumMs, halvesMs, tolerance: 0.001);
     }
 
     /// <summary>Collects count and sum per stage from the histogram, for the whole process.</summary>

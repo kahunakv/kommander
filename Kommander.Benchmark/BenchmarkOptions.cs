@@ -12,7 +12,7 @@ namespace Kommander.Benchmark;
 /// </summary>
 public sealed class BenchmarkOptions
 {
-    [Option("nodes", Default = 3, HelpText = "Number of Raft nodes in the cluster (>= 2).")]
+    [Option("nodes", Default = 3, HelpText = "Number of Raft nodes in the cluster. 1 = a single-voter partition: the leader's own write is the quorum, and nothing is replicated.")]
     public int Nodes { get; set; }
 
     [Option("partitions", Default = 1, HelpText = "InitialPartitions. The workload targets user partitions 1..N.")]
@@ -92,8 +92,12 @@ public sealed class BenchmarkOptions
         if (Fit is not null)
             return null;
 
-        if (Nodes < 2)
-            return "--nodes must be at least 2";
+        if (Nodes < 1)
+            return "--nodes must be at least 1";
+
+        // With one node there is no follower: the arm would report an apply cost that nothing paid.
+        if (Nodes == 1 && ApplyOn == "followers" && ApplyCostMicros > 0)
+            return "--apply-on followers needs at least 2 nodes";
 
         if (Partitions < 1)
             return "--partitions must be at least 1";

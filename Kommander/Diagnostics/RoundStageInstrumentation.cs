@@ -52,7 +52,10 @@ public enum RoundStage
     /// <summary>Leader: the executor processes the ack that makes the quorum, until the ticket is released.</summary>
     LeaderAck,
 
-    /// <summary>Leader: the ticket is released until the caller's <c>ReplicateLogs</c> continuation runs.</summary>
+    /// <summary>
+    /// Leader: the ticket is released until the caller's <c>ReplicateLogs</c> continuation runs.
+    /// <see cref="LeaderResumeFetch"/> and <see cref="LeaderResumeHop"/> split it and add up to it.
+    /// </summary>
     LeaderResume,
 
     /// <summary>Leader: the whole successful <c>ReplicateLogs</c> call, from the gateway entry to the caller's resume.</summary>
@@ -90,6 +93,26 @@ public enum RoundStage
 
     /// <summary>Either side: an <c>AppendLogs</c> or <c>CompleteAppendLogs</c> waits in the transport dispatcher until its send starts.</summary>
     TransportDispatch,
+
+    // The two halves of LeaderResume are appended here, not placed beside it: the numeric values of
+    // the members above are compiled into every consumer, and an insert would shift them.
+
+    /// <summary>
+    /// Leader: the first half of <see cref="LeaderResume"/>. The ticket is released, but its caller cannot
+    /// see that yet, because the caller's waiter fetch (<c>GetTicketWaiterTask</c>, a second executor
+    /// request) is still in the partition executor's queue. Zero when the fetch was served before the
+    /// release, which is the usual order when a follower's ack makes the quorum. On a single-voter
+    /// partition the leader's own write makes the quorum and the same executor turn goes on to apply
+    /// the batch, so the fetch waits behind that apply.
+    /// </summary>
+    LeaderResumeFetch,
+
+    /// <summary>
+    /// Leader: the second half of <see cref="LeaderResume"/>. It starts when the caller can see the
+    /// result (the ticket is released and the waiter fetch is served, whichever is later) and ends
+    /// when the caller's continuation runs: the hop to the thread pool.
+    /// </summary>
+    LeaderResumeHop,
 }
 
 /// <summary>
@@ -118,7 +141,11 @@ public enum RoundStage
 /// executor's queue envelope, the WAL operation, the WAL completion, the proposal quorum). No
 /// stage needs a per-proposal lookup, except <see cref="RoundStage.LeaderResume"/>, whose start
 /// (the ticket release, on the executor) and end (the caller's continuation) share nothing but the
-/// ticket; it goes through a small bounded side table keyed by (partition, ticket).</para>
+/// ticket; it goes through a small bounded side table keyed by (partition, ticket). The same
+/// entry carries the stamp that splits the stage in two: the caller reads its waiter with a second
+/// executor request, and a release that happens before that request is served is invisible to the
+/// caller until it is (<see cref="RoundStage.LeaderResumeFetch"/>, then
+/// <see cref="RoundStage.LeaderResumeHop"/>).</para>
 ///
 /// <para><b>Means add up; percentiles do not.</b> The stage means of the leader chain sum to
 /// the round mean. The follower stages are averaged over both followers, while the round waits
@@ -163,6 +190,8 @@ public static class RoundStageInstrumentation
         "follower.ack",
         "follower.apply",
         "transport.dispatch",
+        "leader.resume_fetch",
+        "leader.resume_hop",
     ];
 
     private static readonly KeyValuePair<string, object?>[] StageTags =
@@ -179,7 +208,14 @@ public static class RoundStageInstrumentation
     /// resumes (timeout, cancellation, a waiter found already complete) leaves its entry, and the
     /// table is cleared when it reaches <see cref="MaxPendingReleases"/> rather than grow.
     /// </summary>
-    private static readonly ConcurrentDictionary<(int PartitionId, HLCTimestamp Ticket), long> PendingReleases = new();
+    private static readonly ConcurrentDictionary<(int PartitionId, HLCTimestamp Ticket), ReleaseStamp> PendingReleases = new();
+
+    /// <summary>
+    /// When a ticket was released and, if its caller's waiter fetch was served after that, when the
+    /// fetch was served. <see cref="VisibleTicks"/> stays 0 when the fetch was served first: the
+    /// release is then the moment the caller can see the result.
+    /// </summary>
+    private readonly record struct ReleaseStamp(long ReleasedTicks, long VisibleTicks);
 
     private const int MaxPendingReleases = 65_536;
 
@@ -240,12 +276,37 @@ public static class RoundStageInstrumentation
         if (PendingReleases.Count >= MaxPendingReleases)
             PendingReleases.Clear();
 
-        PendingReleases[(partitionId, ticket)] = Stopwatch.GetTimestamp();
+        PendingReleases[(partitionId, ticket)] = new(Stopwatch.GetTimestamp(), 0);
     }
 
     /// <summary>
-    /// Records <see cref="RoundStage.LeaderResume"/> for the ticket, if its release was marked,
-    /// and <see cref="RoundStage.LeaderRound"/> from <paramref name="roundStartTicks"/>.
+    /// Notes that the executor served the caller's waiter fetch (<c>GetTicketWaiterTask</c>) for the
+    /// ticket. When the ticket is already released, this is the first moment its caller can see the
+    /// result, and it splits <see cref="RoundStage.LeaderResume"/> into
+    /// <see cref="RoundStage.LeaderResumeFetch"/> and <see cref="RoundStage.LeaderResumeHop"/>. A
+    /// fetch served before the release finds no entry and leaves none: the release is then that
+    /// moment, and the fetch half is zero.
+    ///
+    /// <para>Called on the partition's executor, like <see cref="MarkReleased"/>, and before the
+    /// fetch is answered: the caller reaches <see cref="RecordResume"/> only through that answer, so
+    /// it cannot take the entry first.</para>
+    /// </summary>
+    internal static void MarkWaiterFetched(int partitionId, HLCTimestamp ticket)
+    {
+        if (!IsActive)
+            return;
+
+        (int, HLCTimestamp) key = (partitionId, ticket);
+
+        if (PendingReleases.TryGetValue(key, out ReleaseStamp stamp) && stamp.VisibleTicks == 0)
+            PendingReleases.TryUpdate(key, stamp with { VisibleTicks = Stopwatch.GetTimestamp() }, stamp);
+    }
+
+    /// <summary>
+    /// Records <see cref="RoundStage.LeaderResume"/> and its two halves for the ticket, if its
+    /// release was marked, and <see cref="RoundStage.LeaderRound"/> from
+    /// <paramref name="roundStartTicks"/>. The halves are recorded here, with the whole, so the
+    /// three have one sample per call and the halves add up to the whole.
     /// </summary>
     internal static void RecordResume(int partitionId, HLCTimestamp ticket, long roundStartTicks)
     {
@@ -254,8 +315,14 @@ public static class RoundStageInstrumentation
 
         long now = Stopwatch.GetTimestamp();
 
-        if (PendingReleases.TryRemove((partitionId, ticket), out long releasedTicks))
-            Record(RoundStage.LeaderResume, releasedTicks, now);
+        if (PendingReleases.TryRemove((partitionId, ticket), out ReleaseStamp stamp))
+        {
+            long visibleTicks = stamp.VisibleTicks != 0 ? stamp.VisibleTicks : stamp.ReleasedTicks;
+
+            Record(RoundStage.LeaderResume, stamp.ReleasedTicks, now);
+            Record(RoundStage.LeaderResumeFetch, stamp.ReleasedTicks, visibleTicks);
+            Record(RoundStage.LeaderResumeHop, visibleTicks, now);
+        }
 
         Record(RoundStage.LeaderRound, roundStartTicks, now);
     }

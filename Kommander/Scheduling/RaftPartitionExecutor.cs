@@ -1320,6 +1320,12 @@ public sealed class RaftPartitionExecutor : IDisposable
                 case RaftRequestType.GetTicketWaiterTask:
                 {
                     Task<(RaftProposalTicketState, long)>? waiterTask = _stateMachine.GetTicketWaiterTask(request.Timestamp);
+
+                    // Round stages (off by default): marked before the answer, because the caller's
+                    // continuation may run at once on another thread and take this stamp.
+                    if (waiterTask is not null)
+                        RoundStageInstrumentation.MarkWaiterFetched(_partitionId, request.Timestamp);
+
                     op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.TicketWaiterTask, waiterTask));
                     break;
                 }

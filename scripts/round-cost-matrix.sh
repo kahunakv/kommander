@@ -13,6 +13,8 @@
 #   scripts/round-cost-matrix.sh [output.jsonl]
 #
 # Environment (defaults in brackets):
+#   NODES         ["3"]    node counts, e.g. "1 3". 1 is a single-voter partition: the leader's own
+#                          write is the quorum and nothing is sent, so one transport is enough there
 #   TRANSPORTS    ["grpc-mtls grpc-plaintext memory"]
 #   STORAGES      ["memory rocksdb"]
 #   BATCHES       ["1 16 64 256"]
@@ -37,6 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUTPUT="${1:-round-cost-$(date -u +%Y%m%dT%H%M%SZ).jsonl}"
+NODES="${NODES:-3}"
 TRANSPORTS="${TRANSPORTS:-grpc-mtls grpc-plaintext memory}"
 STORAGES="${STORAGES:-memory rocksdb}"
 BATCHES="${BATCHES:-1 16 64 256}"
@@ -63,6 +66,7 @@ BENCH="Kommander.Benchmark/bin/Release/$FRAMEWORK/Kommander.Benchmark.dll"
 echo "Output: $OUTPUT   label: $LABEL   wal-dir: $WAL_DIR   sync: $SYNC_WRITES"
 
 port=52000
+for nodes in $NODES; do
 for transport in $TRANSPORTS; do
   case "$transport" in
     grpc-mtls)      transport_args=(--transport grpc) ;;
@@ -74,12 +78,13 @@ for transport in $TRANSPORTS; do
   for storage in $STORAGES; do
     for concurrency in $CONCURRENCY; do
       for batch in $BATCHES; do
-        echo "── transport=$transport storage=$storage concurrency=$concurrency batch=$batch"
+        echo "── nodes=$nodes transport=$transport storage=$storage concurrency=$concurrency batch=$batch"
 
         # A fresh port range per arm: a previous arm's sockets can sit in TIME_WAIT.
         port=$(( port + 10 ))
 
         dotnet "$BENCH" \
+          --nodes "$nodes" \
           "${transport_args[@]}" \
           --storage "$storage" \
           --wal-dir "$WAL_DIR" \
@@ -97,6 +102,7 @@ for transport in $TRANSPORTS; do
       done
     done
   done
+done
 done
 
 echo
