@@ -97,7 +97,7 @@
   <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
     <PackageReference Include="Grpc.AspNetCore" Version="2.85.0" />
     <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.85.0" />
-    <PackageReference Include="Kommander.RocksDB" Version="11.8.1.9003" />
+    <PackageReference Include="Kommander.RocksDB" Version="11.12.0.9001" />
   </ItemGroup>
 
   <!-- Microsoft.Data.Sqlite 11 moves to SQLitePCLRaw 3, which takes the native library from the
