@@ -23,10 +23,14 @@ public sealed class RaftResponse
     public HLCTimestamp TicketId { get; } = HLCTimestamp.Zero;
 
     /// <summary>
-    /// Carries the event-driven completion task for a proposal ticket when
-    /// <see cref="RaftResponseType"/> is <see cref="RaftResponseType.TicketWaiterTask"/>.
-    /// The task completes when the proposal reaches a terminal state (committed, rolled-back,
-    /// or invalidated) so callers can await it instead of polling <c>GetTicketState</c>.
+    /// The event-driven completion task of a proposal ticket. The task completes when the proposal
+    /// reaches a terminal state (committed, rolled-back, or invalidated), so callers can await it
+    /// instead of polling <c>GetTicketState</c>.
+    ///
+    /// <para>It arrives two ways. The answer to an accepted proposal carries it together with
+    /// <see cref="TicketId"/>, so the proposer needs no second request. A
+    /// <see cref="RaftResponseType.TicketWaiterTask"/> response carries it for a caller that only
+    /// has the ticket.</para>
     /// </summary>
     public Task<(RaftProposalTicketState, long)>? WaiterTask { get; }
 
@@ -89,6 +93,18 @@ public sealed class RaftResponse
         Type = type;
         Status = status;
         TicketId = ticketId;
+    }
+
+    /// <summary>
+    /// Constructs the answer to an accepted proposal: its ticket and the task that completes when
+    /// the ticket is released.
+    /// </summary>
+    public RaftResponse(RaftResponseType type, RaftOperationStatus status, HLCTimestamp ticketId, Task<(RaftProposalTicketState, long)>? waiterTask)
+    {
+        Type = type;
+        Status = status;
+        TicketId = ticketId;
+        WaiterTask = waiterTask;
     }
 
     /// <summary>

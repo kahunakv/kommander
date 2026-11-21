@@ -165,16 +165,16 @@ public sealed class TestRoundStageInstrumentation
     /// <summary>
     /// On a single-voter partition the leader's own write makes the quorum, so the ticket is released
     /// in the propose completion's executor turn, and that turn then applies the batch. The caller
-    /// learns its ticket from that turn's answer and only then asks for its waiter, so the request
-    /// cannot be served before the apply ends: <c>leader.resume_fetch</c> must carry at least the
-    /// apply time. The apply here spins for a known time on the stage clock, which makes that a
-    /// lower bound and not a timing guess.
+    /// gets its waiter with the answer of that turn, so it resumes at the release and
+    /// <c>leader.resume</c> must not carry the apply. The apply here spins for a known time on the
+    /// stage clock: over the run it adds up to far more than any hop to the thread pool.
     ///
-    /// <para>Without the fetch stamp the half reads zero and the whole wait lands in
-    /// <c>leader.resume_hop</c>, which is what this test catches.</para>
+    /// <para>When the caller fetched its waiter with a second executor request, that request waited
+    /// behind the apply and <c>leader.resume_fetch</c> carried all of it. This test failed then with
+    /// the fetch half above the apply time.</para>
     /// </summary>
     [Fact]
-    public async Task SingleVoter_ResumeFetchCarriesTheApplyThatRunsAfterTheRelease()
+    public async Task SingleVoter_ResumeDoesNotCarryTheApplyThatRunsAfterTheRelease()
     {
         const int applyMs = 2;
 
@@ -218,14 +218,71 @@ public sealed class TestRoundStageInstrumentation
             Assert.Equal(Calls, stages["leader.resume"].Count);
             AssertResumeHalvesAddUp(stages);
 
-            double fetchMs = stages["leader.resume_fetch"].SumMs;
+            // Half the apply time is the bound: a resume behind the apply carries all of it, and a
+            // resume at the release carries none, so nothing in between is a pass by accident.
+            double resumeMs = stages["leader.resume"].SumMs;
             Assert.True(
-                fetchMs >= Calls * applyMs,
-                $"leader.resume_fetch is {fetchMs:0.000} ms over {Calls} calls, below the {Calls * applyMs} ms of apply the waiter fetch waits behind (leader.resume {stages["leader.resume"].SumMs:0.000} ms, leader.resume_hop {stages["leader.resume_hop"].SumMs:0.000} ms)");
+                resumeMs < Calls * applyMs / 2.0,
+                $"leader.resume is {resumeMs:0.000} ms over {Calls} calls with {Calls * applyMs} ms of apply after the releases: the caller waits behind the apply (leader.resume_fetch {stages["leader.resume_fetch"].SumMs:0.000} ms, leader.resume_hop {stages["leader.resume_hop"].SumMs:0.000} ms)");
         }
         finally
         {
             RoundStageInstrumentation.Enabled = false;
+            node.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The same fact without a clock: the application's apply is held on a gate, and the proposer's
+    /// call must return while it is held. The ticket is released before the apply starts, the
+    /// answer of that turn carries the waiter, and nothing the caller needs is behind the apply.
+    /// A caller that fetched its waiter from the executor would wait here until the gate opens.
+    /// </summary>
+    [Fact]
+    public async Task SingleVoter_CallerResumesWhileTheApplyIsStillRunning()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        RaftManager node = MakeNode(new InMemoryCommunication(), 8946, []);
+
+        const int heldPayloadBytes = 64;
+
+        TaskCompletionSource applyStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Only the measured entry is held, by its size. A flag set after the warm-up call returned
+        // would also catch the warm-up's own apply, which may not have run yet: its caller resumes
+        // at the release too. The measured proposal would then queue behind that held turn.
+        node.OnReplicationReceived += async (_, log) =>
+        {
+            if (log.LogData?.Length == heldPayloadBytes)
+            {
+                applyStarted.TrySetResult();
+                await gate.Task.ConfigureAwait(false);
+            }
+
+            return true;
+        };
+
+        try
+        {
+            await node.JoinCluster(ct);
+            RaftManager leader = await FindLeader([node], partitionId: 1, ct);
+
+            Assert.True((await leader.ReplicateLogs(1, "stage", [new byte[32]], cancellationToken: ct)).Success);
+
+            Task<RaftReplicationResult> call = leader.ReplicateLogs(1, "stage", [new byte[heldPayloadBytes]], cancellationToken: ct);
+
+            RaftReplicationResult result = await call.WaitAsync(TestTimeouts.Scale(TimeSpan.FromSeconds(10)), ct);
+
+            Assert.True(result.Success, result.Status.ToString());
+
+            // The apply did start and is still held: the call returned beside it, not after it.
+            await applyStarted.Task.WaitAsync(TestTimeouts.Scale(TimeSpan.FromSeconds(10)), ct);
+            Assert.False(gate.Task.IsCompleted);
+        }
+        finally
+        {
+            gate.TrySetResult();
             node.Dispose();
         }
     }

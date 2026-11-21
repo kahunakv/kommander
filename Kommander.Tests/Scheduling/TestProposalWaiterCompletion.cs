@@ -98,6 +98,73 @@ public class TestProposalWaiterCompletion
         Assert.Equal(1L, commitIndex);
     }
 
+    // ── the propose answer carries the waiter ──────────────────────────────────
+
+    /// <summary>
+    /// The answer to an accepted proposal carries the waiter of its ticket, so the proposer makes no
+    /// second request for it. It is the same task a fetch by ticket returns. With no peers the
+    /// answer comes from the serial propose completion; with a peer it comes from the completion of
+    /// a proposal that was fanned out before the local write.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProposeAnswer_CarriesTheWaiterOfItsTicket(bool withPeer)
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _, CapturingReplySink sink) =
+            MakeLeader(nodes: withPeer ? [new("node-b")] : []);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        if (withPeer)
+            await sm.ReceivedVoteAsync("node-b", voteTerm: 1, remoteMaxLogId: 0);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        List<RaftLog> logs = [new() { Id = 1, Term = 1, LogType = "t" }];
+        sm.ReplicateLogs(logs, autoCommit: true, replyCorrelationId: 21);
+
+        await sm.CompleteWalOperationAsync(MakeProposeCompletion(host.PartitionId, logIndex: 1));
+
+        (ulong _, RaftResponse proposeReply) = Assert.Single(sink.Completed, r => r.Id == 21);
+        Assert.Equal(RaftOperationStatus.Success, proposeReply.Status);
+        Assert.NotNull(proposeReply.WaiterTask);
+        Assert.Same(sm.GetTicketWaiterTask(proposeReply.TicketId), proposeReply.WaiterTask);
+
+        // The task in the answer is the one the terminal transition completes.
+        if (withPeer)
+        {
+            Assert.False(proposeReply.WaiterTask.IsCompleted);
+            await sm.CompleteAppendLogsAsync("node-b", proposeReply.TicketId, RaftOperationStatus.Success, committedIndex: 0);
+        }
+
+        await sm.CompleteWalOperationAsync(MakeCommitCompletion(host.PartitionId, logIndex: 1));
+
+        Assert.True(proposeReply.WaiterTask.IsCompleted);
+        (RaftProposalTicketState state, long commitIndex) = await proposeReply.WaiterTask;
+        Assert.Equal(RaftProposalTicketState.Committed, state);
+        Assert.Equal(1L, commitIndex);
+    }
+
+    /// <summary>A refused proposal has no ticket and so no waiter in its answer.</summary>
+    [Fact]
+    public async Task ProposeAnswer_FailedLocalWrite_CarriesNoWaiter()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _, CapturingReplySink sink) = MakeLeader(nodes: []);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        List<RaftLog> logs = [new() { Id = 1, Term = 1, LogType = "t" }];
+        sm.ReplicateLogs(logs, autoCommit: true, replyCorrelationId: 22);
+
+        await sm.CompleteWalOperationAsync(new RaftWalCompletion(
+            host.PartitionId, OperationId: 1, Term: -1, MinLogIndex: -1, MaxLogIndex: 1,
+            WALWriteOperationType.LeaderPropose, RaftOperationStatus.Errored));
+
+        (ulong _, RaftResponse proposeReply) = Assert.Single(sink.Completed, r => r.Id == 22);
+        Assert.NotEqual(RaftOperationStatus.Success, proposeReply.Status);
+        Assert.Null(proposeReply.WaiterTask);
+    }
+
     // ── single-node manual two-phase propose ───────────────────────────────────
 
     [Fact]

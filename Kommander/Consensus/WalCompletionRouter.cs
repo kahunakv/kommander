@@ -501,10 +501,37 @@ internal sealed class WalCompletionRouter
 
         // The caller is answered before the commit is applied, as it was when the apply waited for
         // the marker: the answer names the ticket, and the ticket is already released.
-        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+        CompleteProposeAccepted(pending?.ReplyCorrelationId, proposalQuorum, ticketId);
 
         if (singleVoterCommitsAtQuorum)
             await CommitAtQuorumAsync(proposalQuorum, ticketId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Answers the caller of an accepted proposal with its ticket and with the task that completes
+    /// when the ticket is released.
+    ///
+    /// <para><b>Why the waiter travels with the answer.</b> The caller used to learn only the ticket
+    /// here and then ask the executor for the waiter (<c>GetTicketWaiterTask</c>): a second request
+    /// per proposal, which waited in the client queue behind whatever this turn went on to do. On a
+    /// single-voter partition this turn releases the ticket and then applies the batch, so the caller
+    /// learned of a release 0.7 ms after it happened (0.99 ms round, 110 entries). The waiter is
+    /// taken here, in the turn that knows the proposal is registered, and the caller resumes when
+    /// the ticket is released.</para>
+    ///
+    /// <para>The task belongs to this ticket for good: a pooled proposal that is reused gets a new
+    /// one, and the old one is completed first.</para>
+    /// </summary>
+    private void CompleteProposeAccepted(ulong? correlationId, RaftProposalQuorum proposal, HLCTimestamp ticketId)
+    {
+        if (correlationId is null)
+            return;
+
+        // Round stages (off by default): marked before the answer, because the caller's continuation
+        // may run at once on another thread and take this stamp.
+        RoundStageInstrumentation.MarkWaiterFetched(host.PartitionId, ticketId);
+
+        CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId, proposal.WaiterSource?.Task));
     }
 
     /// <summary>
@@ -554,7 +581,7 @@ internal sealed class WalCompletionRouter
 
         // The caller is answered before the commit is applied, as it was when the apply waited for
         // the marker: the answer names the ticket, and the ticket is already released.
-        CompleteReply(pending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+        CompleteProposeAccepted(pending.ReplyCorrelationId, proposal, ticketId);
 
         if (commitsAtQuorum)
             await CommitAtQuorumAsync(proposal, ticketId).ConfigureAwait(false);

@@ -320,7 +320,16 @@ public interface IRaft
     /// term then refuses the write definitely, instead of accepting a proposal whose preconditions
     /// were computed under a leadership that no longer holds. Zero disables the fence.
     /// </param>
-    /// <returns></returns>
+    /// <returns>
+    /// The outcome once the entry is committed: durable on a quorum. A success does <b>not</b> mean
+    /// <see cref="OnReplicationReceived"/> has run for the entry on this node. The caller resumes
+    /// when the proposal's ticket is released, and the leader applies the entry after that, in log
+    /// order, on the partition's executor. This holds on a single-voter partition too, where the
+    /// call used to return behind the apply only because of how it fetched its result. A caller
+    /// that needs the entry applied before it goes on must wait for it by its own means (the
+    /// handler can signal it), or gate its read on <see cref="ConfirmLeadershipAsync"/>, which
+    /// waits for the applied frontier.
+    /// </returns>
     /// <exception cref="PartitionNotHostedException">
     /// The partition is in the committed map but not materialized on this node (and forwarding to
     /// a replica was unavailable) — normal under replica placement; route to a node that hosts

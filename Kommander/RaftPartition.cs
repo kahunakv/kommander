@@ -605,23 +605,22 @@ public sealed class RaftPartition : IDisposable
     /// a <see cref="RaftOperationStatus"/> indicating the result status, and an <see cref="HLCTimestamp"/> representing the ticket ID for the log entry.</returns>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit, long expectedGeneration = 0, long expectedTerm = 0)
     {
-        if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+        ProposalAdmission admission = await ProposeAsync(type, data, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
+        return (admission.Success, admission.Status, admission.TicketId);
+    }
 
-        if (Leader != manager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-
-        if (expectedTerm != 0 && expectedTerm != Term)
-            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+    /// <summary>
+    /// <see cref="ReplicateLogs(string,byte[],bool,long,long)"/> with the proposal's waiter in the
+    /// answer; see <see cref="ProposalAdmission"/>.
+    /// </summary>
+    internal Task<ProposalAdmission> ProposeAsync(string type, byte[] data, bool autoCommit, long expectedGeneration = 0, long expectedTerm = 0)
+    {
+        if (RefusedBeforeAsk(expectedTerm) is { } refusal)
+            return Task.FromResult(refusal);
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
 
-        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
-
-        if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.TicketId);
-
-        return (false, response.Status, HLCTimestamp.Zero);
+        return AskProposeAsync(logsToReplicate, autoCommit, expectedGeneration, expectedTerm);
     }
 
     /// <summary>
@@ -645,25 +644,24 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0)
     {
-        if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+        ProposalAdmission admission = await ProposeAsync(type, logs, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
+        return (admission.Success, admission.Status, admission.TicketId);
+    }
 
-        if (Leader != manager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-
-        if (expectedTerm != 0 && expectedTerm != Term)
-            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+    /// <summary>
+    /// <see cref="ReplicateLogs(string,IReadOnlyList{byte[]},bool,long,long)"/> with the proposal's
+    /// waiter in the answer; see <see cref="ProposalAdmission"/>.
+    /// </summary>
+    internal Task<ProposalAdmission> ProposeAsync(string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0)
+    {
+        if (RefusedBeforeAsk(expectedTerm) is { } refusal)
+            return Task.FromResult(refusal);
 
         List<RaftLog> logsToReplicate = new(logs.Count);
         for (int i = 0; i < logs.Count; i++)
             logsToReplicate.Add(new() { Type = RaftLogType.Proposed, LogType = type, LogData = logs[i] });
 
-        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
-
-        if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.TicketId);
-
-        return (false, response.Status, HLCTimestamp.Zero);
+        return AskProposeAsync(logsToReplicate, autoCommit, expectedGeneration, expectedTerm);
     }
 
     /// <summary>
@@ -682,25 +680,54 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateEntries(List<RaftLog> logs, long expectedGeneration = 0, bool autoCommit = true, long expectedTerm = 0)
     {
-        if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+        ProposalAdmission admission = await ProposeEntriesAsync(logs, expectedGeneration, autoCommit, expectedTerm).ConfigureAwait(false);
+        return (admission.Success, admission.Status, admission.TicketId);
+    }
 
-        if (Leader != manager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-
-        if (expectedTerm != 0 && expectedTerm != Term)
-            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+    /// <summary>
+    /// <see cref="ReplicateEntries"/> with the proposal's waiter in the answer; see
+    /// <see cref="ProposalAdmission"/>.
+    /// </summary>
+    internal Task<ProposalAdmission> ProposeEntriesAsync(List<RaftLog> logs, long expectedGeneration = 0, bool autoCommit = true, long expectedTerm = 0)
+    {
+        if (RefusedBeforeAsk(expectedTerm) is { } refusal)
+            return Task.FromResult(refusal);
 
         // Reuses the existing ReplicateLogs request path: a heterogeneous List<RaftLog> with one autoCommit
         // flag, one generation fence and one term fence is exactly what that path already accepts.
         // RaftManager.ReplicateEntries enforces the batch shape (single trailing manual group) before
         // splitting into auto/manual proposals.
+        return AskProposeAsync(logs, autoCommit, expectedGeneration, expectedTerm);
+    }
+
+    /// <summary>
+    /// The refusals a proposal gets without reaching the executor: this node does not lead the
+    /// partition, or the caller's term fence does not match. Null when the proposal may be asked.
+    /// </summary>
+    private ProposalAdmission? RefusedBeforeAsk(long expectedTerm)
+    {
+        if (string.IsNullOrEmpty(Leader) || Leader != manager.LocalEndpoint)
+            return new(false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero, null);
+
+        if (expectedTerm != 0 && expectedTerm != Term)
+            return new(false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero, null);
+
+        return null;
+    }
+
+    /// <summary>
+    /// Sends one proposal to the partition executor and returns its answer. On success the answer
+    /// carries the ticket and the waiter the propose completion took for it, so the caller makes
+    /// one executor round trip per proposal.
+    /// </summary>
+    private async Task<ProposalAdmission> AskProposeAsync(List<RaftLog> logs, bool autoCommit, long expectedGeneration, long expectedTerm)
+    {
         RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.TicketId);
+            return new(true, response.Status, response.TicketId, response.WaiterTask);
 
-        return (false, response.Status, HLCTimestamp.Zero);
+        return new(false, response.Status, HLCTimestamp.Zero, null);
     }
 
     /// <summary>
@@ -1172,9 +1199,10 @@ public sealed class RaftPartition : IDisposable
     /// terminal state (committed, rolled-back, or invalidated by leader loss), allowing
     /// callers to await it directly instead of polling <see cref="GetTicketState"/>.
     /// <para>
-    /// One executor round-trip is incurred per write call to retrieve the task; subsequent
-    /// progress is delivered without executor involvement as the state machine fires
-    /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on the terminal transition.
+    /// This costs one executor round trip, and the request waits in the client queue behind
+    /// whatever the executor is doing. A proposer does not need it: the answer to its proposal
+    /// already carries the waiter (<see cref="ProposalAdmission.Waiter"/>). It remains for a caller
+    /// that holds only a ticket, such as the checkpoint path.
     /// </para>
     /// </summary>
     public async Task<Task<(RaftProposalTicketState, long)>?> GetTicketWaiterTaskAsync(HLCTimestamp ticketId)

@@ -98,18 +98,21 @@ public enum RoundStage
     // the members above are compiled into every consumer, and an insert would shift them.
 
     /// <summary>
-    /// Leader: the first half of <see cref="LeaderResume"/>. The ticket is released, but its caller cannot
-    /// see that yet, because the caller's waiter fetch (<c>GetTicketWaiterTask</c>, a second executor
-    /// request) is still in the partition executor's queue. Zero when the fetch was served before the
-    /// release, which is the usual order when a follower's ack makes the quorum. On a single-voter
-    /// partition the leader's own write makes the quorum and the same executor turn goes on to apply
-    /// the batch, so the fetch waits behind that apply.
+    /// Leader: the first half of <see cref="LeaderResume"/>. The ticket is released, but its caller
+    /// does not hold the waiter yet. Zero when the caller had the waiter before the release, which is
+    /// the usual order when a follower's ack makes the quorum.
+    ///
+    /// <para>The waiter travels with the propose answer. On a single-voter partition the leader's
+    /// own write makes the quorum, so the release and the answer are a few statements apart in one
+    /// executor turn and this half is that distance. Before the waiter travelled with the answer the
+    /// caller fetched it with a second executor request, which waited behind the apply that the
+    /// same turn went on to run, and this half carried that apply.</para>
     /// </summary>
     LeaderResumeFetch,
 
     /// <summary>
     /// Leader: the second half of <see cref="LeaderResume"/>. It starts when the caller can see the
-    /// result (the ticket is released and the waiter fetch is served, whichever is later) and ends
+    /// result (the ticket is released and the waiter is handed over, whichever is later) and ends
     /// when the caller's continuation runs: the hop to the thread pool.
     /// </summary>
     LeaderResumeHop,
@@ -280,16 +283,16 @@ public static class RoundStageInstrumentation
     }
 
     /// <summary>
-    /// Notes that the executor served the caller's waiter fetch (<c>GetTicketWaiterTask</c>) for the
-    /// ticket. When the ticket is already released, this is the first moment its caller can see the
-    /// result, and it splits <see cref="RoundStage.LeaderResume"/> into
-    /// <see cref="RoundStage.LeaderResumeFetch"/> and <see cref="RoundStage.LeaderResumeHop"/>. A
-    /// fetch served before the release finds no entry and leaves none: the release is then that
-    /// moment, and the fetch half is zero.
+    /// Notes that the executor handed the ticket's waiter to its caller: with the propose answer, or
+    /// by serving a fetch by ticket (<c>GetTicketWaiterTask</c>). When the ticket is already released,
+    /// this is the first moment its caller can see the result, and it splits
+    /// <see cref="RoundStage.LeaderResume"/> into <see cref="RoundStage.LeaderResumeFetch"/> and
+    /// <see cref="RoundStage.LeaderResumeHop"/>. A hand-over before the release finds no entry and
+    /// leaves none: the release is then that moment, and the fetch half is zero.
     ///
     /// <para>Called on the partition's executor, like <see cref="MarkReleased"/>, and before the
-    /// fetch is answered: the caller reaches <see cref="RecordResume"/> only through that answer, so
-    /// it cannot take the entry first.</para>
+    /// answer that carries the waiter: the caller reaches <see cref="RecordResume"/> only through
+    /// that answer, so it cannot take the entry first.</para>
     /// </summary>
     internal static void MarkWaiterFetched(int partitionId, HLCTimestamp ticket)
     {

@@ -95,23 +95,21 @@ internal sealed class ReplicationGateway
         if (systemPartition is null)
             throw new RaftException("System partition not initialized.");
 
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
+        ProposalAdmission admission;
 
         do
         {
-            (success, status, ticketId) = await systemPartition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
+            admission = await systemPartition.ProposeAsync(type, data, autoCommit).ConfigureAwait(false);
 
-            if (status == RaftOperationStatus.ActiveProposal)
+            if (admission.Status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
-        } while (status == RaftOperationStatus.ActiveProposal);
+        } while (admission.Status == RaftOperationStatus.ActiveProposal);
 
-        if (!success)
-            return new(success, status, ticketId, -1);
+        if (!admission.Success)
+            return new(false, admission.Status, admission.TicketId, -1);
 
-        return await WaitForQuorum(systemPartition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
+        return await WaitForQuorum(systemPartition, admission.TicketId, autoCommit, cancellationToken, waiter: admission.Waiter).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -142,23 +140,21 @@ internal sealed class ReplicationGateway
 
         partition ??= partitionProvider.GetPartition(partitionId);
 
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
+        ProposalAdmission admission;
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
+            admission = await partition.ProposeAsync(type, data, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
 
-            if (status == RaftOperationStatus.ActiveProposal)
+            if (admission.Status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
-        } while (status == RaftOperationStatus.ActiveProposal);
+        } while (admission.Status == RaftOperationStatus.ActiveProposal);
 
-        if (!success)
-            return new(success, status, ticketId, -1);
+        if (!admission.Success)
+            return new(false, admission.Status, admission.TicketId, -1);
 
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken, roundStartTicks).ConfigureAwait(false);
+        return await WaitForQuorum(partition, admission.TicketId, autoCommit, cancellationToken, roundStartTicks, admission.Waiter).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -219,28 +215,31 @@ internal sealed class ReplicationGateway
 
         partition ??= partitionProvider.GetPartition(partitionId);
 
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
+        ProposalAdmission admission;
 
         do
         {
             // Test seam (null in production): lets a test drive the ActiveProposal retry loop
             // deterministically without a live leader, to prove the payload list is materialized
-            // once before the loop and reused across retries rather than re-enumerated.
-            (success, status, ticketId) = ReplicateAttemptHookForTesting is { } hook
-                ? hook()
-                : await partition.ReplicateLogs(type, logs, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
+            // once before the loop and reused across retries rather than re-enumerated. The hook
+            // has no waiter to give, so its answer takes the fetch by ticket.
+            if (ReplicateAttemptHookForTesting is { } hook)
+            {
+                (bool hookSuccess, RaftOperationStatus hookStatus, HLCTimestamp hookTicket) = hook();
+                admission = new(hookSuccess, hookStatus, hookTicket, null);
+            }
+            else
+                admission = await partition.ProposeAsync(type, logs, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
 
-            if (status == RaftOperationStatus.ActiveProposal)
+            if (admission.Status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
-        } while (status == RaftOperationStatus.ActiveProposal);
+        } while (admission.Status == RaftOperationStatus.ActiveProposal);
 
-        if (!success)
-            return new(success, status, ticketId, -1);
+        if (!admission.Success)
+            return new(false, admission.Status, admission.TicketId, -1);
 
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken, roundStartTicks).ConfigureAwait(false);
+        return await WaitForQuorum(partition, admission.TicketId, autoCommit, cancellationToken, roundStartTicks, admission.Waiter).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -438,13 +437,15 @@ internal sealed class ReplicationGateway
         // ── Auto group: propose and commit with the batch. ──
         if (autoLogs.Count > 0)
         {
-            (bool autoOk, RaftOperationStatus autoStatus, HLCTimestamp autoTicket) =
-                await partition.ReplicateEntries(autoLogs, admissionBackstop, autoCommit: true, expectedTerm: batchTerm).ConfigureAwait(false);
+            ProposalAdmission autoAdmission =
+                await partition.ProposeEntriesAsync(autoLogs, admissionBackstop, autoCommit: true, expectedTerm: batchTerm).ConfigureAwait(false);
 
-            if (!autoOk)
-                return FailBatch(results, autoInputIndex, manualInputIndex, autoStatus);
+            if (!autoAdmission.Success)
+                return FailBatch(results, autoInputIndex, manualInputIndex, autoAdmission.Status);
 
-            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken, roundStartTicks).ConfigureAwait(false);
+            HLCTimestamp autoTicket = autoAdmission.TicketId;
+
+            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken, roundStartTicks, autoAdmission.Waiter).ConfigureAwait(false);
 
             if (!autoQuorum.Success)
                 return FailBatch(results, autoInputIndex, manualInputIndex, autoQuorum.Status);
@@ -459,15 +460,17 @@ internal sealed class ReplicationGateway
         //    Its ticket is returned to the caller (Pending), who commits or rolls it back later. ──
         if (manualLogs.Count > 0)
         {
-            (bool manualOk, RaftOperationStatus manualStatus, HLCTimestamp manualTicket) =
-                await partition.ReplicateEntries(manualLogs, admissionBackstop, autoCommit: false, expectedTerm: batchTerm).ConfigureAwait(false);
+            ProposalAdmission manualAdmission =
+                await partition.ProposeEntriesAsync(manualLogs, admissionBackstop, autoCommit: false, expectedTerm: batchTerm).ConfigureAwait(false);
 
-            if (!manualOk)
-                return FailBatch(results, [], manualInputIndex, manualStatus);
+            if (!manualAdmission.Success)
+                return FailBatch(results, [], manualInputIndex, manualAdmission.Status);
+
+            HLCTimestamp manualTicket = manualAdmission.TicketId;
 
             // For a manual proposal, WaitForQuorum resolves at propose-quorum durability (the ticket stays
             // live in activeProposals for the caller's later CommitLogs/RollbackLogs).
-            RaftReplicationResult manualQuorum = await WaitForQuorum(partition, manualTicket, false, cancellationToken).ConfigureAwait(false);
+            RaftReplicationResult manualQuorum = await WaitForQuorum(partition, manualTicket, false, cancellationToken, waiter: manualAdmission.Waiter).ConfigureAwait(false);
 
             if (!manualQuorum.Success)
                 return FailBatch(results, [], manualInputIndex, manualQuorum.Status);
@@ -563,20 +566,28 @@ internal sealed class ReplicationGateway
     /// Waits for the replication proposal to be completed in the given partition using
     /// event-driven notification rather than periodic polling.
     /// <para>
-    /// One executor round-trip is made to obtain the proposal's completion task; subsequent
-    /// progress is delivered without executor involvement as the state machine fires
-    /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on commit, rollback, or leader loss.
-    /// The wait is bounded by <see cref="RaftConfiguration.ProposalTimeout"/> (10 s by default) via
+    /// The proposal's completion task normally arrives with the propose answer
+    /// (<paramref name="waiter"/>), so this makes no request of its own: progress is delivered without
+    /// executor involvement as the state machine fires <see cref="RaftProposalQuorum.CompleteWaiter"/>
+    /// on commit, rollback, or leader loss, and the caller resumes when the ticket is released,
+    /// whatever the executor is doing then. The wait is bounded by
+    /// <see cref="RaftConfiguration.ProposalTimeout"/> (10 s by default) via
     /// <see cref="Task.WaitAsync(TimeSpan,CancellationToken)"/>.
     /// </para>
     /// <para>
-    /// Falls back to a single <see cref="RaftPartition.GetTicketState"/> poll when the
-    /// completion task cannot be retrieved (proposal not found in <c>activeProposals</c>),
-    /// which can happen if the proposal completed and was cleaned up between the
-    /// <c>ReplicateLogs</c> response and the <c>GetTicketWaiterTask</c> request.
+    /// Without a waiter (the checkpoint path, which has only a ticket) one executor round trip
+    /// fetches it. That falls back to a single <see cref="RaftPartition.GetTicketState"/> poll when
+    /// the proposal is no longer in <c>activeProposals</c>, which can happen if it completed and
+    /// was cleaned up between the answer and the fetch.
     /// </para>
     /// </summary>
-    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken, long roundStartTicks = 0)
+    private async Task<RaftReplicationResult> WaitForQuorum(
+        RaftPartition partition,
+        HLCTimestamp ticketId,
+        bool autoCommit,
+        CancellationToken cancellationToken,
+        long roundStartTicks = 0,
+        Task<(RaftProposalTicketState, long)>? waiter = null)
     {
         // The proposal was already ACCEPTED (it has a ticket): if leadership moved between the
         // accept and this check, the entry is in the log and may still commit — a durable
@@ -589,15 +600,18 @@ internal sealed class ReplicationGateway
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        Task<(RaftProposalTicketState, long)>? waiterTask = null;
+        Task<(RaftProposalTicketState, long)>? waiterTask = waiter;
 
-        try
+        if (waiterTask is null)
         {
-            waiterTask = await partition.GetTicketWaiterTaskAsync(ticketId).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            logger.LogError("WaitForQuorum: GetTicketWaiterTask failed: {Message}", e.Message);
+            try
+            {
+                waiterTask = await partition.GetTicketWaiterTaskAsync(ticketId).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                logger.LogError("WaitForQuorum: GetTicketWaiterTask failed: {Message}", e.Message);
+            }
         }
 
         if (waiterTask is null)
