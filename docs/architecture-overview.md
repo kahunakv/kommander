@@ -1,16 +1,8 @@
 # Kommander Architecture Overview
 
-This guide introduces Kommander. It is written for two kinds of reader:
-
-- **Developers who want to understand the system** — what Kommander does, the vocabulary it uses, and
-  how a request travels through it.
-- **Developers who want to improve or contribute** — where the moving parts live, why they are shaped
-  the way they are, and which invariants you must not break.
-
-It assumes **no prior knowledge of Raft or distributed consensus**. It defines the concepts first and then
-covers the main runtime flows end to end. Deeper feature guides
-([Dynamic Membership](dynamic-membership-developer-guide.md),
-[Elastic Partitions](elastic-partitions-developer-guide.md)) pick up where this one leaves off.
+This guide introduces Kommander to developers who use it or contribute to it. It assumes **no prior
+knowledge of Raft or distributed consensus**. It defines the concepts and then follows the main runtime
+flows from start to end.
 
 ---
 
@@ -33,25 +25,22 @@ covers the main runtime flows end to end. Deeper feature guides
 9. [Code map](#code-map)
 10. [Invariants you must not break](#invariants-you-must-not-break)
 11. [How to extend Kommander](#how-to-extend-kommander)
-12. [Glossary](#glossary)
 
 ---
 
 ## Summary
 
-Kommander keeps **the same data, in the same order, on several machines**, so that the system keeps
-working even when some machines fail.
+Kommander stores **the same data, in the same order, on several machines**. The system continues to work
+when some of the machines fail.
 
-It does this with the **Raft consensus protocol**:
+It uses the **Raft consensus protocol**. The nodes elect one **leader**. The leader writes each change to
+an ordered, on-disk **log** and copies the new entries to the **followers**. When a **majority** of nodes
+has stored an entry, the entry is **committed**. A committed entry survives failures and is applied to the
+application's state.
 
-> One node is elected **leader**. Every change is first written to an ordered, on-disk **log**. The
-> leader copies new log entries to the **followers**. Once a **majority** of nodes have stored an
-> entry, it is **committed** — guaranteed to survive, and applied to the application's state.
-
-Kommander extends Raft with **partitions**. The data is sliced into
-independent **partitions**, and *each partition runs its own Raft group with its own leader*. A single
-node can be the leader for partition 3 and a follower for partition 7. This spreads work across the
-cluster instead of funnelling everything through one leader.
+Kommander divides the data into independent **partitions**. Each partition is a separate Raft group with a
+separate leader, and one node can lead partition 3 and follow partition 7. This spreads the work across
+the cluster.
 
 ```
                         A Kommander cluster of 3 nodes
@@ -67,53 +56,44 @@ cluster instead of funnelling everything through one leader.
 
 ## Purpose and scope
 
-A service that holds important state — account balances, a key/value store, a job queue — loses
-availability, and maybe data, when its only machine fails. Copies on several machines need a rule for
-which copy is correct when they disagree. Naive replication leads to split brain (two machines both
-think they are in charge), lost updates, and inconsistent reads.
+When several machines store copies of the same state, they need a rule for which copy is correct. Simple
+replication leads to lost updates and to split brain, where two machines both act as the leader.
+**Consensus** lets a group of machines agree on one sequence of events despite failures and network
+delays.
 
-**Consensus** lets a group of machines agree on a single sequence of events despite failures and
-network delays. **Raft** is a consensus protocol designed to be
-understandable, and Kommander is a C#/.NET implementation of it.
+Kommander gives an application these guarantees.
 
-What Kommander gives an application:
+- **Leader election.** The cluster converges on one leader per partition and elects a new one when the
+  leader fails.
+- **Replicated, ordered log.** All nodes record the changes in the same order.
+- **Durability.** Changes are written to a **Write-Ahead Log (WAL)** on disk *before* they are
+  acknowledged. A crash does not lose committed data.
+- **Strong consistency.** A committed entry is on a majority of nodes. It is not lost or reordered when
+  the leader changes.
 
-- **Leader election** — the cluster always converges on exactly one leader per partition, and elects a
-  new one automatically when the leader fails.
-- **Replicated, ordered log** — every change is recorded in the same order on every node.
-- **Durability** — changes are written to a **Write-Ahead Log (WAL)** on disk *before* they are
-  acknowledged, so a crash does not lose committed data.
-- **Strong consistency** — a committed entry is on a majority of nodes and will never be lost or
-  reordered, even across leader changes.
-
-What Kommander deliberately keeps **out** of the core and pluggable: *where* the log is stored (the WAL
-backend), *how* nodes talk (the transport), and *how* nodes find each other (discovery). You pick those
-per deployment.
+The consensus core does not include [storage, transport, or discovery](#the-pluggable-layers). You select an
+implementation of each one for your deployment.
 
 ---
 
 ## Core concepts
 
-You will see these words everywhere in the code and the rest of this guide. Learn them once here.
-
 | Term | What it means in Kommander |
 |---|---|
-| **Node** | One participant in the cluster — usually one process. Identified by an endpoint like `host:port`. |
-| **Partition** | An independent Raft group. The data space is split into partitions so different leaders can make progress in parallel. Partition `0` is reserved (see below); application partitions start at `1`. |
-| **Log** | The ordered, append-only sequence of entries for a partition. Each entry has an **index** (its position) and a **term**. This is the source of truth. |
-| **Log entry (`RaftLog`)** | A single record in the log: an index, a term, a type, and the payload bytes. |
-| **Term** | A logical clock for leadership. Every election bumps the term. Terms let nodes detect a stale leader: a message from an older term is rejected. |
-| **Role** | Each node is, per partition, a **Follower**, a **Candidate** (currently running for election), or the **Leader**. See `RaftNodeState`. |
-| **Quorum** | A majority of voting nodes (e.g. 2 of 3, 3 of 5). An entry is committed once a quorum has stored it. Majorities guarantee any two quorums overlap, which is what makes the protocol safe. |
-| **Propose** | The leader appends a new entry and starts replicating it. Not yet durable across the cluster. |
-| **Commit** | A quorum has acknowledged the entry. It is now permanent and may be applied to application state. |
-| **Rollback** | An uncommitted proposal is abandoned (e.g. quorum was not reached, or the app chose to). |
-| **Checkpoint** | A marker in the log saying "everything up to here is settled." Used as the floor for compaction. |
-| **WAL** | Write-Ahead Log: the durable, on-disk store of log entries. Written *before* callbacks run. |
-| **Learner** | A non-voting node that is catching up. It receives the log but does not count toward quorum until promoted to **Voter**. |
-| **HLC** | Hybrid Logical Clock — a timestamp combining wall-clock time with a logical counter, used to order proposals causally. See `HybridLogicalClock`. |
-
-A useful way to hold it together:
+| **Node** | One participant in the cluster, usually one process. Its identity is an endpoint such as `host:port`. |
+| **Partition** | An independent Raft group. Partition `0` is reserved for the system. Application partitions start at `1`. |
+| **Log** | The ordered, append-only sequence of entries of a partition. |
+| **Log entry (`RaftLog`)** | A record in the log. It has an **index** (its position), a **term**, a type, and the payload bytes. |
+| **Term** | A logical clock for leadership. Each election increments it. A message from an older term identifies a stale leader and is rejected. |
+| **Role** | Per partition, a node is a **Follower**, a **Candidate** (in an election), or the **Leader**. See `RaftNodeState`. |
+| **Quorum** | A majority of the voting nodes, for example 2 of 3 or 3 of 5. Any two quorums overlap, and the safety of the protocol depends on that overlap. |
+| **Propose** | The leader appends a new entry and starts to replicate it. The entry is not yet durable across the cluster. |
+| **Commit** | A quorum has acknowledged the entry. It is permanent and can be applied to the application state. |
+| **Rollback** | An uncommitted proposal is abandoned, for example when the quorum was not reached. |
+| **Checkpoint** | A log marker that shows that the entries before it are settled. It is the floor for compaction. |
+| **WAL** | Write-Ahead Log. The durable store of log entries, written *before* callbacks run. |
+| **Learner** | A non-voting node that receives the log. It does not count toward quorum until it is promoted to **Voter**. |
+| **HLC** | Hybrid Logical Clock. A timestamp that combines wall-clock time with a logical counter to order proposals causally. See `HybridLogicalClock`. |
 
 ```
    index:   1     2     3     4     5     6
@@ -126,8 +106,6 @@ A useful way to hold it together:
 ---
 
 ## The component map
-
-Kommander is layered. From the application down to the disk:
 
 ```
    ┌──────────────────────────────────────────────────────────────┐
@@ -160,48 +138,28 @@ Kommander is layered. From the application down to the disk:
    └───────────────────────────┘
 ```
 
-The pieces, in plain terms:
-
-- **`RaftManager`** (implements `IRaft`, in `RaftManager.cs`) — the public entry point. You construct
-  one per node. It owns the set of partitions and the pluggable WAL, communication, and discovery
-  components, and it exposes the API (`ReplicateLogs`, `CommitLogs`, `AmILeader`, membership/partition
-  operations, and the application events `OnReplicationReceived`, `OnLogRestored`, `OnLeaderChanged`,
-  etc.).
-
-- **`RaftPartition`** (`RaftPartition.cs`) — one per partition. It runs that partition's slice of the
-  protocol: election timers, leadership state, and replication.
-
-- **`RaftPartitionExecutor`** (`Scheduling/RaftPartitionExecutor.cs`) — the serial executor of a partition. Every
-  operation for a partition (a client proposal, an incoming append, an election timer tick, a commit)
-  is turned into an operation and pushed onto a **single bounded queue**, then processed **one at a
-  time**. Because of this serial executor, the state machine needs no locks: within a
-  partition, exactly one thing happens at a time, in order. The actual protocol
-  logic lives in `RaftPartitionStateMachine.cs`.
-
-- **`RaftSystemCoordinator`** (`System/`) — manages **partition 0**, the special "system" partition
-  that holds cluster-wide configuration: the partition map (which partition owns which key range) and
-  the membership roster. It is itself a Raft group, so cluster metadata is replicated with the same
-  guarantees as application data.
-
-- **`IWAL`** (`WAL/`) — the durable log. Three backends ship: `InMemoryWAL` (tests/ephemeral),
-  `SqliteWAL`, and `RocksDbWAL`. They all implement the same interface (`ReadLogs`, `Write`,
-  `GetMaxLog`, `GetLastCheckpoint`, `CompactLogsOlderThan`, …) and must be thread-safe.
-
-- **`ICommunication`** (`Communication/`) — node-to-node transport. gRPC is the primary networked
-  transport; REST/JSON is a fallback and a debugging aid; in-memory is for tests.
-
-- **`IDiscovery`** (`Discovery/`) — how a node finds peers: static lists, application-managed dynamic
-  lists, or multicast for a local network.
-
-- **Fair I/O schedulers** (`WAL/IO/`, exposed as `ReadScheduler` / `WalScheduler`) — synchronous disk
-  reads and writes are funnelled through configurable fair schedulers so that slow storage work does
-  not stall the partition's state transitions.
+- **`RaftManager`** (implements `IRaft`) is the public entry point, with one instance per node. It owns the
+  partitions and the pluggable components. It exposes the API (`ReplicateLogs`,
+  `CommitLogs`, `AmILeader`, membership and partition operations) and the application events
+  (`OnReplicationReceived`, `OnLogRestored`, `OnLeaderChanged`).
+- **`RaftPartition`** drives the protocol for one partition.
+- **`RaftPartitionExecutor`** (`Scheduling/`) is the serial executor of a partition. Client proposals,
+  inbound appends, timer ticks, and commits become queued operations that execute **one at a time**. This
+  means that the state machine needs no locks. The protocol logic is in `RaftPartitionStateMachine.cs` and
+  in the classes of `Consensus/`.
+- **`RaftSystemCoordinator`** (`System/`) manages **partition 0**, which stores the partition map (which
+  partition owns which key range) and the membership roster. Partition 0 is also a Raft group, and cluster
+  metadata has the same guarantees as application data.
+- **`IWAL`** (`WAL/`) is the durable log (`ReadLogs`, `Write`, `GetMaxLog`, `GetLastCheckpoint`,
+  `CompactLogsOlderThan`, …). Implementations must be thread-safe.
+- **`ICommunication`** (`Communication/`) is the node-to-node transport.
+- **`IDiscovery`** (`Discovery/`) finds peers.
+- **Fair I/O schedulers** (`WAL/IO/`, exposed as `ReadScheduler` and `WalScheduler`) process disk reads and
+  writes on separate threads. Slow storage does not stall the state transitions of a partition.
 
 ---
 
 ## Architecture flows
-
-This is the part most worth reading carefully. Each flow follows one real scenario end to end.
 
 ### Flow 1 — Starting up and joining a cluster
 
@@ -221,21 +179,14 @@ This is the part most worth reading carefully. Each flow follows one real scenar
    election timers start → cluster converges on a leader per partition
 ```
 
-1. The application builds a `RaftManager` with a configuration (node id, host/port, partition count,
-   chosen WAL/transport/discovery).
-2. `JoinCluster(...)` brings the node online: discovery resolves the peer set, the transport starts
-   listening, and partitions are created.
-3. Each partition opens its WAL and **replays** any existing log so the node restarts where it left off.
-4. Election timers begin. With no leader, a node eventually times out and starts an election (Flow 2).
-
-A brand-new node added to a *running* cluster joins as a non-voting **Learner**, catches up via
-backfill/snapshot, and is auto-promoted once it is close enough and stable — that lifecycle is the
-subject of the [Dynamic Membership guide](dynamic-membership-developer-guide.md).
+A new node that joins a *running* cluster starts as a non-voting **Learner**. It catches up through backfill
+or a snapshot, and is promoted automatically when it is close enough and stable. For more information, see
+the [Dynamic Membership guide](dynamic-membership-developer-guide.md).
 
 ### Flow 2 — Electing a leader
 
-Leadership is per partition. A follower that has not heard from a leader within a randomized election
-timeout (between `StartElectionTimeout` and `EndElectionTimeout`) suspects the leader is gone and acts:
+A follower starts an election when it does not hear from a leader within a randomized timeout, between
+`StartElectionTimeout` and `EndElectionTimeout`.
 
 ```
    Follower's election timer fires
@@ -260,18 +211,13 @@ timeout (between `StartElectionTimeout` and `EndElectionTimeout`) suspects the l
    sends heartbeats (empty appends) to assert leadership
 ```
 
-Two details that matter:
-
-- **Randomized timeouts** make simultaneous candidacies (split votes) rare, so an election usually
-  settles in one round.
-- **The "log up to date" check** is a safety rule: a node will not vote for a candidate whose log is
-  behind its own. This guarantees a new leader already has every committed entry — the protocol never
-  has to "un-commit" anything. Kommander also uses a **PreVote** step to stop a flapping node from
-  disrupting a healthy leader.
+- **Randomized timeouts** make simultaneous candidacies (split votes) rare, and an election usually settles
+  in one round.
+- **The "log up to date" check** is a safety rule. A node does not vote for a candidate whose log is behind
+  its own log. This guarantees that a new leader already has all committed entries.
+- **PreVote** stops a flapping node from disrupting a healthy leader.
 
 ### Flow 3 — Writing data (the propose → replicate → commit path)
-
-This is the core write path and the one to understand best.
 
 ```
    App calls ReplicateLogs(partition, type, data, autoCommit: true)
@@ -296,35 +242,26 @@ This is the core write path and the one to understand best.
    ReplicateLogs returns success to the caller
 ```
 
-Step by step:
+1. The application calls `ReplicateLogs` on the **leader** with a `type` string and a `byte[]` payload, or a
+   batch of payloads. A call on a follower fails.
+2. The leader assigns the next index and the current term, and **writes the entry to its own WAL first**.
+3. Each follower writes the entry to its WAL and replies with `CompleteAppendLogs`.
+4. The leader counts the acknowledgements in `RaftProposalQuorum`. The entry is **committed** when a
+   **majority**, which includes the leader, has it.
+5. On commit, each node fires `OnReplicationReceived`. `ReplicateLogs` then returns a
+   `RaftReplicationResult`. A follower learns of the commit from the leader's commit broadcast. It
+   acknowledges that append first and applies the entries in separate executor turns
+   (`FollowerApplyInOwnTurn`). The next proposal's append does not wait for the callbacks.
 
-1. The application calls `ReplicateLogs` on the **leader** (proposing on a follower fails — leadership
-   is checked). It passes a `type` string and the payload `byte[]` (or a batch of payloads).
-2. The leader assigns the entry the next index and the current term, and **writes it to its own WAL
-   first** (write-ahead — durability before acknowledgement).
-3. The leader sends `AppendLogs` to the followers. Each follower writes the entry to its WAL and
-   replies with `CompleteAppendLogs`.
-4. The leader tallies acknowledgements. The quorum-tracking lives in
-   `RaftProposalQuorum`/`RaftSyncProposalQuorum`. Once a **majority** (counting the leader itself) has
-   the entry, it is **committed**.
-5. On commit, every node fires `OnReplicationReceived` so the application can apply the change to its
-   own state machine. `ReplicateLogs` returns a `RaftReplicationResult`. A follower learns of the commit
-   from the leader's commit broadcast; it acks that append first and applies in executor turns of their
-   own (`FollowerApplyInOwnTurn`), so the next proposal's append never waits for the callbacks.
-
-**Auto-commit vs. manual commit.** With `autoCommit: true` (the default) the leader commits as soon as
-quorum is reached. With `autoCommit: false`, the proposal stays pending and the application explicitly
-calls `CommitLogs(partition, ticketId)` or abandons it with `RollbackLogs(...)`. The `ticketId` is an
-HLC timestamp identifying the proposal — that is how HLCs give you causal ordering of proposals.
-
-Everything inside a partition is serialized by its executor (the bounded queue), so even though
-proposals, appends, and commits arrive concurrently from the network, the state machine processes them
-one at a time, in a well-defined order.
+With `autoCommit: true` (the default), the leader commits when the quorum is reached. With
+`autoCommit: false`, the proposal is pending until the application calls
+`CommitLogs(partition, ticketId)` or `RollbackLogs(...)`. The `ticketId` is the HLC timestamp of the
+proposal.
 
 ### Flow 4 — Keeping a slow follower in sync (backfill)
 
-A follower can fall behind — it was slow, paused, briefly partitioned, or just joined. The leader
-detects this and **backfills** the missing entries, separately from the live broadcast path.
+A follower can fall behind, for example when it is slow or has just joined. The leader **backfills** the
+missing entries on a path that is separate from the live broadcast.
 
 ```
    LEADER tracks, per follower, how far behind it is
@@ -348,27 +285,19 @@ detects this and **backfills** the missing entries, separately from the live bro
    repeat in bounded rounds until the follower is caught up
 ```
 
-The key design choices, so you do not get surprised when reading the code:
+- **Backfill is leader-driven and bounded.** Each chunk has at most `MaxBackfillEntriesPerRound` entries and
+  is sent with normal heartbeat traffic.
+- **The Log Matching anchor is enforced on the backfill path only.** It prevents a *gap* or a *divergent*
+  tail in a follower's log. The live broadcast path is intentionally not anchored. An anchor there can
+  reject a transiently-behind follower that has no way to recover, and progress stalls.
+- **A follower below the compaction floor needs a snapshot (Flow 6).** The leader detects the empty backfill
+  read at the floor and switches to a snapshot on its heartbeat path. There is no wire status for this
+  handoff. A snapshot that cannot be produced or delivered is retried with exponential backoff and is
+  visible in `IRaft.GetSnapshotStatuses`.
 
-- **Backfill is leader-driven and bounded.** The leader catches a follower up in chunks of at most
-  `MaxBackfillEntriesPerRound`, riding alongside normal heartbeat traffic, instead of dumping the whole
-  log at once.
-- **The Log Matching anchor is enforced on the backfill path only.** A backfill batch says "you should
-  already have entry F at term T before I give you F+1," and the follower refuses if that does not hold
-  — this is what prevents a follower from ever growing a *gap* or keeping a *divergent* tail. The live
-  broadcast path (ordinary proposals/commits) is intentionally not anchored, because anchoring the live
-  path can reject transiently-behind followers with no recovery and stall progress.
-- **If a follower is so far behind that the leader has already compacted the entries it needs**, backfill
-  cannot help (the data is gone). The leader detects the empty backfill read at the compaction floor and
-  switches to installing a snapshot instead (Flow 6) — an internal handoff on the leader's heartbeat
-  path, with no wire status. A follower whose snapshot cannot be produced or delivered is retried with
-  exponential backoff and reported through `IRaft.GetSnapshotStatuses`.
-
-For a full walkthrough, see the [Log Catch-Up & Backfill Developer Guide](log-backfill-developer-guide.md).
+For more information, see the [Log Catch-Up & Backfill Developer Guide](log-backfill-developer-guide.md).
 
 ### Flow 5 — Restarting and replaying the log
-
-Because the WAL is durable, a restart is not a blank slate.
 
 ```
    process starts → RaftManager → open WAL
@@ -385,24 +314,19 @@ Because the WAL is durable, a restart is not a blank slate.
    OnRestoreFinished(partition) → node rejoins, participates in elections
 ```
 
-The application's job is to make `OnLogRestored` rebuild its in-memory state from each entry, so that
-after replay the node is exactly where it was before the crash. Only then does it start participating
-again. This is why the WAL must record entries *before* callbacks run: only the log survives a crash.
+Your `OnLogRestored` handler must rebuild the in-memory state from each entry. The node participates in
+elections only after the replay ends. The WAL must record entries *before* callbacks run, as only the log
+survives a crash.
 
 ### Flow 6 — Compaction and snapshots
 
-A log that only ever grows would eventually fill the disk. Two mechanisms keep it bounded:
-
-- **Compaction.** Once an entry is below the last **checkpoint** (everything before it is settled), its
-  history is removable. Counters trigger bounded, per-partition compaction: roughly every
-  `CompactEveryOperations` committed operations the partition trims old entries in capped batches
-  (`CompactNumberEntries`, `MaxEntriesPerCompaction`) via `IWAL.CompactLogsOlderThan`. "Bounded" is
-  deliberate — a compaction pass never blocks the partition for an unbounded time.
-
-- **Snapshots.** Compaction creates a **compaction floor**: the earliest index the leader still has. If
-  a follower needs entries *below* that floor, the leader can no longer replay them. Instead it installs
-  a **snapshot** — a compact representation of the state up to a point — and the follower resumes normal
-  replication from there. This is the escape hatch backfill (Flow 4) hands off to.
+- **Compaction.** Entries below the last **checkpoint** are removable. After about
+  `CompactEveryOperations` committed operations, the partition trims old entries in capped batches
+  (`CompactNumberEntries`, `MaxEntriesPerCompaction`) through `IWAL.CompactLogsOlderThan`. The caps limit
+  how long a pass can block the partition.
+- **Snapshots.** Compaction creates a **compaction floor**, the earliest index that the leader has. A
+  follower that needs entries *below* the floor gets a **snapshot**, a compact representation of the state
+  up to a point. Normal replication resumes from there.
 
 ```
    log grows ──► checkpoint marks settled prefix ──► compaction trims below it
@@ -416,19 +340,15 @@ A log that only ever grows would eventually fill the disk. Two mechanisms keep i
 
 ## The pluggable layers
 
-A defining property of Kommander is that the consensus core does not care *how* it stores, talks, or
-discovers. Three seams let you swap implementations:
-
 **Storage — `IWAL`**
 
 | Backend | Use it for |
 |---|---|
-| `InMemoryWAL` | tests and ephemeral nodes; nothing survives a restart |
+| `InMemoryWAL` | tests and ephemeral nodes; the log does not survive a restart |
 | `SqliteWAL` | a simple embedded durable store |
 | `RocksDbWAL` | higher-throughput durable storage |
 
-All three honour the same conformance contract (the tests in `Kommander.Tests/WAL/`). If you write a
-new backend, it must pass that contract too.
+All backends must pass the conformance tests in `Kommander.Tests/WAL/`.
 
 **Transport — `ICommunication`**
 
@@ -443,41 +363,31 @@ pinning (see `RaftTransportAuthenticator`).
 
 **Discovery — `IDiscovery`**
 
-Static (fixed list), dynamic (application-managed), or multicast (local-network). Note: discovery feeds
-*peer connectivity* only. In a dynamically-membered cluster, the committed roster (next section)
-decides who may vote.
+Discovery is static (a fixed list), dynamic (application-managed), or multicast (a local network). It feeds
+*peer connectivity* only. In a cluster with dynamic membership, the committed roster decides who can vote.
 
 ---
 
 ## Partitions, membership, and the system partition
 
-Two cluster-wide concerns are themselves stored as replicated Raft state on **partition 0**, the
-system partition managed by `RaftSystemCoordinator`:
+`RaftSystemCoordinator` stores two cluster-wide records on **partition 0** (P0), the system partition.
 
-- **The partition map** — which partition owns which key range. Partitions can be **created, split,
-  merged, and removed at runtime** without restarting any node. Because the map is replicated through
-  P0, every node converges on every change, and two-phase split/merge ensures no key range is ever left
-  uncovered. Full details: [Elastic Partitions guide](elastic-partitions-developer-guide.md).
-
-- **The membership roster** — the authoritative, versioned list of nodes and their roles (Learner vs.
-  Voter). It is a *committed Raft record*, never derived from gossip or discovery, so quorum math is
-  always consistent. A SWIM-style gossip layer spreads the roster faster and flags dead nodes, but it
-  is strictly advisory — only a committed membership change alters who can vote. Full details:
+- **The partition map** shows which partition owns which key range. You can create and
+  remove partitions at runtime, and you can split or merge them. No node restarts. A two-phase protocol for splits and merges keeps
+  all key ranges covered. See the [Elastic Partitions guide](elastic-partitions-developer-guide.md).
+- **The membership roster** is the versioned list of nodes and their roles (Learner or Voter). A SWIM-style
+  gossip layer spreads the roster faster and flags dead nodes, but it is advisory. Only a committed
+  membership change alters who can vote. See the
   [Dynamic Membership guide](dynamic-membership-developer-guide.md).
 
-The principle shared by both: **truth by consensus, dissemination by gossip.** Anything that affects
-safety (who votes, who owns a key range) is a committed log entry; gossip only makes that truth travel
-faster.
-
-To route a key to its partition, use `GetPartitionKey(key)` (or `GetPrefixPartitionKey`) and then call
-`ReplicateLogs` against that partition.
+To route a key, find its partition with `GetPartitionKey(key)` or `GetPrefixPartitionKey`. Then call
+`ReplicateLogs` on that partition.
 
 ---
 
 ## Common configuration
 
-Configuration lives in `RaftConfiguration.cs`. You do not need most of it; these are the knobs that
-come up in practice. Defaults shown.
+The options are in `RaftConfiguration.cs`. The tables show the ones that deployments change most.
 
 **Identity & topology**
 
@@ -486,7 +396,7 @@ come up in practice. Defaults shown.
 | `NodeId` / `NodeName` / `Host` / `Port` | — | how this node identifies and exposes itself |
 | `InitialPartitions` | `1` | how many partitions to start with |
 
-**Election & heartbeats** (timing — adjust together for your network's latency)
+**Election & heartbeats** (adjust these together for the latency of your network)
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -507,7 +417,7 @@ come up in practice. Defaults shown.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BackfillThreshold` | 10 | how far behind a follower must be before backfill kicks in |
+| `BackfillThreshold` | 10 | how far behind a follower must be before backfill starts |
 | `MaxBackfillEntriesPerRound` | 128 | cap on entries sent per backfill round |
 | `CompactEveryOperations` | 10000 | committed-op interval that triggers compaction |
 | `CompactNumberEntries` / `MaxEntriesPerCompaction` | 100 / 5000 | per-pass compaction batch sizing |
@@ -518,7 +428,7 @@ come up in practice. Defaults shown.
 |---|---|---|
 | `LearnerPromotionLag` / `LearnerPromotionStableWindow` | 10 / 3 s | how caught-up and stable a learner must be before promotion |
 | `GossipInterval` / `GossipFanout` | 5 s / 2 | how often and to how many peers gossip spreads |
-| `SuspicionTimeout` / `DeadMemberEvictionGrace` | 5 s / 10 min | SWIM failure-detection timing; the grace is sized to the longest outage the roster should ride through intact |
+| `SuspicionTimeout` / `DeadMemberEvictionGrace` | 5 s / 10 min | SWIM failure-detection timing; set the grace to the longest outage that the roster must survive intact |
 
 ---
 
@@ -535,7 +445,7 @@ Kommander/
 ├─ RaftProposalQuorum*.cs      quorum accounting for a proposal
 ├─ RaftWriteAhead.cs           the WAL-facing replication helpers
 ├─ Scheduling/                 the serial per-partition executor + operation types
-│   └─ RaftPartitionExecutor.cs   one bounded queue per partition
+│   └─ RaftPartitionExecutor.cs   one serial executor per partition
 ├─ WAL/                        durable log
 │   ├─ IWAL.cs   InMemoryWAL.cs   SqliteWAL.cs   RocksDbWAL.cs
 │   └─ IO/                     fair read/write schedulers
@@ -546,30 +456,27 @@ Kommander/
 └─ System/                    RaftSystemCoordinator: partition map, membership, split/merge
 
 Kommander.Server/   ASP.NET Core host exposing Kommander as a gRPC/REST service
-Kommander.Tests/    NUnit suite: clusters, WAL conformance, scheduler, safety
+Kommander.Tests/    xUnit suite: clusters, WAL conformance, scheduler, safety
 docs/               this guide + feature deep-dives
 ```
 
-Reading order if you are new: `IRaft.cs` (what it does) → this guide's flows →
-`RaftPartitionStateMachine.cs` (how a partition behaves) → `Scheduling/RaftPartitionExecutor.cs` (how
-operations are serialized) → a WAL backend.
+If you are new, start with `IRaft.cs` and the flows in this guide. Continue with
+`RaftPartitionStateMachine.cs` and `Scheduling/RaftPartitionExecutor.cs`, and end with a WAL backend.
 
 ---
 
 ## Invariants you must not break
 
-Violating any of these rules can cause data loss or split brain.
+A violation of these rules can cause data loss or split brain.
 
-1. **Write-ahead, always.** An entry is written to the WAL *before* it is acknowledged or applied. The
-   log is the authority.
-2. **Commit means quorum.** Never apply or report an entry as committed before a majority of voters
-   holds it. Two quorums always overlap; that overlap is the entire safety argument.
-3. **No gaps, no divergent tails.** A follower's log must stay contiguous and consistent with the
-   leader's. The Log Matching anchor on the backfill path enforces this; do not "fill over" a gap.
-4. **One thing at a time per partition.** Partition state is mutated only through its executor's serial
-   queue. Do not reach around it with ad-hoc locks or background mutation.
-5. **Truth by consensus.** Anything affecting safety — the voter set, the partition map — is a committed
-   record on the system partition, never gossip- or discovery-derived.
+1. **Write-ahead.** An entry is written to the WAL *before* it is acknowledged or applied.
+2. **Commit means quorum.** Do not apply or report an entry as committed before a majority of voters has it.
+3. **No gaps and no divergent tails.** A follower's log must be contiguous and consistent with the leader's
+   log. Do not "fill over" a gap. The Log Matching anchor on the backfill path enforces this rule.
+4. **One thing at a time per partition.** Change partition state only through the serial queue of its
+   executor. Do not use ad-hoc locks or background mutation.
+5. **Truth by consensus.** The voter set and the partition map are committed records on the system
+   partition. Do not derive them from gossip or discovery.
 6. **WAL backends are thread-safe and conformant.** A new backend must pass the WAL conformance tests
    unchanged.
 
@@ -577,20 +484,14 @@ Violating any of these rules can cause data loss or split brain.
 
 ## How to extend Kommander
 
-A few common contribution shapes and where to start:
-
-- **A new WAL backend** → implement `IWAL`, keep it thread-safe, and make it pass
-  `Kommander.Tests/WAL/`. Use `SqliteWAL` as the reference for shape.
-- **A new transport** → implement `ICommunication`; mirror the gRPC/REST request/response types. The
+- **A new WAL backend:** implement `IWAL` and pass `Kommander.Tests/WAL/`. Use `SqliteWAL` as the reference.
+- **A new transport:** implement `ICommunication` and mirror the gRPC/REST request and response types. The
   in-memory transport is the simplest reference.
-- **Protocol changes** → live in `RaftPartitionStateMachine.cs` and the `Scheduling/` operation types.
-  Because the executor serializes everything, reason about your change as "what new operation kind is
-  enqueued, and how is it handled in order."
-- **Tests** → NUnit 3. Mark anything touching shared in-process clusters or timing-sensitive behavior
-  `[NonParallelizable]`. **Never run multiple `dotnet test` commands at once** — the suite spins up
-  in-process Raft clusters and concurrent runs produce false failures.
-
-Build and test:
+- **Protocol changes:** the logic is in `RaftPartitionStateMachine.cs` and `Consensus/`. The operation types are in
+  `Scheduling/`. Identify the new operation kind that is enqueued and how it is handled in order.
+- **Tests:** the suite uses xUnit v3. Add tests that touch shared in-process clusters or timing-sensitive
+  behavior to `[Collection(ClusterIntegrationCollection.Name)]`. **Do not run two `dotnet test` commands at
+  once.** The suite starts in-process Raft clusters, and concurrent runs produce false failures.
 
 ```sh
 dotnet restore Kommander.sln
@@ -600,38 +501,4 @@ dotnet test   Kommander.Tests/Kommander.Tests.csproj
 dotnet test   Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~YourTest
 ```
 
-When you change WAL formats, partition state shape, or the scheduling protocol, update the affected
-tests *in the same change*, and add or update the XML `<summary>` on any key class/method whose
-invariant you touched.
-
----
-
-## Glossary
-
-- **Backfill** — leader-driven, bounded catch-up of a follower that has fallen behind.
-- **Candidate** — a node currently standing for election in a term.
-- **Checkpoint** — a log marker indicating the prefix before it is settled; the floor for compaction.
-- **Commit** — the point at which a quorum holds an entry, making it permanent.
-- **Compaction** — trimming removable history below the last checkpoint to bound the log's size.
-- **Compaction floor** — the earliest index still retained after compaction.
-- **Consensus** — agreement by a group of nodes on a single ordered sequence of events despite failures.
-- **Follower** — a node that replicates the leader's log and does not propose.
-- **HLC (Hybrid Logical Clock)** — a timestamp blending wall-clock time and a logical counter to order proposals.
-- **Leader** — the single node per partition that accepts proposals and drives replication.
-- **Learner** — a non-voting node catching up before promotion to Voter.
-- **Log / log entry** — the ordered, append-only record of changes; each entry has an index and a term.
-- **Log Matching** — the rule that a follower accepts an entry only if it holds the immediately preceding entry at the expected term.
-- **Partition** — an independent Raft group; data is split across partitions for parallelism.
-- **Quorum** — a majority of voting nodes.
-- **Roster / membership** — the committed, versioned list of cluster members and their roles.
-- **Snapshot** — a compact state representation used to catch up a follower past the compaction floor.
-- **System partition (P0)** — the reserved partition holding the partition map and membership roster.
-- **Term** — a monotonically increasing logical clock for leadership.
-- **Voter** — a member that counts toward quorum.
-- **WAL (Write-Ahead Log)** — the durable on-disk store of log entries, written before callbacks run.
-
----
-
-*This document is an overview. For the membership lifecycle see the
-[Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md); for runtime partition
-changes see the [Elastic Partitions Developer Guide](elastic-partitions-developer-guide.md).*
+A change to WAL formats, partition state shape, or the scheduling protocol includes the affected tests. Also update the XML `<summary>` of the classes and methods whose invariant changed.

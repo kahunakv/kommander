@@ -1,13 +1,10 @@
 # Node Transport Authentication — Developer Guide
 
-This guide explains how Kommander authenticates **node-to-node** traffic: the three modes, what each one
-proves, what it leaves unprotected, and how to operate them. It is written for two
-readers — an operator choosing a mode and rotating its credentials, and a developer extending the
-transport layer. It covers the REST and gRPC transports together, because they share one implementation
-and must not drift.
+This guide covers authentication of **node-to-node** traffic over REST and gRPC, for operators who
+choose a mode and rotate credentials, and for developers who extend the transport layer.
 
-`SharedSecret` authenticates *membership in the cluster*; `MutualTls` authenticates
-*which node* is calling. If you need to tell your own nodes apart from each other, you need `MutualTls`.
+`SharedSecret` authenticates *membership in the cluster*. `MutualTls` authenticates *which node* is
+calling. If you need to tell your own nodes apart, use `MutualTls`.
 
 ---
 
@@ -24,25 +21,22 @@ and must not drift.
 9. [Fail-closed startup checks](#fail-closed-startup-checks)
 10. [Snapshot integrity](#snapshot-integrity)
 11. [Code map](#code-map)
-12. [Glossary](#glossary)
 
 ---
 
 ## Summary
 
-Every inbound Raft request — REST or gRPC — passes through one authentication decision before it reaches
-the state machine. Three modes are available:
+Each inbound Raft request, REST or gRPC, is authenticated before it reaches the state machine.
 
 | Mode | What it proves | Credential |
 |---|---|---|
-| `Disabled` | Nothing. Any host that can reach the port can drive consensus. | none |
+| `Disabled` | Any host that can reach the port can drive consensus. | none |
 | `SharedSecret` | The caller holds the cluster secret. | one symmetric secret, cluster-wide |
 | `MutualTls` | The caller holds a specific trusted private key. | per-node certificate |
 
-`Disabled` is the default, and the server **refuses to start** in that mode unless it is bound to
-loopback or the operator passes `--allow-unauthenticated-cluster`. That refusal exists because the
-unauthenticated surface is not a read-only one: it includes log append, snapshot install, vote, and
-membership change.
+`Disabled` is the default. In that mode the server **does not start** unless it is bound to loopback
+or the operator passes `--allow-unauthenticated-cluster`. The unauthenticated surface includes log
+append, snapshot install, vote, and membership change.
 
 ---
 
@@ -50,103 +44,92 @@ membership change.
 
 ### Disabled
 
-No check is performed. Suitable only for a single-host development cluster on loopback.
+No check is performed. Use it only for a single-host development cluster on loopback.
 
 ### SharedSecret
 
-Every request carries four headers — a signature, the sending node's name, a timestamp, and a nonce.
-The signature is an HMAC-SHA256 over the request method, path (or gRPC method), sender, timestamp,
-nonce, and a digest of the body, keyed by the shared secret.
+Each request carries four headers: a signature, the name of the sending node, a timestamp, and a
+single-use random nonce. The signature is an HMAC-SHA256 that is keyed by the shared secret.
 
-The receiver recomputes the signature and compares it in constant time, then checks that the timestamp
-is within the allowed clock skew and that the nonce has not been seen before. The nonce is recorded
-**only after the signature verifies**, so unauthenticated traffic cannot grow the replay cache.
+The receiver recomputes the signature and compares it in constant time. It then checks that the
+timestamp is within the allowed clock skew and that the nonce is new. The nonce is recorded **only
+after the signature verifies**. This means that unauthenticated traffic cannot grow the replay cache,
+which is keyed per sender and bounded by the allowed clock skew.
 
 ### MutualTls
 
-Authentication happens during the TLS handshake: each node presents a client certificate, and the
-receiver checks it against a thumbprint allow-list and its validity window. No per-request signature is
-sent or expected — there is nothing to sign, because the identity is a property of the connection.
+Each node presents a client certificate in the TLS handshake. The receiver checks it against a
+thumbprint allow-list and its validity window. A thumbprint is the SHA-256 hash of the DER encoding of
+the certificate. Requests carry no signature because the identity is a property of the connection.
 
 ---
 
 ## Shared-secret mode proves cluster membership only
 
-There is **one secret for the whole cluster**. Every node signs with it and verifies with it. The
-sending node's name travels as a header and is covered by the signature — but it is only a
-*claim*: any holder of the secret can put any name there.
-
-The consequences:
+All nodes sign and verify with **one secret**. The name of the sending node is covered by the
+signature, but it is a *claim*: any holder of the secret can put any name there.
 
 - **A compromised node can impersonate any other node.** It can cast votes as a peer, fabricate
-  acknowledgements attributed to a peer, and send gossip claiming to originate from one.
-- **Revoking one node means rotating the cluster.** There is no per-node credential to remove.
-- **The mode proves that a request comes from inside the cluster. It does not identify the node.**
+  acknowledgements from a peer, and send gossip that claims to come from one.
+- **To revoke one node, you must rotate the secret of the cluster.** There is no per-node credential
+  to remove.
 
-None of this is a defect in the HMAC construction, which is sound. It is inherent to a symmetric
-cluster-wide key. If your threat model includes one node being compromised, use `MutualTls`, where each
-node holds a distinct private key and can be individually removed from every peer's allow-list.
+If your threat model includes one compromised node, use `MutualTls`. Each node then has a distinct
+private key that you can remove from the allow-list of each peer.
 
 ---
 
 ## What a signature covers
 
-A `SharedSecret` signature binds:
+A `SharedSecret` signature is an HMAC over these fields.
 
 ```
 method \n path-or-grpc-method \n sender \n timestamp \n nonce \n SHA256(body)
 ```
 
-Both transports bind their body. REST signs the raw JSON payload; gRPC signs the serialized protobuf
-message. The digests necessarily differ between transports for the same logical request — they are
-different encodings — but neither leaves the payload unsigned. An on-path attacker cannot alter a
-request's contents and keep its signature valid.
+REST signs the raw JSON payload, and gRPC signs the serialized protobuf message. An on-path attacker
+cannot alter the contents of a request and leave its signature valid.
 
-**One exception, by design.** The gRPC duplex `BatchRequests` stream is authenticated once, when the
-stream is established, before any message is read. There is no single request message to bind, so the
-per-message integrity of that stream rests on the transport (TLS). This is
-the hot replication path; if you require per-message cryptographic integrity there, run with TLS
-enforced, which is the default.
+**The gRPC duplex `BatchRequests` stream is the exception.** It is authenticated once, when the stream
+is established and before any message is read. The per-message integrity of this hot replication path
+depends on TLS. If you require per-message cryptographic integrity there, enforce TLS, which is the
+default.
 
 ---
 
 ## Mutual TLS and the pinning model
 
-`MutualTls` validates peers by **SHA-256 thumbprint pinning** plus the certificate's validity window.
-It deliberately does **not** build or verify a certificate chain, and it does not check revocation
-lists. That is a coherent model for a private cluster of self-signed per-node certificates, which is
-the deployment it targets — but be clear about what it implies:
+`MutualTls` validates peers by **SHA-256 thumbprint pinning** and the validity window of the
+certificate. It does **not** build or verify a certificate chain, and it does not check revocation
+lists. The model suits a private cluster of self-signed per-node certificates.
 
-- **Revocation is unobservable.** A compromised certificate stays trusted until its thumbprint is
-  removed from every peer's allow-list.
-- **Removal requires a restart.** The presented certificate is loaded once and cached for the process
-  lifetime, so rotating it is a restart-and-redeploy operation.
-- **There is no CA trust mode.** A certificate signed by your PKI is not trusted unless its thumbprint
+- **Revocation is not visible.** A compromised certificate is trusted until you remove its thumbprint
+  from the allow-list of each peer.
+- **Rotation needs a restart.** The presented certificate is loaded once and cached for the process
+  lifetime.
+- **There is no CA trust mode.** A certificate that your PKI signed is trusted only if its thumbprint
   is listed.
 
-Both directions are checked symmetrically: an expired *client* certificate is rejected by the server,
-and an expired *server* certificate is rejected by the client, even when the thumbprint matches.
+Both directions are checked. The server denies an expired *client* certificate and the client denies
+an expired *server* certificate, even when the thumbprint matches.
 
-Thumbprints may be pasted in the format `openssl x509 -fingerprint -sha256` emits (colon-separated,
-any case); separators and case are normalized before comparison. Use the SHA-256
-thumbprint. Some tools and `X509Certificate2.Thumbprint` show a SHA-1 value, which does not match.
+You can paste thumbprints in the format of `openssl x509 -fingerprint -sha256`. Separators and case
+are normalized before comparison. Use the SHA-256 thumbprint: `X509Certificate2.Thumbprint` and some
+tools show a SHA-1 value, which does not match.
 
 ---
 
 ## Transport security is separate from node authentication
 
-TLS and node authentication answer different questions, and both matter:
-
 - **TLS** protects confidentiality and integrity on the wire and validates the *server* certificate.
-- **Node authentication** decides whether an authenticated *peer* may drive this node's consensus.
+- **Node authentication** decides whether an authenticated *peer* can drive the consensus of this node.
 
-`RequireTls` (default **on**) makes the two interlock: in `SharedSecret` mode a signed request arriving
-over cleartext is rejected outright, because a valid signature over an observable channel still leaks
-the payload. Leave it on unless you have a specific reason not to.
+With `RequireTls` (default **on**), a signed request that arrives over cleartext in `SharedSecret` mode
+is denied. A valid signature over an observable channel would leak the payload.
 
-The development flag that disables peer certificate validation applies **only to Kommander's own
-cluster clients** — it does not alter certificate validation for any other HTTP client in the process.
-It cannot be combined with `MutualTls`, and that combination is rejected at startup.
+The development flag that disables peer certificate validation applies **only to the cluster clients of
+Kommander**. Other HTTP clients in the process are not affected. The server does not start if you
+combine this flag with `MutualTls`.
 
 ---
 
@@ -156,7 +139,7 @@ It cannot be combined with `MutualTls`, and that combination is rejected at star
 |---|---|---|
 | `TransportSecurity.NodeAuthenticationMode` | `Disabled` | `Disabled`, `SharedSecret`, `MutualTls` |
 | `TransportSecurity.SharedSecret` | none | required in `SharedSecret` mode |
-| `TransportSecurity.RequireTls` | `true` | rejects cleartext when authentication is enabled |
+| `TransportSecurity.RequireTls` | `true` | denies cleartext when authentication is enabled |
 | `TransportSecurity.AllowedClockSkew` | 60 s | bounds timestamp drift and the replay window |
 | `TransportSecurity.HeaderName` | `X-Kommander-Cluster-Auth` | signature header |
 | `TransportSecurity.TrustedClientCertificateThumbprints` | empty | required in `MutualTls` mode |
@@ -168,8 +151,8 @@ Server command-line equivalents: `--node-auth-mode`, `--node-shared-secret`, `--
 `--trusted-client-cert-thumbprint`, `--trusted-server-cert-thumbprint`, `--client-certificate`,
 `--client-certificate-password`, `--allow-insecure-certificate-validation`.
 
-Clock skew is a real operational dependency: nodes whose clocks differ by more than `AllowedClockSkew`
-will reject each other's requests with a timestamp error. Run NTP.
+Nodes whose clocks differ by more than `AllowedClockSkew` will deny each other's requests with a
+timestamp error. Use NTP.
 
 ---
 
@@ -178,56 +161,51 @@ will reject each other's requests with a timestamp error. Run NTP.
 ### The shared secret
 
 `HttpAuthBearerToken` is a **legacy alias for the same credential**. When `SharedSecret` is empty, the
-bearer token is used as the shared secret. They are not two independent credentials, and rotating only
-one of them may leave the other still accepted, or rotate a value you did not realize was live. When
-in doubt, set `SharedSecret` explicitly — it takes precedence — and leave the bearer token unset.
+bearer token is used as the shared secret. If you rotate only one of them, the other can still be
+valid. Set `SharedSecret` explicitly, which takes precedence, and leave the bearer token unset.
 
-Rotating the secret is a cluster-wide operation: signatures are verified with a single key, so nodes
-holding the old and new secret cannot authenticate each other. Plan a maintenance window, or move to
-`MutualTls`, where credentials are per node and can be rolled one at a time.
+Signatures are verified with a single key, and nodes that hold the old and the new secret cannot
+authenticate each other. Plan a maintenance window, or move to `MutualTls`, where you can roll
+credentials one node at a time.
 
 ### Certificates
 
-1. Issue the new certificate and add its thumbprint to every peer's
-   `TrustedClientCertificateThumbprints` (and `TrustedServerCertificateThumbprints`, if the node is
-   dialed).
-2. Restart peers so the new allow-list is loaded.
+1. Issue the new certificate. Add its thumbprint to `TrustedClientCertificateThumbprints` on each peer
+   (and to `TrustedServerCertificateThumbprints`, if the node is dialed).
+2. Restart the peers to load the new allow-list.
 3. Switch the rotating node to the new certificate and restart it.
-4. Remove the old thumbprint from every peer and restart them.
+4. Remove the old thumbprint from each peer and restart them.
 
-The allow-list holding both thumbprints during the overlap is what makes this rollable one node at a
-time.
+The allow-list must contain both thumbprints during the overlap.
 
 ---
 
 ## Fail-closed startup checks
 
-The server refuses to start in these insecure configurations:
+The server does not start in these insecure configurations.
 
-- authentication `Disabled` on a non-loopback bind, without `--allow-unauthenticated-cluster`;
-- `MutualTls` with no trusted client certificate thumbprint — an empty allow-list would trust every
-  certificate that completes the handshake;
-- `MutualTls` combined with the insecure-certificate-validation flag;
-- `MutualTls` without an HTTPS certificate;
-- `SharedSecret` without a secret;
-- a cleartext listener requested alongside `MutualTls`.
+- Authentication is `Disabled` on a non-loopback bind and `--allow-unauthenticated-cluster` is absent.
+- `MutualTls` has an empty list of trusted client certificate thumbprints. An empty allow-list would
+  trust any certificate that completes the handshake.
+- `MutualTls` is combined with the insecure-certificate-validation flag.
+- `MutualTls` is set and no HTTPS certificate is configured.
+- `SharedSecret` is set and the secret is missing.
+- A cleartext listener is requested alongside `MutualTls`.
 
-The cleartext HTTP listener is not bound at all when an HTTPS certificate is configured, unless
-`--allow-plaintext-listener` is passed. `--host` controls the bind address; use `--host localhost` to
-keep a development node off the network.
+When an HTTPS certificate is configured, the cleartext HTTP listener is not bound unless you pass
+`--allow-plaintext-listener`. Use `--host localhost` to limit a development node to loopback.
 
 ---
 
 ## Snapshot integrity
 
-A snapshot install writes bytes straight into the application state machine and seeds a WAL checkpoint,
-which makes it the highest-leverage message in the protocol. Independently of transport security, the
-sender computes a SHA-256 over the whole snapshot and the receiver verifies it against what it
-staged before anything is imported. A mismatch — tampering, or a truncated transfer that still satisfied
-the chunk-ordering rules — rejects the install.
+A snapshot install writes bytes into the application state machine and seeds a WAL checkpoint.
+Independently of transport security, the sender computes a SHA-256 over the full snapshot. The receiver
+verifies it against the staged bytes before the import. The install fails on a mismatch, which can come
+from tampering or from a truncated transfer that satisfied the chunk-ordering rules.
 
-Senders that predate this field are refused unless `AllowLegacySnapshotSenders` is set, which exists as
-a rolling-upgrade window and should be turned back off afterwards.
+Senders that predate this field are denied unless `AllowLegacySnapshotSenders` is set. Set it for a
+rolling upgrade, and turn it off afterwards.
 
 ---
 
@@ -243,22 +221,5 @@ a rolling-upgrade window and should be turned back off afterwards.
 | gRPC body digest | `GrpcMessageBodyHash` |
 | Startup policy | `KommanderServerBindingPolicy` |
 
-Both transports route their trust decisions through the shared validator on purpose: a divergence
-between them would be invisible to a test that exercises only one transport, while leaving the other
-permanently more permissive.
-
----
-
-## Glossary
-
-**Nonce** — a single-use random value that makes each signature unique, so a captured request cannot be
-replayed.
-
-**Replay cache** — the record of recently seen nonces, keyed per sender and bounded by the allowed clock
-skew.
-
-**Thumbprint** — a hash of a certificate's DER encoding, used here as its identity. Kommander uses
-SHA-256.
-
-**Pinning** — trusting a specific certificate by its thumbprint, with no chain to whatever a
-certificate authority has signed.
+Both transports must use the shared validator for trust decisions. A divergence would leave one
+transport permanently more permissive, and a test of the other transport would not detect it.

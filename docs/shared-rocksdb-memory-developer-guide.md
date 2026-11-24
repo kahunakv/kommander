@@ -1,15 +1,11 @@
 # Shared RocksDB Memory Resources for the RocksDB WAL — Developer Guide
 
-This guide explains how to make a process that runs **both** a Kommander RocksDB WAL **and** its own
-RocksDB database share one memory budget instead of paying for two. It covers what is shared (a block
-cache and a write-buffer manager), what is not, how to size the budget, and the ownership and lifetime
-rules you must follow to avoid leaks or crashes. It is written for two readers — an operator deciding
-whether to turn this on and how to size it, and a developer wiring it into a host application. No prior
-RocksDB internals are assumed.
+A process that has **both** a Kommander RocksDB WAL **and** another RocksDB database can give them one
+memory budget. This guide covers what is shared, how to size the budget, and the ownership rules. It is
+for operators who size the budget and for developers who wire it into a host application.
 
-This feature is **opt-in and additive**. It changes only in-process memory objects — no on-disk format,
-WAL semantics, recovery mode, or wire behaviour. With it unset, the RocksDB WAL behaves byte-for-byte as
-before.
+The feature is **opt-in**. It changes only in-process memory objects. The on-disk format, WAL semantics,
+recovery mode, and wire behaviour are the same.
 
 ---
 
@@ -28,23 +24,17 @@ before.
 11. [Code map](#code-map)
 12. [Invariants you must not break](#invariants-you-must-not-break)
 13. [Testing](#testing)
-14. [Glossary](#glossary)
 
 ---
 
 ## Summary
 
-RocksDB's memory is dominated by two things: the **block cache** (cached SST blocks, shared across reads)
-and **memtables** (in-RAM write buffers, one set per column family). A `RocksDbWAL` opens **one** RocksDB
-database with **10 column families** (`default` + `metadata` + `shard0..7`), each with its own memtables.
-
-By default the WAL configures **neither** — it uses RocksDB's small default block cache and unbounded
-default memtables. If the host process also runs a *second* RocksDB instance (the application's own
-database), the two never share anything: two block caches, two unbounded sets of memtables, two budgets.
+Two things dominate RocksDB memory: the **block cache** (cached SST blocks, used by reads) and
+**memtables** (in-memory write buffers, one set per column family, or CF). A `RocksDbWAL` opens **one**
+database with **10 column families**: `default`, `metadata`, and `shard0..7`.
 
 `RocksDbSharedResources` lets the host create **one** block cache and **one** write-buffer manager (WBM),
-then hand the same bundle to the WAL and to its own database. Both instances now draw from a single,
-bounded budget:
+and give the same bundle to the WAL and to the host database.
 
 ```
    without sharing:   [ WAL: cache A + memtables A ]   [ host DB: cache B + memtables B ]
@@ -56,29 +46,19 @@ bounded budget:
                                   one unified budget
 ```
 
-The host **owns** the bundle, creates it once, injects it into every database via an optional
-constructor parameter, and disposes it **after** all those databases are closed.
+The host **owns** the bundle. It passes the bundle to each database and disposes it **after** all those
+databases are closed.
 
 ---
 
 ## Double memory cost of two RocksDB instances
 
-`RocksDbWAL` (`Kommander/WAL/RocksDbWAL.cs`) opens its database with no memory tuning:
+By default, `RocksDbWAL` configures no block cache and no global bound on memtable memory. It uses
+RocksDB's small default block cache. If the host process opens a second RocksDB instance, the process
+pays for two block caches and two unbounded memtable footprints.
 
-- **No block cache configured.** The `DbOptions` set only `CreateIfMissing`,
-  `CreateMissingColumnFamilies`, `AllowConcurrentMemtableWrite`, and `WalRecoveryMode` — so the database
-  uses RocksDB's small default per-instance block cache.
-- **No `write_buffer_size` / `max_write_buffer_number` override.** Each of the 10 column families gets
-  RocksDB's default memtable sizing, with no *global* bound on total memtable memory.
-- **No custom `Env`.** It uses the process-wide `Env::Default()`, whose background thread pools are
-  *already* shared across every RocksDB instance in the process. The levers are therefore
-  the block cache and the memtables.
-
-When the host runs a second RocksDB instance with its own cache, both of these are fully duplicated. The
-process pays for two block caches and two unbounded memtable footprints, even though one bounded budget
-would serve both. Sharing a single `Cache` and a single `WriteBufferManager` bounds total cache+memtable
-memory to **one** number without merging the databases — they keep separate data, paths, and column
-families.
+One `Cache` and one `WriteBufferManager` bound the total to **one** number. The databases have separate
+data, paths, and column families.
 
 ---
 
@@ -86,34 +66,29 @@ families.
 
 | Resource | Shared? | How |
 |---|---|---|
-| **Block cache** | ✅ | One `Cache` (managed RocksDbSharp type) applied to every column family of every DB. |
-| **Memtable budget** | ✅ | One `WriteBufferManager` cost-charged to that same cache, attached to each DB's `DbOptions`. |
-| **Background thread pools (`Env`)** | already shared | Both instances use `Env::Default()` — nothing to do. |
-| **On-disk data / column families** | ❌ | Each database keeps its own path, files, and CFs. Sharing is memory-only. |
-| **WAL semantics, recovery mode, wire format** | ❌ unchanged | The feature touches only in-process memory objects. |
+| **Block cache** | ✅ | One `Cache` (managed RocksDbSharp type) applied to each column family of each DB. |
+| **Memtable budget** | ✅ | One `WriteBufferManager` charged to that same cache, attached to each DB's `DbOptions`. |
+| **Background thread pools (`Env`)** | already shared | Both instances use `Env::Default()`. |
+| **On-disk data / column families** | ❌ | Each database has separate files and CFs. |
+| **WAL semantics, recovery mode, wire format** | ❌ unchanged | |
 
-Two key facts shape the API:
-
-- RocksDbSharp `10.10.1` exposes a **managed `Cache`** type (`Cache.CreateLru`, `Cache.GetUsage`,
-  `BlockBasedTableOptions.SetBlockCache`), so the block-cache path needs no interop.
-- It exposes **no** managed `WriteBufferManager` type and **no** `DbOptions.SetWriteBufferManager`. The
-  WBM is therefore created and attached through a thin interop wrapper over `Native.Instance.*`, and
-  `RocksDbSharedResources` holds it as a raw `IntPtr` it owns.
+RocksDbSharp has a **managed `Cache`** type (`Cache.CreateLru`, `Cache.GetUsage`,
+`BlockBasedTableOptions.SetBlockCache`). It has **no** managed `WriteBufferManager` type and **no**
+`DbOptions.SetWriteBufferManager`. The WBM is created and attached through `Native.Instance.*`, and
+`RocksDbSharedResources` owns it as a raw `IntPtr`.
 
 ---
 
 ## The unified budget
 
-`RocksDbSharedResources.CreateWithUnifiedBudget(totalBytes, memtableBudgetBytes)` builds:
+`RocksDbSharedResources.CreateWithUnifiedBudget(totalBytes, memtableBudgetBytes)` builds two objects.
 
 1. One **soft** LRU block cache of `totalBytes` (`Cache.CreateLru`).
-2. One **non-stalling** WriteBufferManager with a memtable sub-budget of `memtableBudgetBytes`,
-   **cost-charged to that same cache** (`rocksdb_write_buffer_manager_create_with_cache`,
-   `allow_stall = 0`).
+2. One **non-stalling** WBM with a memtable sub-budget of `memtableBudgetBytes`, **charged to that same
+   cache** (`rocksdb_write_buffer_manager_create_with_cache`, `allow_stall = 0`).
 
-Because the memtable budget is charged *into* the cache, cache occupancy and memtable memory share one
-bound — hence the requirement `memtableBudgetBytes <= totalBytes` (the constructor throws
-`ArgumentOutOfRangeException` otherwise: the sub-budget cannot be larger than the budget it lives in).
+Cache occupancy and memtable memory share one bound. The method throws `ArgumentOutOfRangeException`
+unless `memtableBudgetBytes <= totalBytes`.
 
 ```
    ┌─────────────────────── totalBytes (LRU block cache) ───────────────────────┐
@@ -121,25 +96,22 @@ bound — hence the requirement `memtableBudgetBytes <= totalBytes` (the constru
    └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Two deliberate choices keep this safe under write load:
-
-- **Soft (non-strict-capacity) cache.** With memtables charged to the cache, a *hard* capacity limit
-  would surface as write errors or stalls every time any sharing database flushed a memtable. A soft
-  limit makes the budget a soft target.
-- **`allow_stall = false` on the WBM.** Prevents cross-database flush coupling from turning into write
-  stalls. Size conservatively instead of relying on stalls for back-pressure.
+- **The cache has a soft (non-strict) capacity.** Memtables are charged to the cache, and a *hard* limit
+  would cause write errors or stalls when a sharing database flushes a memtable.
+- **The WBM has `allow_stall = false`.** A flush in one database does not stall writes in another. Size
+  the budget conservatively, because stalls give no back-pressure.
 
 ---
 
 ## Flow 1 — Create the bundle once, inject it everywhere
 
-The host's composition root creates the bundle, then passes it to the WAL (and to its own database):
+The host's composition root creates the bundle, then passes it to the WAL and to the host database.
 
 ```csharp
 // Host owns this. Create once, dispose last.
 RocksDbSharedResources shared = RocksDbSharedResources.CreateWithUnifiedBudget(
     totalBytes:          512L * 1024 * 1024,  // 512 MiB block cache
-    memtableBudgetBytes: 128L * 1024 * 1024); // 128 MiB memtable sub-budget inside it
+    memtableBudgetBytes: 256L * 1024 * 1024); // 256 MiB memtable sub-budget inside it
 
 RaftManager node = new(
     configuration,
@@ -159,15 +131,14 @@ RaftManager node = new(
 shared.Dispose();
 ```
 
-The trailing `sharedResources:` parameter is optional. Omit it (or pass `null`) and the WAL opens exactly
-as before — no cache, default buffers, default CF options.
+The `sharedResources:` parameter is optional.
 
 ---
 
 ## Flow 2 — How the WAL applies the bundle
 
-When `sharedResources` is non-null, `RocksDbWAL` wires both objects in **before** `RocksDb.Open` (these
-are baked into the options and CF descriptors at open time — they cannot be applied afterward):
+`RocksDbWAL` sets both objects **before** `RocksDb.Open`. They are part of the options and CF descriptors
+at open time and cannot be applied afterward.
 
 ```
   build DbOptions
@@ -180,72 +151,66 @@ are baked into the options and CF descriptors at open time — they cannot be ap
   RocksDb.Open(dbOptions, path, columnFamilies)
 ```
 
-Applying the block cache to **every** column family matters: a CF *without* the block-cache factory keeps
-RocksDB's default per-CF cache and is silently excluded from the shared budget. None can be skipped, so a
-single shared `BlockBasedTableOptions` (it only references the cache) is applied to all 10 via the
-`ApplyCfOptions` helper.
+A CF that does not get the shared block-cache factory uses RocksDB's default per-CF cache and is silently
+excluded from the budget. The `ApplyCfOptions` helper applies one `BlockBasedTableOptions` to all 10.
 
-When `sharedResources` is null, the column families are created with plain `new()` options and no WBM is
-attached — the byte-for-byte default path.
+When `sharedResources` is null, the WAL sets no block cache and attaches no WBM.
 
 ---
 
 ## Sizing the budget
 
-The WBM bounds **total** memtable memory across *every column family of every database* sharing it. This
-WAL alone contributes 10 column families. If
+The WBM bounds **total** memtable memory across *all column families of all databases* that share it.
 
 ```
    Σ over all sharing DBs ( write_buffer_size × max_write_buffer_number × CF count )
 ```
 
-greatly exceeds `memtableBudgetBytes`, ordinary write bursts trip the global budget and cause continuous
-cross-CF / cross-DB flushing — the workload-coupling cost of sharing a WBM.
+If this sum greatly exceeds `memtableBudgetBytes`, ordinary write bursts trip the global budget and cause
+continuous flushes across CFs and databases.
 
-RocksDB's defaults are **64 MiB** `write_buffer_size` and **2** `max_write_buffer_number`. For this WAL's
-10 CFs that is `10 × 64 MiB × 2 ≈ 1.28 GiB` of *potential* memtable memory — far above any typical WBM
-budget. So if you share a WBM, plan for it:
+`RocksDbWalTuning` sizes the shard CFs of the WAL. Its defaults are 64 MiB for
+`ShardWriteBufferSizeBytes` and 4 for `ShardMaxWriteBufferNumber`. The eight shards can use
+`8 × 64 MiB × 4 = 2 GiB` of *potential* memtable memory, which is far above a typical WBM budget. Plan
+for it when you share a WBM.
 
-- Pick `write_buffer_size` so this WAL's `cf_count × write_buffer_size × max_write_buffer_number` is a
-  **small, intended fraction** of `memtableBudgetBytes`, leaving headroom for the host's own database.
-- Apply matching, modest values on the host database too.
-- Document the numbers you chose so the coupling is intentional.
+The budget must be at least `ShardWriteBufferSizeBytes × (ShardMinWriteBufferNumberToMerge + 1)`, which
+is one flush unit plus one memtable of headroom. With the defaults this is 192 MiB. Below it, the WAL logs
+a Warning at open, and RocksDB flushes the Raft log on the budget's cadence. Add the memtables of the host
+database to this minimum.
 
-If write-path coupling turns out to be a problem, you have an escape hatch: **share only the `Cache`** —
-the larger, workload-agnostic win — and leave the WBM unset on the host side. The block cache alone
-already eliminates the duplicated read-cache footprint.
+- Pick values that make the envelope of the WAL a **small, intended fraction** of `memtableBudgetBytes`,
+  with headroom for the host database.
+- Set matching, modest values on the host database too.
+- Document the numbers you chose.
 
-Measure consensus-path latency (WAL append / commit) under concurrent load with sharing **on vs off**
-before committing to a WBM in production.
+If write-path coupling is a problem, **share only the `Cache`** and leave the WBM unset on the host side.
+The block cache alone removes the duplicated read-cache footprint.
+
+Before you use a WBM in production, measure consensus-path latency (WAL append and commit) under
+concurrent load with sharing **on and off**.
 
 ---
 
 ## Ownership and lifetime
 
-**The host owns the bundle. `RocksDbWAL` borrows it and never disposes it.** Both the type and the
-constructor document this rule.
+**The host owns the bundle. `RocksDbWAL` borrows it and must not dispose it.**
 
-The native `Cache` and WBM are reference-counted (`shared_ptr`). When a database opens with them,
-`rocksdb_options_set_write_buffer_manager` copies the WBM's `shared_ptr` into the DB's options, and each
-open DB holds its own reference to **both** objects. The consequences:
+The native `Cache` and WBM are reference-counted (`shared_ptr`), and each open DB has a reference to
+**both** objects.
 
-- **Dispose order is host last.** Dispose every database that borrowed the bundle, *then* dispose the
-  bundle. `RocksDbSharedResources.Dispose()` drops only the **bundle's** reference; the open DBs keep
-  their own.
-- **Disposing early will not crash.** Because the DBs hold their own references, disposing the bundle
-  *before* closing the databases does **not** free memory out from under them — no use-after-free. It is
-  still a **usage error**, because a charged-but-released cache leaves the budget accounting
-  inconsistent.
-- **Dispose is idempotent.** A `_disposed` guard makes repeated `Dispose()` calls safe no-ops.
-- **A finalizer backstops a forgotten `Dispose`.** If the host never disposes the bundle, a finalizer
-  releases the raw WBM handle so it does not leak. (The managed `Cache` self-finalizes; the raw `IntPtr`
-  would not, hence the backstop.) Always dispose explicitly anyway — the finalizer is only a
-  safety net.
+- **Dispose the bundle last.** Dispose each database that borrowed it first.
+  `RocksDbSharedResources.Dispose()` drops only the **bundle's** reference.
+- **An early dispose does not crash.** The open DBs have references, and no memory is freed under them.
+  However, it is a **usage error**: the budget accounting becomes inconsistent.
+- **Dispose is idempotent.** Repeated `Dispose()` calls are safe.
+- **A finalizer releases the raw WBM handle** if the host forgets `Dispose`. The raw `IntPtr` would leak
+  otherwise. You should always dispose explicitly.
 
-Inside `Dispose`, the order is **WBM first, then the block cache**: the WBM holds a `shared_ptr` to the
-cache, so releasing it first lets the cache's refcount drop cleanly. The `Cache` has no managed `Dispose`
-and frees its handle through its own finalizer; the bundle destroys the cache handle explicitly and
-suppresses that finalizer so the handle is never freed twice.
+`Dispose` releases the **WBM first, then the block cache**. The WBM has a `shared_ptr` to the cache, and
+this order lets the refcount drop cleanly. `Cache` has no managed `Dispose`, and its finalizer frees the
+handle. The bundle destroys the cache handle explicitly and suppresses that finalizer to prevent a
+double free.
 
 ---
 
@@ -275,16 +240,18 @@ public RocksDbWAL(
     string revision,
     ILogger<IRaft> logger,
     bool syncWrites = true,
-    RocksDbSharedResources? sharedResources = null);   // optional; null ⇒ default behaviour
+    RocksDbSharedResources? sharedResources = null,    // optional; null ⇒ default behaviour
+    IMonotonicTickSource? tickSource = null,
+    RocksDbWalTuning? tuning = null);                  // null ⇒ RocksDbWalTuning.Default
 ```
 
 | Parameter | Effect |
 |---|---|
-| `sharedResources = null` (default) | No block cache, default memtables, default CF options — byte-for-byte the prior behaviour. |
-| `sharedResources != null` | Block cache applied to all 10 CFs; WBM applied to `DbOptions`; both before `RocksDb.Open`. Bundle is borrowed, never disposed by the WAL. |
+| `sharedResources = null` (default) | No block cache and no WBM. |
+| `sharedResources != null` | Block cache applied to all 10 CFs and WBM applied to `DbOptions`, both before `RocksDb.Open`. |
+| `tuning` | Sizes the shard CFs. The constructor throws `ArgumentOutOfRangeException` unless `ShardMaxWriteBufferNumber` is greater than `ShardMinWriteBufferNumberToMerge`. |
 
-There is no `RaftConfiguration` knob for this — the bundle is injected through the constructor by the host
-that already constructs the `RocksDbWAL`.
+There is no `RaftConfiguration` setting for the bundle.
 
 ---
 
@@ -292,12 +259,12 @@ that already constructs the `RocksDbWAL`.
 
 | Signal | Meaning | When it moves |
 |---|---|---|
-| `RocksDbSharedResources.MemtableMemoryUsage` | Live memtable bytes tracked by the WBM (`rocksdb_write_buffer_manager_memory_usage`). | Rises on **writes** from *any* database sharing the bundle. The primary signal that sharing is real. |
-| `RocksDbSharedResources.BlockCache.GetUsage()` | Current block-cache occupancy. | Grows on **reads** (cached blocks) or via the WBM's cost-to-cache dummy entries. Do **not** rely on it alone for a write-only workload. |
+| `RocksDbSharedResources.MemtableMemoryUsage` | Live memtable bytes tracked by the WBM (`rocksdb_write_buffer_manager_memory_usage`). | Rises on **writes** from *any* database that shares the bundle. |
+| `RocksDbSharedResources.BlockCache.GetUsage()` | Current block-cache occupancy. | Grows on **reads**, or through the WBM's dummy entries. |
 
-To confirm two databases share one budget, watch `MemtableMemoryUsage` rise as either one writes.
-If you assert on `GetUsage()`, issue reads on both first to populate the block cache, or the counter may
-not move predictably under a pure-append workload.
+To confirm that two databases share one budget, check that `MemtableMemoryUsage` rises when either one
+writes. Before you assert on `GetUsage()`, issue reads on both, because the counter may not move
+predictably under a pure-append workload.
 
 ---
 
@@ -326,43 +293,37 @@ Kommander.Tests/
 
 ## Invariants you must not break
 
-1. **The host owns the bundle; the WAL borrows it.** `RocksDbWAL` must never call `Dispose` on a
-   `RocksDbSharedResources`. The host disposes it, after all borrowing databases are closed.
-2. **Apply the block cache to *every* column family.** A CF without the shared table factory falls back
-   to its own default cache and silently escapes the budget. All 10 CFs get the same
-   `BlockBasedTableOptions`.
-3. **Wire the cache and WBM before `RocksDb.Open`.** They are baked into the options and CF descriptors
-   at open time and cannot be changed afterward.
-4. **`memtableBudgetBytes <= totalBytes`.** The memtable sub-budget lives inside the cache budget;
-   violating this throws.
-5. **Soft cache + non-stalling WBM.** Never use a strict-capacity cache here — with memtables charged to
-   the cache, a hard cap surfaces as write stalls/errors on every sharing database.
-6. **Null path is sacred.** With `sharedResources` null, the WAL open path is byte-for-byte the prior
-   default — no cache, default buffers, default CF options.
-7. **Dispose order inside the bundle is WBM then cache**, and the `Cache` finalizer must be suppressed
-   after the explicit cache destroy so the handle is never freed twice.
+1. **The host owns the bundle and the WAL borrows it.** `RocksDbWAL` must not call `Dispose` on a
+   `RocksDbSharedResources`.
+2. **Apply the block cache to *every* column family.** A CF that does not get it silently escapes the
+   budget.
+3. **Set the cache and the WBM before `RocksDb.Open`.** They cannot be changed afterward.
+4. **`memtableBudgetBytes <= totalBytes`.** A violation throws.
+5. **Soft cache and non-stalling WBM.** A strict-capacity cache surfaces as write stalls or errors on all
+   sharing databases.
+6. **Null means unshared.** With `sharedResources` null, the WAL open path must set no block cache and no
+   WBM.
+7. **Dispose order in the bundle is WBM, then cache.** Suppress the `Cache` finalizer after the explicit
+   destroy, or the handle is freed twice.
 
 ---
 
 ## Testing
 
-`TestRocksDbSharedResources` covers the feature at the unit and integration layers:
+`TestRocksDbSharedResources` covers the feature.
 
-- **Budget validation** — `CreateWithUnifiedBudget` rejects `memtableBudgetBytes > totalBytes` and
-  accepts an equal budget; the resulting handles are non-null and `MemtableMemoryUsage` is readable.
-- **Idempotent dispose** — `Dispose` twice does not crash.
-- **Backward compatibility** — a WAL opened with `sharedResources: null` writes and reads identically to
-  the default constructor.
-- **Bundle applied** — a WAL opened *with* a bundle round-trips logs across several partitions/shards, so
-  the shared cache + WBM do not change WAL behaviour.
-- **Sharing is real** — two independent `RocksDbWAL` instances (distinct paths) opened with **one**
-  bundle both drive `MemtableMemoryUsage` up, proving a single WBM tracks both databases.
-- **Lifetime** — disposing the WALs then the bundle (correct order) does not crash; disposing the bundle
-  *before* the WALs also does not crash (the DBs hold their own refcounts), documenting that early
-  disposal is only a budget-accounting error.
+- **Budget validation.** `CreateWithUnifiedBudget` throws for `memtableBudgetBytes > totalBytes` and
+  allows an equal budget. The handles are non-null and `MemtableMemoryUsage` is readable.
+- **Idempotent dispose.** A second `Dispose` does not crash.
+- **Backward compatibility.** A WAL with `sharedResources: null` writes and reads identically to the
+  default constructor.
+- **Bundle applied.** A WAL with a bundle round-trips logs across several partitions and shards.
+- **Sharing.** Two `RocksDbWAL` instances at distinct paths with **one** bundle both drive
+  `MemtableMemoryUsage` up.
+- **Lifetime.** Neither dispose order (WALs first, or bundle first) crashes.
 
-Reminder: **never run multiple `dotnet test` commands at once.** The suite spins up in-process Raft
-clusters; concurrent runs produce false failures. Use a targeted `--filter` while iterating.
+**Do not start multiple `dotnet test` commands at once.** Concurrent in-process Raft clusters produce
+false failures.
 
 ```sh
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~TestRocksDbSharedResources
@@ -370,29 +331,6 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~T
 
 ---
 
-## Glossary
-
-- **Block cache** — RocksDB's cache of decompressed SST data blocks; the dominant *read* memory cost.
-  Shared here as a single `Cache`.
-- **Memtable** — an in-RAM write buffer; one active (plus up to `max_write_buffer_number - 1` immutable)
-  per column family. The dominant *write* memory cost.
-- **WriteBufferManager (WBM)** — RocksDB's global bound on total memtable memory across column families
-  and databases. Shared here, cost-charged to the block cache.
-- **Column family (CF)** — an independently-keyed namespace inside one RocksDB database. The WAL uses 10:
-  `default`, `metadata`, and `shard0..7`.
-- **Cost-charged to a cache** — the WBM accounts its memtable memory *inside* the block cache's budget, so
-  one number bounds both.
-- **Soft / strict-capacity cache** — a soft cache treats its size as a target; a strict one rejects/stalls
-  at the cap. This feature uses a soft cache deliberately.
-- **`allow_stall`** — a WBM flag that, when true, stalls writes at the memtable budget. Set to false here
-  to avoid cross-database write stalls.
-- **`shared_ptr` / refcount** — the native objects are reference-counted; each open DB holds its own
-  reference, so disposing the bundle only drops the bundle's reference.
-- **Borrowed resource** — the WAL uses the bundle but does not own its lifetime; the host creates and
-  disposes it.
-
----
-
-*For the broader system, see the [Architecture Overview](architecture-overview.md); for the WAL write and
+*For the broader system, see the [Architecture Overview](architecture-overview.md). For the WAL write and
 durability path, see the
 [WAL Write Durability & Single-Fsync Commit Developer Guide](wal-commit-durability-developer-guide.md).*

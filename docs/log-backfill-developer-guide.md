@@ -1,49 +1,39 @@
 # Log Catch-Up & Backfill — Developer Guide
 
-This guide explains how Kommander keeps a **lagging follower** in sync with its leader: the
-**backfill** feature. It is written for two readers — someone who wants to *understand* how catch-up
-works, and someone who wants to *extend or debug* it. No prior Raft expertise is assumed.
+This guide explains **backfill**, which brings a lagging follower back in sync with its leader, and the
+snapshot path that takes over when the leader no longer has the missing entries.
 
 ---
 
 ## Table of contents
 
 1. [Summary](#summary)
-2. [Purpose of backfill](#purpose-of-backfill)
-3. [Live and backfill replication paths](#live-and-backfill-replication-paths)
-4. [Core concepts](#core-concepts)
-5. [Flow 1 — Detecting a lagging follower](#flow-1--detecting-a-lagging-follower)
-6. [Flow 2 — Sending a bounded backfill round](#flow-2--sending-a-bounded-backfill-round)
-7. [Flow 3 — The follower's Log Matching check](#flow-3--the-followers-log-matching-check)
-8. [Flow 4 — Multi-round convergence](#flow-4--multi-round-convergence)
-9. [Flow 5 — Snapshots below the compaction floor](#flow-5--snapshots-below-the-compaction-floor)
-10. [Flow 6 — Requested re-seed and withheld candidacy](#flow-6--requested-re-seed-and-withheld-candidacy)
-11. [The unanchored live path](#the-unanchored-live-path)
-12. [Configuration](#configuration)
-13. [Code map](#code-map)
-14. [Invariants you must not break](#invariants-you-must-not-break)
-15. [Testing](#testing)
-16. [Glossary](#glossary)
+2. [Live and backfill replication paths](#live-and-backfill-replication-paths)
+3. [Core concepts](#core-concepts)
+4. [Flow 1 — Detecting a lagging follower](#flow-1--detecting-a-lagging-follower)
+5. [Flow 2 — Sending a bounded backfill round](#flow-2--sending-a-bounded-backfill-round)
+6. [Flow 3 — The follower's Log Matching check](#flow-3--the-followers-log-matching-check)
+7. [Flow 4 — Multi-round convergence](#flow-4--multi-round-convergence)
+8. [Flow 5 — Snapshots below the compaction floor](#flow-5--snapshots-below-the-compaction-floor)
+9. [Flow 6 — Requested re-seed and withheld candidacy](#flow-6--requested-re-seed-and-withheld-candidacy)
+10. [The unanchored live path](#the-unanchored-live-path)
+11. [Configuration](#configuration)
+12. [Code map](#code-map)
+13. [Invariants you must not break](#invariants-you-must-not-break)
+14. [Testing](#testing)
 
 ---
 
 ## Summary
 
-A Raft follower is supposed to hold the **same log** as its leader — the same entries, in the same
-order, with no gaps. But followers fall behind: one is slow, one was briefly paused, one was
-partitioned for a few seconds, one just joined the cluster.
+A follower falls behind when it is slow, paused, partitioned or new to the cluster. A broadcast of the
+newest entry does not help it, since the entries it missed would be a **gap** in its log.
 
-**Backfill** is how the leader catches a behind follower back up:
-
-> The leader notices a follower is lagging by more than a threshold, reads the missing slice of its own
-> log, and ships it in **bounded chunks**. Each chunk is **anchored**: it tells the follower "you must
-> already hold entry *F* at term *T* before I give you *F+1*." The follower applies the chunk only if the
-> anchor matches; otherwise it rejects, and the leader backs up and retries lower. Rounds repeat until
-> the follower is caught up.
-
-If the follower has fallen so far behind that the leader has already **compacted** the entries it needs,
-backfill can't help — the data is gone. The leader detects the empty backfill read and catch-up hands
-off to snapshot install internally, on the leader's own heartbeat path.
+The leader detects the lag, reads the missing range of its log and ships it in **bounded, anchored
+chunks**. The anchor states which entry the follower must already have. A follower that does not have it
+rejects the chunk, and the leader retries from a lower index. Rounds repeat until the follower is caught
+up. If the leader already **compacted** the missing entries, the backfill read comes back empty and
+catch-up switches to a snapshot install.
 
 ```
    LEADER log:   1 2 3 4 5 6 7 8 9 10
@@ -54,50 +44,18 @@ off to snapshot install internally, on the leader's own heartbeat path.
 
 ---
 
-## Purpose of backfill
-
-Normal replication is a **broadcast**: when the leader commits a new entry, it pushes that entry to all
-followers right away. This works for a follower that is *keeping up* — it gets entry N, then N+1,
-then N+2, in order.
-
-It does nothing for a follower that **missed entries while it was away**. If a follower last saw
-entry 3 and the leader is now broadcasting entry 10, naively appending entry 10 would leave a **gap**
-(4–9 missing). A log with a gap is corrupt: replaying it would skip changes and the follower's state
-would silently diverge from everyone else's.
-
-**Backfill** finds the missing range and fills it in without ever creating a gap or a divergent tail.
-
----
-
 ## Live and backfill replication paths
-
-Kommander has **two** ways entries reach a
-follower, and they behave differently **on purpose**.
-
-```
-   ┌───────────────────────── LIVE PATH (broadcast) ─────────────────────────┐
-   │  Leader proposes / commits / rolls back an entry → push to all followers │
-   │  Used when followers are keeping up.                                     │
-   │  NOT anchored — entries flow without a Log Matching precondition.        │
-   └─────────────────────────────────────────────────────────────────────────┘
-
-   ┌──────────────────────────── BACKFILL PATH ─────────────────────────────┐
-   │  Leader detects a follower lagging > threshold → ships the missing      │
-   │  range in bounded chunks.                                               │
-   │  ANCHORED — each chunk carries (PrevLogIndex, PrevLogTerm); the          │
-   │  follower enforces Log Matching and rejects a mismatch.                  │
-   └─────────────────────────────────────────────────────────────────────────┘
-```
 
 | | Live path | Backfill path |
 |---|---|---|
-| When | follower is keeping up | follower lags > `BackfillThreshold` |
-| Trigger | a new propose/commit/rollback | leader's lag detection |
+| When | The follower is up to date | The follower lags > `BackfillThreshold`, or another trigger in [Flow 1](#flow-1--detecting-a-lagging-follower) applies |
+| Trigger | A new propose/commit/rollback, broadcast to all followers | The leader's lag detection |
 | Anchored? | **No** (`PrevLogIndex = 0`) | **Yes** `(PrevLogIndex, PrevLogTerm)` |
-| Bounded? | one entry/op at a time | `MaxBackfillEntriesPerRound` per round |
-| Enforces Log Matching? | no | yes |
+| Bounded? | One entry/op at a time | `MaxBackfillEntriesPerRound` per round |
+| Enforces Log Matching? | No | Yes |
 
-The live path is unanchored for liveness; see [The unanchored live path](#the-unanchored-live-path).
+The live path is unanchored for liveness. For more information, see
+[The unanchored live path](#the-unanchored-live-path).
 
 ---
 
@@ -106,23 +64,23 @@ The live path is unanchored for liveness; see [The unanchored live path](#the-un
 | Term | Meaning |
 |---|---|
 | **Log index** | The position of an entry in the log (1, 2, 3, …). |
-| **Term** | The leadership epoch in which an entry was created. Index + term uniquely pins an entry. |
+| **Term** | The leadership epoch in which an entry was created. |
 | **Lag** | How many committed entries a follower is behind the leader. |
-| **Anchor** | The pair `(PrevLogIndex, PrevLogTerm)` attached to a backfill batch — the entry the follower must already hold. |
-| **Log Matching Property (LMP)** | A follower accepts entries only if it holds the entry at `PrevLogIndex` with `PrevLogTerm`. This is what guarantees contiguity and consistency. |
+| **Anchor** | The pair `(PrevLogIndex, PrevLogTerm)` on a backfill batch: the entry the follower must already have. |
+| **Log Matching Property (LMP)** | A follower takes entries only if it has the entry at `PrevLogIndex` with `PrevLogTerm`. |
 | **`matchIndex`** | Per-follower: the highest index the leader knows the follower has stored. |
-| **`nextIndex`** | Per-follower: the next index the leader will try to send. Backtracks on a mismatch. |
-| **Backtrack** | On a Log Matching rejection, the leader lowers `nextIndex` and retries from an earlier point. |
-| **Divergent tail** | Uncommitted entries on a follower that don't match the leader's — truncated and replaced during backfill. |
-| **Compaction floor** | The earliest index the leader still retains after compaction. Below it, only a snapshot can help. |
-| **`SnapshotRequired`** | Reserved enum value — never produced. The floor→snapshot handoff is internal to the leader; see `IRaft.GetSnapshotStatuses` for observing it. |
+| **`nextIndex`** | Per-follower: the next index the leader will try to send. |
+| **Backtrack** | After a `LogMismatch`, the leader lowers `nextIndex` and retries from an earlier index. |
+| **Divergent tail** | Uncommitted follower entries that do not match the leader's. They are truncated and replaced during backfill. |
+| **Compaction floor** | The earliest index the leader retains after compaction. Below it, only a snapshot can help. |
+| **`SnapshotRequired`** | Reserved enum value that is not produced. The handoff to a snapshot is internal to the leader. To observe it, use `IRaft.GetSnapshotStatuses`. |
 
 ---
 
 ## Flow 1 — Detecting a lagging follower
 
-The leader tracks, per follower, how far behind it is (via `matchIndex` vs. its own committed index).
-There are **three** independent triggers, and only the first is gated by `BackfillThreshold`:
+The leader compares each follower's `matchIndex` with its own committed index. There are **three**
+independent triggers, and `BackfillThreshold` gates only the first.
 
 ```
    LEADER, for each follower:
@@ -145,50 +103,37 @@ There are **three** independent triggers, and only the first is gated by `Backfi
    leave it to the live path
 ```
 
-The first trigger uses a threshold because a follower that is one or two entries
-behind is usually mid-broadcast and about to catch up on its own. Backfilling it would be
-wasted work and could race with the live path. The threshold draws the line between "transiently
-behind" and "genuinely lagging."
+A follower that is one or two entries behind is usually mid-broadcast, and the threshold leaves it to the
+live path. The other two triggers ignore the threshold, since the live path cannot heal those gaps. Once
+writes stop, empty heartbeats carry no entries and one missed tail entry would strand the follower. A
+follower that restarted and lost its lazy commit markers must be re-supplied from the frontier it reports.
 
-The other two triggers deliberately ignore the threshold, because in their situations the live path
-cannot heal the gap at all: once writes stop, empty heartbeats carry no entries, so even a single
-missed tail entry would strand the follower forever; and a follower that restarted and lost its lazy
-commit markers has to be re-supplied from where it says it is, however small the gap looks.
+The leader also ships a batch directly from an ack that shows the follower more than `BackfillThreshold`
+behind (the ack fast path). A multi-batch catch-up then does not wait a heartbeat per batch. The fast path
+skips a follower whose gap is already in flight to it as commit or rollback broadcasts, counted from the
+moment the commit marker is queued (`ReplicationTracker.AreResolutionsInFlight`). This prevents a third
+`AppendLogs` and a third WAL write per proposal under steady writes. A broadcast that is not answered within
+`HeartbeatInterval` stops counting. The gate does not apply to the heartbeat triggers.
 
-The leader also ships a batch straight from a follower's ack when that ack shows it more than
-`BackfillThreshold` behind (the ack fast path), so a multi-batch catch-up does not wait a heartbeat per
-batch. Under steady writes, the slower follower's ack usually looks one batch behind: the other follower
-made the quorum while this ack was on its way, and the commit broadcast is still being sent. The fast path
-therefore skips a follower whose whole gap is already in flight to it as commit or rollback broadcasts,
-counted from the moment the commit marker is queued (`ReplicationTracker.AreResolutionsInFlight`). A
-broadcast the follower has not answered within `HeartbeatInterval` stops counting, and the heartbeat
-triggers above are not gated at all. Before this gate, every proposal cost each follower a third
-`AppendLogs` and a third WAL write.
-
-**This is why `BackfillThreshold` is not a disable switch.** Raising it suppresses backfill only while
-writes are flowing — the moment the partition goes idle, the idle-tail trigger fires anyway. To turn
-backfill off for a node's partitions, set `BackfillEnabled = false`; it short-circuits all three
-triggers *and* the snapshot fallback. Do that only when something else owns those peers' catch-up
-story, because nothing else re-ships entries they missed.
+**`BackfillThreshold` is not a disable switch.** With a high threshold, the idle-tail trigger fires when the
+partition goes idle. To turn backfill off for a node's partitions, set `BackfillEnabled = false`. It
+disables all three triggers **and** the snapshot fallback. Do that only if another mechanism catches up
+those peers, since the library will not re-ship entries they missed.
 
 The startup safety audit logs `BackfillEnabled=false` at Warning. A host that turns backfill off on
-purpose, for example a standalone node whose other voters are in-process witnesses, adds
-`BackfillEnabled` to `RaftConfiguration.IntendedFenceDeviations` with a one-sentence reason. The audit
-then logs the line at Information with that reason. `Validate` refuses a key that the audit never
-reports and a blank reason.
+purpose, such as a standalone node whose other voters are in-process witnesses, should add
+`BackfillEnabled` to `RaftConfiguration.IntendedFenceDeviations` with a one-sentence reason. The audit then
+logs the line at Information with that reason. `Validate` refuses a key that the audit does not report and a
+blank reason.
 
-> Note (`GetFollowerLagAsync`, `GetFollowerProgress`): the public `IRaft` API exposes a follower's lag so
-> applications and operators can observe catch-up progress. `GetFollowerLagAsync` is the protocol commit
-> frontier (an executor round-trip); `GetFollowerProgress` is a lock-free read of the leader's
-> per-follower acknowledgement snapshot — the follower's *durable* frontier, its pending-write age and
-> whether that counts as a stall — cheap enough for an application to consult per operation before
-> waiting on a follower.
+`IRaft` exposes a follower's lag. `GetFollowerLagAsync` is the protocol commit frontier and needs an
+executor round-trip. `GetFollowerProgress` is a lock-free read of the leader's acknowledgement snapshot for
+the follower: its *durable* frontier, its pending-write age and whether that counts as a stall. It is cheap
+enough to call per operation.
 
 ---
 
 ## Flow 2 — Sending a bounded backfill round
-
-Once a follower is flagged, the leader assembles one round:
 
 ```
    pick the start index:  from = nextIndex[follower]  (where we believe it needs entries)
@@ -205,20 +150,15 @@ Once a follower is flagged, the leader assembles one round:
    send AppendLogs(entries, PrevLogIndex, PrevLogTerm)  → follower
 ```
 
-Two bounds keep this safe and cheap:
-
-- **`MaxBackfillEntriesPerRound`** caps how many entries ride in one round, so backfill never tries to
-  ship the whole log in a single message and never starves the live heartbeat traffic it rides
-  alongside.
-- **One round in flight per follower.** The leader sends a round, waits for the reply, then decides the
-  next round. It does not fire-and-forget overlapping rounds at the same follower.
+- **`MaxBackfillEntriesPerRound`** caps the entries in one round. Backfill therefore does not starve the
+  live heartbeat traffic.
+- **One round in flight per follower.** The leader waits for the reply before it decides the next round.
 
 ---
 
 ## Flow 3 — The follower's Log Matching check
 
-This is where contiguity is enforced. When a follower receives an **anchored** append, it checks the
-anchor before touching its log:
+A follower checks an **anchored** append before it changes its log.
 
 ```
    follower receives AppendLogs(entries, PrevLogIndex, PrevLogTerm)
@@ -240,24 +180,14 @@ anchor before touching its log:
                         ack with new matchIndex
 ```
 
-Two outcomes matter:
-
-- **Match → append.** The follower holds the anchor, so the incoming batch slots in contiguously. If the
-  follower had *uncommitted* entries past the anchor that disagree with the leader (a divergent tail),
-  those are **truncated and replaced** — the leader's log always wins.
-- **Mismatch → reject.** The follower does **not** hold the anchored entry at the expected term. It
-  refuses and replies `LogMismatch`. The leader lowers `nextIndex` and retries from earlier (backtrack),
-  converging on the last index they agree on.
-
-The check is gated on `PrevLogIndex > 0`. A live (unanchored) append carries `PrevLogIndex = 0`, so the
-follower skips the check — which is exactly the live-vs-backfill split from earlier.
+- **Match → append.** The batch slots in contiguously. A divergent uncommitted tail past the anchor is
+  **truncated and replaced**.
+- **Mismatch → reject.** The follower replies `LogMismatch` and the leader backtracks to the last index
+  they agree on.
 
 ---
 
 ## Flow 4 — Multi-round convergence
-
-A single round rarely catches a far-behind follower up. The leader drives a loop, reacting to each
-reply:
 
 ```
    ┌─────────────────────────────────────────────────────┐
@@ -274,21 +204,18 @@ reply:
    └─────────────────────────────────────────────────────┘
 ```
 
-On **Success**, the leader advances its `matchIndex`/`nextIndex` for that follower and, if the follower
-is still beyond the threshold, immediately sends the next round so catch-up doesn't wait a full
-heartbeat each time. On **LogMismatch**, it backtracks and retries lower. Either way the loop is
-bounded per round, so it shares the partition cleanly with normal traffic. It ends when the follower is
-within the threshold — at which point the live path takes over again.
+On **Success**, the leader advances `matchIndex`/`nextIndex`. If the follower is beyond the threshold, it
+sends the next round at once. On **LogMismatch**, it backtracks and retries lower. The loop ends when the
+follower is within the threshold and the live path takes over.
 
 ---
 
 ## Flow 5 — Snapshots below the compaction floor
 
-Kommander **compacts** old log entries to bound disk usage (everything below the last checkpoint is
-removable). That creates a **compaction floor**: the earliest index the leader still has.
-
-If a follower needs entries *below* that floor, the leader cannot read them — they've been
-trimmed. Backfill is out of options:
+The entries below the last checkpoint are removable. A follower that needs entries below the resulting
+**compaction floor** needs a snapshot, and the empty backfill read is the handoff signal. No status crosses
+the wire for it. A new node that joins a long-running cluster typically takes this path first, then
+switches to backfill.
 
 ```
    LEADER log after compaction:        [floor=50] 51 52 ... 100
@@ -303,100 +230,114 @@ trimmed. Backfill is out of options:
         → resume normal replication from the snapshot point
 ```
 
-The empty backfill read at the compaction floor is the handoff signal — it is internal to the leader's
-heartbeat path; no status crosses the wire for it. Snapshot install is a separate mechanism (its own
-RPC and follower-side state replacement); backfill's job is only to *detect* the floor and hand off
-cleanly. Brand-new nodes joining a long-running cluster typically hit this path first, then switch to
-backfill once they're above the floor.
+### Retry and install wait
 
-Operational notes on the handoff:
+- A follower whose snapshot **fails** (the export throws, a chunk is rejected) is retried with exponential
+  backoff from the heartbeat interval, capped at 30 s. A **saturated** follower, which pauses entry batches
+  to drain its WAL queue, is not escalated to a snapshot.
+- The **install has no timeout**. The receiver acknowledges the last chunk once the snapshot is staged and
+  verified (`InstallPending`). The leader then asks for the outcome in short calls until the follower
+  returns `Installed`, `SkippedAlreadyCovered` or a failure. `IRaft.GetSnapshotStatuses` shows such a
+  transfer as `InFlight` with `AwaitingInstall` set.
+- A retry **resumes**. Before it exports, each attempt asks the follower if an install of the partition is
+  already queued or running, from its own earlier attempt or a previous leader. If so, it waits for that
+  install. A follower has one install per partition at a time and stages no other snapshot for that
+  partition meanwhile.
+- When **no snapshot transfer is registered**, a follower that needs a snapshot cannot catch up. The
+  condition is recorded once per episode. `IRaft.GetSnapshotStatuses(partitionId)` returns it with the
+  in-flight transfers, attempt counts and last errors.
 
-- A follower whose snapshot **fails** (the export throws, a chunk is rejected) is retried with
-  exponential backoff — heartbeat-interval base, capped at 30 s — instead of once per heartbeat, and a
-  follower that is **saturated** (pausing entry batches to drain its WAL queue) is never
-  escalated to a snapshot at all.
-- The follower's **install has no timeout**. The receiver acknowledges the last chunk as soon as
-  the snapshot is staged and verified (`InstallPending`), and the leader then asks for the install's
-  outcome in short calls of their own until the follower reports `Installed`, `SkippedAlreadyCovered`
-  or a failure. The wait is bounded by progress: the follower reports how far its importer has read
-  into the staged snapshot, and only `SnapshotTransferStepTimeout` without a change ends the attempt.
-  `IRaft.GetSnapshotStatuses` shows such a transfer as `InFlight` with `AwaitingInstall` set.
-- A retry **resumes**. Before it exports anything, every attempt asks the follower whether an install
-  of the partition is already queued or running — its own earlier attempt's, or a previous leader's —
-  and if so waits for that install instead of sending another snapshot. A follower runs one install
-  per partition and stages nothing else for that partition meanwhile.
-- The floor is held on **every replica**, the leader included. The leader sends its live-replica
-  retention floor (the slowest replica's durable position, or its own when its disk is the one behind)
-  with every AppendLogs, and each follower holds its own compaction there within
-  `CompactionLiveReplicaLagBudget`. A leader change therefore does not strand a replica that was being
-  caught up from the log: the successor's log still reaches back to it. A freshly elected leader holds
-  the budget's full depth for a peer until that peer's first ack reports its position.
-- A follower that needs a snapshot when **no snapshot transfer is registered** cannot catch up; the
-  condition is recorded once per episode and reported — together with in-flight transfers, attempt
-  counts and last errors — through `IRaft.GetSnapshotStatuses(partitionId)`.
-- A read that comes back **starting above the anchor** — no committed entry exists at the follower's
-  next index, because the run there is uncommitted or was compacted away — is refused: an anchored batch that skips the gap would advance nothing and repeat forever. The refusal
-  is logged **once per episode** (repeats drop to Debug, and there is a line when it clears) and the
-  live condition is reported through `IRaft.GetBackfillStatuses(partitionId)`, which carries the
-  anchor, the first index the leader could read, and the last checkpoint — the checkpoint is
-  what tells the two causes apart: at or above the first readable index means the anchor was
-  compacted away and only a snapshot can seed that follower.
-- A follower whose reported frontiers **do not advance** although batches anchored at its
-  frontier are shipped and acknowledged cannot be converged by log shipping at all. The no-progress
-  probe paces and re-anchors such batches; once the fruitless streak reaches the warning threshold
-  (four ships) the leader also offers the follower a snapshot from its last checkpoint, through the
-  same escalation path as a refused batch. This is what lets a **new** leader resume a seed the old
-  leader left unfinished: its own WAL may still serve the stuck follower's anchor (the follower's
-  position pins the retention floor), so no refusal ever occurs, and without this trigger the
-  follower stayed at frontier 0 for the rest of the run. Without a checkpoint nothing is shipped.
-- **Slow is not stuck.** The probe counts a ship fruitless only when *none* of the follower's
-  reported frontiers moved: its commit frontier, its durable frontier, and — for a ship whose batch
-  reached the follower's contiguous presence frontier and so could have extended it — that presence
-  frontier. A follower closing a log hole while the live stream keeps landing above the hole reports
-  a commit frontier pinned under the hole for as long as the hole is open, while every batch anchored
-  at the hole advances its presence frontier; judged on the commit frontier alone, four such ships
-  read as fruitless inside ten seconds and the follower was re-seeded three times for one 30-second
-  pause (CamusDB fault soak rl6). The presence frontier is credited only through a ship that reached
-  it because in the marker-loss wedge the live stream lands contiguously above the pinned frontier
-  and the presence frontier climbs with the leader's head while nothing below it is repaired.
-- **A freshly seeded follower gets a grace.** An install hands the follower the lag the leader
-  accrued while the snapshot was exported, sent and imported; the follower closes it from the log,
-  and its frontiers can stand still for several ships while it does. After a confirmed install the
-  probe defers only its escalation (pacing and the Warning continue) for `BackfillNoProgressPauseCap`
-  plus the time the follower needs to close that lag at the commit rate the leader has sustained
-  since, bounded by `BackfillSeededCatchUpGraceCap` (3 minutes). A refused backfill still escalates
-  at once: the grace applies only to the probe, whose verdict is an inference.
-- **A follower that already reaches the checkpoint is not seeded.** Every escalation — a refused
-  read, the no-progress probe, a compacted anchor — passes one gate before the export starts: when the
-  follower's gap-aware commit frontier reaches the leader's last checkpoint, the snapshot would carry
-  nothing it lacks, and no transfer starts. The hold is counted
-  (`raft.snapshot.transfers_withheld_peer_reaches_checkpoint_total`) and the probe logs it once per
-  episode. The follower's *durable* frontier does not count against it: that frontier trails its
-  commit frontier by whatever its disk has not flushed, a snapshot cannot move it, and the install
-  would need the same disk. Requiring it seeded a follower resuming from a 30-second pause whose
-  commit and presence frontiers stood 73,000 entries past the checkpoint with its durable frontier
-  25 entries under it; the follower skipped the install as already covered (CamusDB fault soak inst5,
-  2026-11-06). The *presence* frontier does not stand in for the commit frontier either: a follower
-  that holds a range without its commit markers still needs the snapshot.
-- **The transfer-start line says why.** Every snapshot transfer starts with a Warning that names
-  its trigger (`SnapshotTransferTrigger`: a non-contiguous or empty backfill read, the no-progress
-  probe, a compacted anchor, the follower's own re-seed request) and the numbers behind it — the
-  anchor and first readable entry, the fruitless streak, the follower's commit, durable and presence
-  frontiers, the leader's checkpoint and retention floor. The trigger is also on
-  `RaftSnapshotStatus.Trigger` and tags `raft.snapshot.transfers_started_total`. The line used to
-  assert "below the WAL compaction floor" for every path.
+### Retention on all replicas
+
+The leader sends its live-replica retention floor with each AppendLogs. The floor is the slowest replica's
+durable position, or the leader's own when its disk is behind. Each follower limits its own compaction to
+that floor within `CompactionLiveReplicaLagBudget`. After a leader change, the successor's log therefore
+reaches back to a replica that was catching up. A new leader retains the budget's full depth for a peer
+until the first ack from that peer gives its position.
+
+### When a snapshot is offered
+
+- **A read that starts above the anchor** is refused. The run at the follower's next index is uncommitted
+  or was compacted away, and an anchored batch that skips the gap would repeat forever. The refusal is
+  logged **once per episode** (repeats drop to Debug, and a line is logged when it clears).
+  `IRaft.GetBackfillStatuses(partitionId)` shows the anchor, the first index the leader could read and the
+  last checkpoint. A checkpoint at or above the first readable index means that the anchor was compacted
+  away and only a snapshot can seed that follower.
+- **No progress.** When batches anchored at a follower's frontier are acknowledged but its reported
+  frontiers **do not advance**, the no-progress probe paces and re-anchors the batches. After four
+  fruitless ships (the warning threshold) the leader also offers a snapshot from its last checkpoint. This
+  lets a **new** leader resume a seed that the old leader left unfinished, when its own WAL can serve the
+  anchor and no refusal occurs. No snapshot is shipped if there is no checkpoint.
+- **Slow is not stuck.** A ship is fruitless only when *none* of the follower's reported frontiers moved.
+  These are its commit frontier, its durable frontier and its contiguous presence frontier. The presence
+  frontier is credited only for a ship whose batch reached it and so could have extended it. A follower
+  that closes a log hole therefore counts as progress although its commit frontier is pinned under the
+  hole. In the marker-loss wedge the presence frontier climbs with the live stream while no entry below it
+  is repaired, and it gets no credit.
+- **A freshly seeded follower gets a grace.** After a confirmed install the probe defers its escalation
+  (pacing and the Warning continue). The grace is `BackfillNoProgressPauseCap` plus the time to close the
+  install's lag at the leader's sustained commit rate, bounded by `BackfillSeededCatchUpGraceCap`
+  (3 minutes). A refused backfill escalates at once.
+- **A follower that reaches the checkpoint is not seeded.** All escalations pass one gate before the export.
+  When the follower's gap-aware commit frontier reaches the leader's last checkpoint, no transfer starts.
+  The hold is counted (`raft.snapshot.transfers_withheld_peer_reaches_checkpoint_total`) and the probe logs
+  it once per episode. The *durable* frontier is not considered, since a snapshot cannot move it. The
+  *presence* frontier does not stand in for the commit frontier: a follower that has a range but not its
+  commit markers needs the snapshot.
+
+Each snapshot transfer starts with a Warning that names its trigger (`SnapshotTransferTrigger`: a
+non-contiguous or empty backfill read, the no-progress probe, a compacted anchor, the follower's own
+re-seed request). The line also has the anchor and first readable entry, the fruitless streak, the
+follower's three frontiers, and the leader's checkpoint and retention floor. The trigger is also on
+`RaftSnapshotStatus.Trigger` and tags `raft.snapshot.transfers_started_total`.
+
+### While a follower is being seeded
+
+A snapshot transfer occupies the follower's partition executor for the length of the install, and
+entry-carrying appends cannot be applied there before the installed state. These rules prevent a loop of
+installs.
+
+- **The follower sheds entry-carrying appends.** `RaftPartition.AppendLogs` answers them at the receive
+  path with `FollowerInstallingSnapshot` and gives no position. Heartbeats are queued. The leader treats
+  the status as a saturated WAL: entry-carrying sends to the peer pause for `FollowerSaturationBackoff`,
+  renewed by each refusal. The install's confirmation advances the peer's cursors to the installed
+  boundary. `raft.follower.appends_refused_while_installing_total` counts the refusals, and one Information
+  line per install sums them.
+- **The leader sends the peer no entries while its transfer is in flight.** `BackfillSender.AppendLogToNode`
+  and the batch path consult `SnapshotSender.TryGetSeedingIndex` and skip the send
+  (`raft.backfill.seeding_peer_sends_skipped_total`). The entries ship contiguously from the installed
+  boundary afterwards.
+- **Retention starts at the install's boundary and is exempt from the budget while the install is
+  unresolved.** The floor publisher retains from the boundary + 1 while a transfer is in flight *or* an
+  install is remembered as active (`SnapshotSender.TryGetRetentionHoldIndex`, the lower of the two). It
+  raises the published budget to cover a just-seeded peer's need (`commit − need + 1`, under
+  `CompactionLiveReplicaLagCap`). The hold outlives the transfer attempt and ends when the peer gives a
+  position at or past the boundary. Otherwise the floor could pass the boundary and the peer would be
+  installed again. The raised budget travels on each AppendLogs. A node that wins an election inherits the
+  last budget it received (`HeartbeatDriver.InheritRetentionBudget`) until its own commit history fills the
+  window. `raft.compaction.seeded_peer_retention_holds_total` counts the rounds that raised the budget.
+- **The follower names its install in each ack, for a successor leader.**
+  `CompleteAppendLogsRequest.SeedIndex` carries the boundary of the install that occupies the follower's
+  executor (on `FollowerInstallingSnapshot` refusals), or of the install it landed within the last
+  `BackfillSeededCatchUpGraceCap` (on positional acks). A leader that did not send the install treats an
+  active one as unresolved: retention starts from it, and its first transfer waits for it. A landed install
+  becomes the peer's snapshot seed, with the same budget exemption. A boundary arms the seed once. Peers
+  that predate the field send 0 and get the previous behaviour.
+- **A stalled read figure does not end the wait.** The progress figure is the bytes read from the staged
+  snapshot, and it stops while the import's later phases (drain, purge, store decode) run. The sender logs
+  a Warning once per `SnapshotTransferStepTimeout` of no progress
+  (`raft.snapshot.install_waits_past_step_timeout_total`) and continues to wait. The wait ends when the
+  follower reports the install done, failed or lost, goes silent for `SnapshotChunkAckTimeout`, or this node
+  stops leading.
 
 ---
 
 ## Flow 6 — Requested re-seed and withheld candidacy
 
-Every trigger above starts from the **log**: a follower is missing entries, and backfill or a snapshot
-brings its log level with the leader's. There is a second failure shape the log cannot see — a
-replica whose WAL is complete but whose **application state** is not (an earlier install marked
-entries applied without delivering them; an import rewound the application below its cursor; the
-consumer alone rejected an entry). The apply cursor and the checkpoint boundary both say "covered",
-so the ordinary install path *skips* such a replica, and it stays electable. Two application-driven
-seams handle it (Kommander 1.8.1):
+A replica can have a complete WAL but incomplete **application state**. Examples are an earlier install that
+marked entries applied and did not deliver them, or a consumer that rejected an entry. The apply cursor and
+the checkpoint boundary both say "covered", so the ordinary install path *skips* such a replica and it
+can be elected. Two application-driven calls handle it (Kommander 1.8.1).
 
 ```
    APPLICATION on replica F finds F's projection incomplete
@@ -416,133 +357,63 @@ seams handle it (Kommander 1.8.1):
    APPLICATION sees ImportPartitionState land → SetCandidacyWithheld(p, false)
 ```
 
-- **`RequestReseedAsync`** answers `NodeIsNotLeader` on a leader (it must relinquish first) and
-  `Errored` when no leader is known. A repeat while pending re-sends the request. The hold is bounded
-  by `RaftConfiguration.ReseedRequestTimeout` (default 3 min): with no install by then the follower
-  resumes delivering where it stopped and logs `Re-seed request expired`; the leader drops a request
-  whose checkpoint never commits inside the same bound. A replica that becomes leader while pending
-  resumes at once.
-- **The leader's side** takes a checkpoint *newer than the request* so the snapshot's index is above
-  anything the follower applied before holding; the forced transfer bypasses the convergence
-  breaker, the failure backoff and the post-success pause (those pace the leader's own rescues), but
-  not the in-flight guard or the durable-write-stall deferral.
-- **`SetCandidacyWithheld`** is a per-node in-memory flag consulted on every campaign entry
-  (unbounded, like the stall deferral) and by the transfer receive path; the replica keeps voting,
-  replicating and acknowledging.
+- **`RequestReseedAsync`** answers `NodeIsNotLeader` on a leader, which must relinquish first, and
+  `Errored` when no leader is known. A repeat while pending re-sends the request. The hold is bounded by
+  `RaftConfiguration.ReseedRequestTimeout` (default 3 min). If no install lands by then, the follower
+  resumes delivery where it stopped and logs `Re-seed request expired`. The leader drops a request whose
+  checkpoint does not commit in the same bound. A replica that becomes leader while pending resumes at once.
+- **The leader's side** takes a checkpoint *newer than the request*. The snapshot's index is then above the
+  entries the follower applied before the hold. The forced transfer bypasses the convergence breaker, the
+  failure backoff and the post-success pause. It does not bypass the in-flight guard or the
+  durable-write-stall deferral.
+- **`SetCandidacyWithheld`** is a per-node in-memory flag. Each campaign entry and the transfer receive path
+  consult it, and it has no time limit. The replica continues to vote, replicate and acknowledge.
 
-Both lines of the cycle are logged at Warning on the node that runs them (`Re-seed requested …`,
+The nodes log the cycle at Warning (`Re-seed requested …`,
 `Re-seed of … checkpoint … committed, starting the forced snapshot transfer`, `InstallSnapshot … answers
 a re-seed request`, `Re-seed complete`, `Deferring candidacy: the application withheld …`).
 
 ---
 
-### While a follower is being seeded
-
-A snapshot transfer to a follower holds that follower's partition executor for the whole install, and
-nothing entry-carrying can be applied there before the installed state. Three rules keep an install
-from feeding on itself:
-
-- **The follower sheds entry-carrying appends while it installs.** `RaftPartition.AppendLogs` answers
-  them at the receive path with `FollowerInstallingSnapshot` (no position reported) instead of queueing
-  them behind the install in the executor's unbounded replication queue; heartbeats still queue. The
-  leader treats the status as a saturated WAL: entry-carrying sends to the peer pause for
-  `FollowerSaturationBackoff`, renewed by every refusal, and the install's confirmation advances the
-  peer's cursors to the installed boundary. `raft.follower.appends_refused_while_installing_total`
-  counts the refusals; one Information line per install sums them.
-- **The leader sends the peer nothing entry-carrying while its transfer is in flight.** The single
-  send choke point (`BackfillSender.AppendLogToNode`) and the batch path consult
-  `SnapshotSender.TryGetSeedingIndex`; a live proposal or a backfill batch to a peer being exported
-  to, streamed to, or awaited on is skipped (`raft.backfill.seeding_peer_sends_skipped_total`), and
-  the entries ship contiguously from the installed boundary afterwards.
-- **Retention holds from the install's boundary, exempt from the budget, for as long as the install
-  is unresolved.** The heartbeat round's floor publisher holds a peer's need at the boundary + 1 —
-  whatever position it last reported — while a transfer to it is in flight *or* an install is
-  remembered as running there (`SnapshotSender.TryGetRetentionHoldIndex`: the lower of the two), and
-  keeps a just-seeded peer's need (while its install is on record) exempt from the rate-scaled budget
-  clamp by raising the published budget to cover it (`commit − need + 1`, still under
-  `CompactionLiveReplicaLagCap`). The hold outlives the transfer attempt: it used to end with the
-  attempt, and between an attempt that gave up waiting and the next one the floor rose to the commit
-  index — the follower landed its install 2.4 M entries below the first retained entry and was
-  installed again (CamusDB fault soak, 2026-11-05). It ends when the peer reports a position at or
-  past the boundary. The raised budget travels to the followers on every AppendLogs, so they hold
-  too, and a node that wins an election inherits the last budget it received
-  (`HeartbeatDriver.InheritRetentionBudget`) until its own commit history fills the window. Without
-  these, a 130 s install at 8,600 entries/s outlasted a 1,000,000-entry budget, the first backfill
-  after it was non-contiguous, and the leader re-installed in a loop (CamusDB fault soak, 2026-11-04).
-  `raft.compaction.seeded_peer_retention_holds_total` counts the rounds that raised the budget.
-- **The follower names its install in every ack, so a successor leader holds too.**
-  `CompleteAppendLogsRequest.SeedIndex` carries the boundary of the install holding the follower's
-  executor (on its `FollowerInstallingSnapshot` refusals) or of the install it landed within the last
-  `BackfillSeededCatchUpGraceCap` (on positional acks). A leader that did not send the install — the
-  successor of the one that did — remembers a running install as unresolved (retention holds from it,
-  and its first transfer waits for it instead of exporting) and records a landed one as the peer's
-  snapshot seed, so the lag the install handed the peer stays exempt from the budget clamp while it
-  closes it. A reported boundary arms the seed once; peers predating the field send 0 and get the
-  previous behaviour.
-- **A stalled read figure does not end the wait.** The sender polls the follower for the install's
-  progress — bytes read from the staged snapshot — and that figure stops at the end of the stream
-  while the import's later phases (drain, purge, store decode) run. Treating that as a hung step ended
-  the attempt, released the in-flight guard, and the retry re-anchored the transfer at a newer index
-  only to wait for the same install. The sender now logs a Warning once per
-  `SnapshotTransferStepTimeout` of no progress (`raft.snapshot.install_waits_past_step_timeout_total`)
-  and keeps waiting; the wait still ends when the follower reports the install done, failed or lost,
-  goes silent for `SnapshotChunkAckTimeout`, or this node stops leading.
-
 ## The unanchored live path
 
-Kommander does not anchor live broadcasts, because anchoring the live path causes a
-**liveness failure**:
+An anchor on the live path causes a **liveness failure**. A live proposal would be anchored at the latest
+index. A follower that is *transiently* behind does not have that anchor yet and rejects the proposal with
+`LogMismatch`. The live proposal path has **no recovery loop**. The proposal misses quorum and times out
+(`ProposalTimeout`), and under load this becomes a livelock.
 
-- A live proposal is anchored at the latest index.
-- A follower that is *transiently* behind (mid-broadcast, slightly slow) won't yet hold that anchor.
-- It rejects the live proposal with `LogMismatch` — but the **live proposal path has no recovery loop**
-  (recovery lives in the backfill loop). The proposal can't make quorum, so it times out
-  (`ProposalTimeout`), and under load this turns into a livelock.
+- **Live path**: unanchored (`PrevLogIndex = 0`). Lag detection hands a follower that falls behind to
+  backfill.
+- **Backfill path**: anchored, with full Log Matching enforcement. This is the *only* place where gaps and
+  divergent tails are prevented. It is sufficient, since the entries a follower is missing arrive through
+  backfill.
 
-This was observed directly: anchoring the live path made stress tests fail with `ProposalTimeout`;
-reverting to an unanchored live path fixed them. So:
-
-- **Live path**: unanchored (`PrevLogIndex = 0`). Followers that are keeping up apply broadcasts
-  directly; followers that fall behind are caught by lag detection and handed to backfill.
-- **Backfill path**: anchored, with full Log Matching enforcement. This is the *only* place gaps and
-  divergent tails are prevented — and it's sufficient, because every entry a follower is missing
-  ultimately arrives through backfill, where it *is* checked.
-
-A practical consequence for contributors: the **`LogMismatch → backtrack` branch is not reachable from
-the live path** in production — only the backfill path can trigger it. Only unit tests exercise it
-directly, and is retained as defensive scaffolding. If you ever make
-the live path anchored "to be safe," re-read this section first.
+In production, the **`LogMismatch → backtrack` branch is reachable only from the backfill path**. Unit tests
+exercise it directly.
 
 ---
 
 ## Configuration
 
-In `RaftConfiguration.cs`:
+These settings are in `RaftConfiguration.cs`.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BackfillEnabled` | `true` | Master switch. `false` means this node never backfills and never falls back to a snapshot transfer for a lagging follower — peers converge only through the live path, and a follower that misses entries stays behind. |
-| `BackfillThreshold` | `10` | A follower must lag by more than this many entries before the *actively-behind* trigger engages. Below it, the live path handles catch-up. Does not gate the idle-tail or crash-restart triggers — see Flow 1. |
-| `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round. Caps message size and keeps backfill sharing the partition fairly. |
+| `BackfillEnabled` | `true` | Master switch. `false` means this node does not backfill and does not fall back to a snapshot transfer for a lagging follower. Peers converge only through the live path, and a follower that misses entries remains behind. |
+| `BackfillThreshold` | `10` | A follower must lag by more than this many entries before the *actively-behind* trigger engages. Does not gate the idle-tail or crash-restart triggers (Flow 1). |
+| `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round. |
 | `BackfillNoProgressPauseCap` | `30 s` | Cap on the exponential pause between batches to a follower none of whose reported frontiers is advancing. |
 | `BackfillSeededCatchUpGraceCap` | `3 min` | Upper bound on the grace a follower gets after a snapshot install before the no-progress probe may offer it another one (Flow 5). Zero disables the grace. |
 
-Tuning notes:
-
-- **Lower `BackfillThreshold`** → backfill engages sooner (faster recovery, slightly more eager work on
-  small lags). **Higher** → more lag tolerated before the dedicated path kicks in. Raising it to
-  `int.MaxValue` does **not** disable backfill; use `BackfillEnabled` for that.
-- **Lower `MaxBackfillEntriesPerRound`** → smaller, more frequent rounds (smoother, more rounds to
-  converge). **Higher** → fewer, larger rounds (faster bulk catch-up, bigger messages).
-
-`FollowerSaturationBackoff` (default 1 s) also paces the leader after a `FollowerInstallingSnapshot`
-refusal; there is no separate setting, since the follower renews the refusal for as long as its install
-runs. The seeding retention hold needs no setting either: it is bounded by the transfer's own lifetime,
-the seeded-peer install record (`BackfillSeededCatchUpGraceCap`) and `CompactionLiveReplicaLagCap`.
-
-Compaction settings (`CompactEveryOperations`, `CompactNumberEntries`, `MaxEntriesPerCompaction`)
-indirectly affect backfill: aggressive compaction lowers the compaction floor faster, making the
-snapshot path (Flow 5) more likely for far-behind followers.
+- A lower `BackfillThreshold` gives faster recovery and more work on small lags. `int.MaxValue` does **not**
+  disable backfill. Use `BackfillEnabled` for that.
+- A lower `MaxBackfillEntriesPerRound` gives smaller messages and more rounds to converge.
+- `FollowerSaturationBackoff` (default 1 s) also paces the leader after a `FollowerInstallingSnapshot`
+  refusal.
+- The seeding retention hold has no setting. It is bounded by the transfer's lifetime, the seeded-peer
+  install record (`BackfillSeededCatchUpGraceCap`) and `CompactionLiveReplicaLagCap`.
+- Aggressive compaction (`CompactEveryOperations`, `CompactNumberEntries`, `MaxEntriesPerCompaction`) raises
+  the compaction floor faster. Far-behind followers are then more likely to need a snapshot.
 
 ---
 
@@ -550,12 +421,15 @@ snapshot path (Flow 5) more likely for far-behind followers.
 
 ```
 Kommander/
-├─ RaftPartitionStateMachine.cs   the backfill engine:
-│     ├─ lag detection + the per-follower nextIndex/matchIndex loop
-│     ├─ TrySendBackfillBatchAsync       assemble & send one anchored round (Flow 2)
-│     ├─ CompleteAppendLogsAsync         handle the reply: Success advances,
+├─ Consensus/
+│     ├─ ReplicationTracker.cs           the per-follower nextIndex/matchIndex state
+│     ├─ BackfillSender.cs
+│     │     └─ TrySendBackfillBatchAsync assemble & send one anchored round (Flow 2)
+│     ├─ ReplicationAckProcessor.cs
+│     │     └─ CompleteAppendLogsAsync   handle the reply: Success advances,
 │     │                                   LogMismatch backtracks (Flow 4)
-│     └─ AppendLogsCoreAsync             follower-side Log Matching check (Flow 3)
+│     └─ FollowerAppendHandler.cs
+│           └─ AppendLogsCoreAsync       follower-side Log Matching check (Flow 3)
 ├─ RaftWriteAhead.cs
 │     └─ GetAnyTermAtAsync               read the term at an index (for the anchor)
 ├─ Data/
@@ -574,50 +448,45 @@ Kommander.Tests/
 └─ WAL/WalConformanceTests.cs          TruncateLogsAfter_* across all WAL backends
 ```
 
-`IRaft.GetFollowerLagAsync(partitionId, followerEndpoint)` is the observability entry point for
-how far a follower is behind by its protocol commit frontier. `IRaft.GetFollowerProgress(partitionId,
-followerEndpoint)` returns the leader's `RaftFollowerProgress` snapshot for the peer (durable frontier,
-protocol frontier, pending-write age, stall flag, the leader's commit index when the ack was folded),
-published from the ack path (`ReplicationAckProcessor` → `IRaftPartitionHost.PublishFollowerProgress`)
-into a concurrent map on `RaftPartition` and cleared with the tracker on step-down; `null` on a
-non-leader or for a peer the leadership has not heard from.
+`IRaft.GetFollowerLagAsync(partitionId, followerEndpoint)` returns the lag by the protocol commit frontier.
+`IRaft.GetFollowerProgress(partitionId, followerEndpoint)` returns the leader's `RaftFollowerProgress`
+snapshot (durable frontier, protocol frontier, pending-write age, stall flag, the leader's commit index when
+the ack was folded). The ack path publishes it (`ReplicationAckProcessor` →
+`IRaftPartitionHost.PublishFollowerProgress`) into a concurrent map on `RaftPartition`. It is cleared with
+the tracker on step-down, and is `null` on a non-leader or for a peer the leadership has not heard from.
 
 ---
 
 ## Invariants you must not break
 
-1. **No gaps.** A follower's log must stay contiguous. Never append an entry past a hole. The backfill
-   anchor exists precisely to prevent this.
+1. **No gaps.** A follower's log must be contiguous. Do not append an entry past a hole.
 2. **No divergent committed tail.** Uncommitted entries that disagree with the leader are truncated and
-   replaced during an anchored append; committed entries are never overwritten.
-3. **Log Matching lives on the backfill path.** Don't move the anchor onto the live broadcast path — it
-   reintroduces the `ProposalTimeout` livelock (see [its section](#the-unanchored-live-path)).
-4. **Backfill is bounded.** Honour `MaxBackfillEntriesPerRound` and one-round-in-flight; backfill must
-   never starve live replication.
-5. **Below the floor, hand off — don't fake it.** If entries are below the compaction floor, hand off
-   to the snapshot path. Never try to synthesize missing entries.
+   replaced during an anchored append. Committed entries are never overwritten.
+3. **Log Matching lives on the backfill path.** Do not anchor the live broadcast path. It brings back the
+   `ProposalTimeout` livelock (see [The unanchored live path](#the-unanchored-live-path)).
+4. **Backfill is bounded.** Honour `MaxBackfillEntriesPerRound` and one round in flight. Backfill must not
+   starve live replication.
+5. **Below the floor, hand off to the snapshot path.** Do not synthesize missing entries.
 
 ---
 
 ## Testing
 
-The backfill behavior is covered at two layers:
-
-- **Unit (direct injection)** — `TestLogMatchingCheck` exercises the follower's Log Matching check and
-  the leader's backtrack logic directly, including the mismatch branch that the live path can't reach.
-- **Cluster integration** — in `TestThreeNodeCluster`:
-  - `BackfilledFollower_HasContiguousLog_MatchingLeader` — a lagging follower ends with a contiguous,
+- **Unit (direct injection)** — `TestLogMatchingCheck` exercises the follower's Log Matching check and the
+  leader's backtrack logic, with the mismatch branch that the live path cannot reach.
+- **Cluster integration** — `TestThreeNodeCluster`.
+  - `BackfilledFollower_HasContiguousLog_MatchingLeader`: a lagging follower ends with a contiguous,
     term/type-identical log (checked entry by entry via `AssertContiguousLog`).
-  - `DivergentSuffix_Backfill_OverwritesStaleUncommittedEntries` — a divergent uncommitted tail is
-    truncated and replaced.
-  - `PausedStaleFollower_MultiRoundBackfill_ConvergesAcrossChunks` — a far-behind follower converges
-    across several bounded rounds.
-- **WAL conformance** — `TruncateLogsAfter_*` verifies divergent-tail truncation across InMemory,
-  SQLite, and RocksDB.
+  - `DivergentSuffix_Backfill_OverwritesStaleUncommittedEntries`: a divergent uncommitted tail is truncated
+    and replaced.
+  - `PausedStaleFollower_MultiRoundBackfill_ConvergesAcrossChunks`: a far-behind follower converges across
+    several bounded rounds.
+- **WAL conformance** — `TruncateLogsAfter_*` verifies divergent-tail truncation across InMemory, SQLite
+  and RocksDB.
 
-Reminder: **never run multiple `dotnet test` commands at once.** The suite spins up
-in-process Raft clusters; concurrent runs produce false failures. Use a targeted `--filter` while
-iterating, then the full project for shared scheduling/WAL/cluster changes.
+Do not run more than one `dotnet test` command at a time. The suite starts in-process Raft clusters, and
+concurrent runs give false failures. Use a targeted `--filter` while you iterate, then run the full project
+for shared scheduling/WAL/cluster changes.
 
 ```sh
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~Backfill
@@ -625,20 +494,5 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~B
 
 ---
 
-## Glossary
-
-- **Anchor** — the `(PrevLogIndex, PrevLogTerm)` a backfill batch asserts the follower already holds.
-- **Backfill** — leader-driven, bounded catch-up of a lagging follower.
-- **Backtrack** — lowering `nextIndex` after a `LogMismatch` to retry from an earlier index.
-- **Compaction floor** — the earliest log index still retained after compaction.
-- **Divergent tail** — uncommitted follower entries that disagree with the leader; truncated on append.
-- **Lag** — how many committed entries a follower is behind the leader.
-- **Live path** — the normal, unanchored broadcast of new entries to keeping-up followers.
-- **Log Matching Property (LMP)** — accept entries only if the entry at `PrevLogIndex` has `PrevLogTerm`.
-- **`matchIndex` / `nextIndex`** — per-follower progress markers the leader maintains.
-- **`SnapshotRequired`** — reserved enum value, never produced; the floor→snapshot handoff is internal.
-
----
-
-*For the broader system, see the [Architecture Overview](architecture-overview.md); for how a brand-new
-node joins and catches up, see the [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md).*
+*For the broader system, see the [Architecture Overview](architecture-overview.md). For how a new node joins
+and catches up, see the [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md).*

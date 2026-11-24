@@ -1,11 +1,7 @@
 # Leader Balancer — Developer Guide
 
-This guide is for developers who **use, understand, or maintain** Kommander's leader balancer. It
-assumes you know roughly what Kommander is (a Raft-based distributed system) but **no prior knowledge
-of leader balancing**.
-
-If you are brand new to Kommander, skim the [Architecture Overview](architecture-overview.md) first —
-it explains partitions, leaders, and the system partition, which this guide builds on.
+This guide is for developers who **use or maintain** Kommander's leader balancer. For
+the basic concepts, see the [Architecture Overview](architecture-overview.md).
 
 ---
 
@@ -29,18 +25,10 @@ it explains partitions, leaders, and the system partition, which this guide buil
 
 ## Summary
 
-Kommander splits your data into many **partitions**. Each partition runs its own little Raft group,
-and each group elects one **leader** that does all the real work for that partition (handling writes,
-sending heartbeats, driving replication). Followers mostly keep up.
-
-Leaders are elected independently and somewhat randomly. Nothing coordinates *where* they land. So
-over time you can end up with a lopsided cluster: one node holding most of the leaders while its peers
-sit nearly idle. That node becomes a bottleneck even though you have spare machines.
-
-The **leader balancer** fixes this. It watches how leaders are spread across the cluster, notices when
-one node is carrying too much, and politely asks busy nodes to hand some leaderships to idle ones —
-using Kommander's existing, safe leadership-handoff machinery. It is **off by default**, fully
-advisory, and can never corrupt data; the worst it can do is make a pointless move.
+Each partition elects its leader independently. One node can end up with most of the leaders and become a
+bottleneck while its peers are idle. The **leader balancer** detects this and asks busy nodes to hand some
+leaderships to idle ones through the normal leadership handoff. It is **off by default** and advisory. It
+moves leadership only, and the worst result is a pointless move.
 
 ```
 Before:                          After balancing:
@@ -55,170 +43,132 @@ Before:                          After balancing:
 
 ## Leader imbalance
 
-Two distinct kinds of imbalance show up in practice:
+1. **Count skew.** One node has a disproportionate *number* of leaderships. With 64 partitions and 3 nodes,
+   an even spread is about 21 each, but elections can produce 40 / 12 / 12.
+2. **Load skew.** The *counts* are equal, but the **hot** partitions (high write rate, deep queues) are on
+   one node.
 
-1. **Count skew.** Pure bad luck in election timing puts a disproportionate *number* of leaderships on
-   one node. With 64 partitions and 3 nodes you'd like ~21 each, but you might get 40 / 12 / 12. The
-   busy node does the heartbeat, replication, and commit work for all 40.
-
-2. **Load skew.** Even when the *counts* are equal, the **hot** partitions (high write rate, deep
-   queues) can cluster on one node while another holds only cold, idle partitions. Counting leaders
-   alone won't catch this — you have to look at how much work each partition does.
-
-The balancer handles both: it equalizes counts first, then spreads load.
+The balancer equalizes counts first and then spreads load.
 
 ---
 
 ## Core concepts
 
 ### Partition leader
-The single node currently responsible for a partition. Only the leader can hand off its own
-leadership.
+The node that is currently responsible for a partition. Only the leader can hand off its leadership.
 
 ### The system partition (P0)
-A special partition (id `0`) that every node participates in. Its leader is the cluster's natural
-coordination point: it already drives cluster-wide decisions, so there is exactly **one** of it and no
-risk of two nodes making conflicting decisions. **The leader balancer runs only on the P0 leader.** This guide
-calls it "the controller."
+Partition `0`, in which all nodes participate. **Only the P0 leader executes the leader balancer.** This
+guide calls that node "the controller."
 
 ### Load report
-A small, periodic message each node gossips out describing the partitions *it currently leads* and how
-busy each one is. Reports are **advisory** — they ride the gossip path and are never written to the Raft log,
-because they change too fast and don't need to be durable.
+A periodic gossip message in which a node describes the partitions *it currently leads* and how busy each
+one is. It is **advisory** and is not written to the Raft log.
 
 ### Load score
-A single number summarizing how busy one partition is. It blends two signals Kommander already
-measures:
 
 ```
 load = (ops weight) × (recent operations/sec)  +  (queue weight) × (pending work in queues)
 ```
 
-The "operations/sec" part uses an **EWMA** (exponentially weighted moving average) — a smoothed
-average that reacts to sustained traffic but ignores brief spikes, and decays toward zero
-when a partition goes idle. Only real *workload* operations count (client writes and replication);
-background chatter like heartbeats is excluded, because it happens equally on every leader and would
-add noise.
+The operations/sec value is an **EWMA** (exponentially weighted moving average). It follows sustained
+traffic, ignores brief spikes, and decays toward zero when a partition is idle. Only *workload* operations
+(client writes and replication) count. Heartbeats are excluded.
 
 ### Global view
-On the P0 leader, all the incoming load reports are reduced into one snapshot: who leads what, how many
-leaders each node has, and how loaded each node is. This is the controller's picture of the world. Old
-reports (past a time-to-live) are dropped so a node that went silent doesn't appear to still hold
-leaderships.
+The snapshot that the controller builds from the load reports. It shows who leads what, how many leaders
+each node has, and how loaded each node is. A report past its time-to-live is dropped.
 
 ### Transfer suggestion
-The controller never *forces* anything. When it decides partition P should move from node A to node B,
-it sends node A a **suggestion**: "please consider handing partition P to B." Node A — the only node
-that knows whether it still leads P — validates and decides. This keeps the whole system safe
-and advisory.
+A request from the controller to the current leader of a partition to hand that partition to another node.
+The current leader validates the request and decides.
 
 ---
 
 ## Rebalance steps
 
-Every `LeaderBalancerInterval` (default 30s), the P0 leader runs one **balancing pass**:
+The controller does one **balancing pass** each `LeaderBalancerInterval` (default 30s).
 
-1. **Gather.** Collect the latest load report from each node into the global view. Drop expired ones.
-2. **Reconcile in-flight moves.** For any suggestion sent on a previous pass, check the view: did the
-   target become the leader? If yes, mark it done and put that partition on a short cooldown.
-   If too much time passed with no change, give up on it (it may have been dropped) and retry later.
-3. **Check completeness.** If the view is missing a fresh report from any live node, **skip this pass**
-   entirely. Acting on a half-complete picture could make bad moves, so the balancer would rather wait.
-4. **Plan.** Run the two-tier policy (next section) to produce a short list of moves.
-5. **Dispatch.** Send each planned move as a suggestion to the partition's current leader, and remember
-   it as "outstanding" so the controller can confirm it later.
+1. **Gather.** Collect the latest unexpired load report of each node into the global view.
+2. **Reconcile in-flight moves.** If the target of an earlier suggestion became the leader, mark the move
+   done and put the partition on cooldown. If `SuggestionTimeout` elapsed first, clear the move.
+3. **Check completeness.** If the view lacks a fresh report from any live node, **skip this pass**.
+4. **Plan.** Apply the two-tier policy to produce a short list of moves.
+5. **Dispatch.** Send each move as a suggestion to the partition's current leader and record it as
+   "outstanding."
 
-The loop never blocks on a transfer: it fires suggestions and re-checks on the next pass. Every pass
-re-derives the state from fresh reports, so a failed or lost suggestion is re-planned later.
+The controller does not block on a transfer. A later pass plans a failed or lost suggestion again.
 
-The recipient, for its part, runs the move through the same converging handover as
-`IRaft.TransferLeadershipAsync`: if the target is behind (which, under a steady write load, a healthy
-follower is at almost every instant), the leader parks new proposals, keeps replicating, and hands
-over as soon as the target is level with its last index — bounded by one election timeout. Parked
-proposals are answered `NodeIsNotLeader` only after the leader change is published (or re-admitted if
-the wait expires), so a node never reports itself as not the leader while it still is. Every
-attempted move logs one `TransferSuggestion p{Partition} ... finished with {Status}` line at
-Information (partition, term, from, to, status, elapsed), so the recipient's log also shows a move that did
-not complete.
+The recipient uses the same converging handover as `IRaft.TransferLeadershipAsync`. If the target is behind,
+the leader parks new proposals and continues to replicate. It hands over when the target is level with its
+last index, within one election timeout. Under a steady write load, a healthy follower is behind at almost
+all times. Parked proposals are answered `NodeIsNotLeader` only after the leader change is published, or are
+re-admitted if the wait expires.
+
+Each attempted move logs one `TransferSuggestion p{Partition} ... finished with {Status}` line at
+Information (partition, term, from, to, status, elapsed).
 
 ---
 
 ## The two-tier balancing policy
 
-The planner is a **pure function**: given the global view and the configuration, it returns a list of
-moves and has no side effects. (That makes it easy to test and reason about.) It works in two tiers:
+The planner is a **pure function**. It takes the global view and the configuration, returns a list of moves,
+and has no side effects.
 
 ### Tier 1 — count balance (primary)
-Compute the ideal: `total leaders ÷ number of live nodes`. A node holding more than that (beyond a
-small tolerance, `CountDeadband`) is **over-loaded**; one holding fewer is **under-loaded**. The
-planner moves leaderships from the most over-loaded node to the most under-loaded node, and when it
-has a choice, it moves the **hottest** partition onto the **coolest** node — improving count *and*
-load in one move.
+The ideal count is `total leaders ÷ number of live nodes`. A node above it by more than `CountDeadband` is
+**over-loaded**, and a node below it is **under-loaded**. The planner moves leaderships from the most
+over-loaded node to the most under-loaded node. When it has a choice, it moves the **hottest** partition to
+the **coolest** node.
 
 ### Tier 0 — degraded-node drain (optional, runs first)
-Off by default. Switch it on with `EnableSlowNodeAvoidance`.
+This tier is off by default. Set `EnableSlowNodeAvoidance` to turn it on.
 
-Every node measures how long its own WAL writes take to become durable, and reports that figure with
-its load report. Followers report it too, which matters: the balancer must judge the disk of a node it
-is about to *give* leadership to, and that node is a follower for the partition in question.
+Each node, leader or follower, measures how long its WAL writes take to become durable and includes the
+figure in its load report. When the write latency of one node is far above its peers', the balancer sends it
+no new leadership and moves away the leaderships that it has. If this tier emits a move, the other tiers
+emit none in that pass. A drain unbalances the counts on purpose, and Tier 1 would undo it.
 
-When one node's write latency stands far above its peers', the balancer stops sending it leadership
-and moves away the leaderships it already holds. If this tier emits any move, the other two tiers sit
-out that pass — a drain deliberately unbalances the counts, and Tier 1 would only fight it.
+These rules prevent a drain in a healthy cluster.
 
-Four rules keep it from firing on a healthy cluster:
+1. **A node is compared with the cluster median.** Under heavy write load, all disks slow down together and
+   the ratio does not change.
+2. **A quiet node is "unknown".** The latency estimate is updated only by writes. A node with
+   too few samples or samples that are too old is not judged. This includes a freshly restarted node.
+3. **Classification takes several passes.** A node must look slow for `SlowNodeEnterPasses` consecutive
+   passes to be classified, and clean for `SlowNodeExitPasses` consecutive passes to be released.
+4. **Half or more of the voters is a cluster-wide condition.** If that many look slow, none are classified.
+5. **At least three nodes need usable measurements.** With two, the median is their mean, and a slow node
+   raises the number that it is compared with.
 
-1. **A node is judged against the cluster median.** Under heavy write load every
-   disk slows down together, so the ratio to the cluster median stays flat and nobody is classified.
-   A single failing device is what stands out.
-2. **A quiet node is "unknown".** The latency estimate only updates when writes
-   happen, so a node that stopped writing keeps reporting its last figure. Both the number of
-   observations and their age travel with the report, and a node without enough recent evidence is
-   left alone — including a freshly restarted one, which would otherwise look like the fastest node
-   in the cluster.
-3. **Nothing happens on the first bad pass.** A node must look slow for `SlowNodeEnterPasses`
-   consecutive passes to be classified, and clean for `SlowNodeExitPasses` consecutive passes to be
-   released. Recovery is deliberately slower than detection.
-4. **Never a majority.** If half or more of the voters look slow, none are classified. That is a
-   cluster-wide condition, and draining a majority would be a self-inflicted outage.
-
-Fewer than three nodes with usable measurements also classifies nobody: with two, the median is their
-mean, so a slow node lifts the number it is compared against.
-
-> **This is a leadership decision only.** A node classified slow keeps its replicas, keeps its vote,
-> and stays a full cluster member. Nothing is evicted.
+> **This is a leadership decision only.** The replicas and the vote of a slow node do not change, and it
+> is not evicted.
 
 ### Tier 2 — load balance (secondary)
-If counts are already even but one node is still much hotter than another (load skew above
-`LoadImbalanceThreshold`), the planner emits a **count-neutral swap**: move a hot partition off the
-hot node and a cold partition back onto it. Counts stay the same; load evens out. It only does a swap
-if the swap *reduces* the imbalance — never churn for nothing.
+If the counts are even and the load skew is above `LoadImbalanceThreshold`, the planner emits a
+**count-neutral swap**. It moves a hot partition off the hot node and a cold partition back onto it. It
+emits a swap only if the swap *reduces* the imbalance.
 
 ### Guard rails on every move
-Before a move is allowed, it must pass all of these:
 
-- The partition is in the normal **Active** state (never move one that's splitting, draining, etc.).
-- Its leader has been stable for at least `MinLeaderStabilityMs` (don't move a leadership that just
-  formed — it's probably still settling).
-- The target is a live, voting member that belongs to that partition's group.
-- The target is not currently classified as a degraded node (only when `EnableSlowNodeAvoidance` is
-  on; see Tier 0).
-- The partition isn't in **cooldown** from a recent move (prevents ping-ponging).
-- The partition doesn't already have an **outstanding** suggestion in flight (prevents duplicates).
+A move must satisfy all of these conditions.
 
-Plus two throttles: at most `MaxMovesPerPass` moves are planned per pass, and at most
-`MaxConcurrentTransfers` moves may be in flight cluster-wide at once. Balance is reached gradually over
-several passes, never in one disruptive burst.
+- The partition is **Active**. A partition that is splitting or draining does not move.
+- Its leader has been stable for at least `MinLeaderStabilityMs`.
+- The target is a live, voting member of that partition's group.
+- The target is not classified as degraded (when `EnableSlowNodeAvoidance` is on).
+- The partition is not in **cooldown** from a recent move.
+- The partition has no **outstanding** suggestion.
+
+At most `MaxMovesPerPass` moves are planned per pass, and at most `MaxConcurrentTransfers` moves can be in
+flight cluster-wide.
 
 ---
 
 ## Transfer suggestions
 
-In Raft, **only the current leader of a partition can hand off that partition's leadership.**
-
-But the *decider* is the P0 leader, which usually does **not** lead the partition it wants to move. So
-the controller can't do the transfer itself. Instead it sends a suggestion to whoever currently
-leads the partition, and that node does the actual handoff:
+**Only the current leader of a partition can hand off that partition's leadership.** The controller usually
+does not lead the partition. It sends a suggestion to the node that does.
 
 ```
    P0 controller                     Node that leads partition P
@@ -235,86 +185,75 @@ leads the partition, and that node does the actual handoff:
         │                                       │  if any no  → silently ignore
 ```
 
-The recipient is **authoritative**: it re-checks everything at the moment of action. If the
-controller's view was stale (e.g. this node already lost leadership of P), the suggestion is
-dropped. The actual handoff uses Kommander's normal, Raft-correct leadership-transfer path, which
-itself re-validates terms and leadership and catches a lagging target up before handing over. So a
-wrong suggestion can never cause an unsafe transfer — only a wasted one, and a wasted one is logged
-with its outcome (`TargetNotCaughtUp`, `NodeIsNotLeader`, ...).
+The recipient is **authoritative**. If the controller's view was stale, the suggestion is dropped. The
+handoff itself re-validates terms and leadership, and catches up a lagging target first. A wrong suggestion
+can cause only a wasted transfer, which is logged with its outcome (`TargetNotCaughtUp`,
+`NodeIsNotLeader`, ...).
 
-> **One easy-to-miss case:** the P0 controller often *does* lead some of the overloaded partitions
-> itself. When the "from" node is the controller's own node, the suggestion is delivered **in-process**:
-> a node is not its own network peer, so the transport drops a self-addressed message. If you ever touch the dispatch code, keep this self-delivery path intact; without
-> it the balancer silently ignores every partition led by the P0 node.
+> **Self-delivery:** when the controller leads the partition that must move, the suggestion is delivered
+> **in-process**. The transport drops a self-addressed message, as a node is not a network peer of
+> itself. If you remove this path, the balancer silently ignores the partitions that the P0 leader leads.
 
 ---
 
 ## Tracking moves without waiting
 
-Because the controller fires suggestions and moves on, it needs a way to know later whether each one
-worked. It keeps a small in-memory table of **outstanding moves** (partition → intended target +
-deadline). On each pass it reconciles that table against the fresh global view:
+The controller has an in-memory table of **outstanding moves** (partition → intended target + deadline). On
+each pass it compares that table with the global view.
 
-- **Confirmed** — the view now shows the target leading the partition. Mark success, start a
-  `MoveCooldown` on that partition so it isn't immediately moved again.
-- **Timed out** — `SuggestionTimeout` elapsed and ownership never changed. Assume it was dropped or
-  failed; clear it and let a future pass retry (still respecting cooldown).
+- **Confirmed:** the view shows that the target leads the partition. The partition starts a `MoveCooldown`.
+- **Timed out:** `SuggestionTimeout` elapsed and ownership did not change. The move is cleared, and a later
+  pass can retry it after the cooldown.
 
-This "fire-and-confirm-by-observation" approach means there's **no durable balancer state**. If P0
-leadership moves to another node, the new controller starts fresh from the next round of reports —
-at worst one extra pass before it converges again.
+There is **no durable balancer state**. When P0 leadership moves, the new controller starts fresh, and
+the cost is at worst one extra pass.
 
 ---
 
 ## Configuration
 
-The balancer is **off by default**. Turn it on by setting `EnableLeaderBalancer = true` in
-`RaftConfiguration` on your nodes. Everything else has sensible defaults:
+Set `EnableLeaderBalancer = true` in `RaftConfiguration` on all nodes.
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `EnableLeaderBalancer` | `false` | Master on/off switch. When off: no reports, no passes, zero overhead. |
-| `LeaderBalancerInterval` | `30s` | How often the controller runs a balancing pass. |
+| `EnableLeaderBalancer` | `false` | Master switch. When off, there are no balancing passes and no suggestions. Load reports can flow for replica placement or `EnableLoadReports`. |
+| `LeaderBalancerInterval` | `30s` | How often the controller does a balancing pass. |
 | `LeaderBalancerReportInterval` | `5s` | Obsolete, no effect. A node emits its load report once per `GossipInterval`. |
 | `LeaderBalancerReportTtl` | `20s` | A report older than this is ignored (the node is treated as silent). |
-| `CountDeadband` | `1` | How far above/below the average a node may drift before it's acted on. |
+| `CountDeadband` | `1` | How far above/below the average a node can drift before a move is planned. |
 | `LoadImbalanceThreshold` | `0.25` | How skewed load must be (when counts are even) to trigger a swap. |
 | `MinLeaderStabilityMs` | `5000` | A leadership younger than this is not eligible to move. |
 | `MoveCooldown` | `60s` | After a partition moves, how long before it can move again. |
 | `MaxMovesPerPass` | `4` | Most moves planned in a single pass. |
 | `MaxConcurrentTransfers` | `2` | Most moves in flight cluster-wide at once. |
-| `SuggestionTimeout` | `15s` | How long to wait for a suggested move to show up before giving up on it. |
+| `SuggestionTimeout` | `15s` | How long to wait for a suggested move to show up before the controller clears it. |
 | `LeaderBalancerOpsWeight` | `1.0` | Weight of throughput in the load score. |
 | `LeaderBalancerQueueWeight` | `0.5` | Weight of queue depth in the load score. |
-| `EnableSlowNodeAvoidance` | `false` | Master on/off switch for Tier 0. Off: no node is ever classified. |
+| `EnableSlowNodeAvoidance` | `false` | Master switch for Tier 0. |
 | `SlowNodeMultiplier` | `3.0` | How many times the cluster median write latency makes a node a candidate. |
-| `SlowNodeFloorMs` | `10.0` | Below this absolute latency a node is never a candidate, whatever the ratio. |
-| `SlowNodeMinSamples` | `20` | Write batches a node must have observed before it is judged at all. |
+| `SlowNodeFloorMs` | `10.0` | Below this absolute latency, a node is not a candidate at any ratio. |
+| `SlowNodeMinSamples` | `20` | Write batches a node must have observed before it is judged. |
 | `SlowNodeObservationTtl` | `30s` | Older measurements count as unknown. |
 | `SlowNodeEnterPasses` | `3` | Consecutive bad passes before a node is classified. |
 | `SlowNodeExitPasses` | `6` | Consecutive clean passes before a node is released. |
 
-**Tuning tips for beginners:**
+**Tuning tips**
 
-- Start with defaults. They're deliberately conservative — slow and gentle.
-- If rebalancing feels too sluggish, lower `LeaderBalancerInterval` or raise `MaxMovesPerPass` /
-  `MaxConcurrentTransfers` — but expect more churn.
-- Keep `SuggestionTimeout` comfortably larger than `GossipInterval` **plus** the time it
-  takes gossip to spread across your cluster. If it's too small, successful moves get mis-counted as
-  failures (because their "I'm the new leader" report hasn't reached the controller yet) and get
-  needlessly retried. On bigger clusters, raise it.
-- `SlowNodeEnterPasses` and `SlowNodeExitPasses` count **controller passes**. If you shorten
-  `LeaderBalancerInterval`, you shorten the detection and recovery delays with it. At the defaults
-  (30s interval) a node is classified after 90s and released after 180s.
-- `CountDeadband` and `LoadImbalanceThreshold` are your anti-oscillation knobs. Raise them if you see
-  the balancer fidgeting; lower them for tighter balance at the cost of more moves.
+- For faster rebalancing, lower `LeaderBalancerInterval` or raise `MaxMovesPerPass` /
+  `MaxConcurrentTransfers`. Expect more churn.
+- `SuggestionTimeout` should be larger than `GossipInterval` **plus** the time that gossip takes to spread.
+  If it is too small, successful moves are counted as failures and retried. Raise it on larger clusters.
+- `SlowNodeEnterPasses` and `SlowNodeExitPasses` count **controller passes**. A shorter
+  `LeaderBalancerInterval` shortens detection and recovery. At the defaults, a node is classified after
+  90s and released after 180s.
+- If the balancer oscillates, raise `CountDeadband` and `LoadImbalanceThreshold`. Lower them for tighter
+  balance and more moves.
 
 ---
 
 ## Observability
 
-The balancer publishes metrics under the `Kommander` meter (consumable via OpenTelemetry,
-`dotnet-counters`, etc.). Watch these to confirm it's working and not thrashing:
+The metrics are under the `Kommander` meter.
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -324,38 +263,31 @@ The balancer publishes metrics under the `Kommander` meter (consumable via OpenT
 | `raft.balancer.load_imbalance` | gauge | Fractional load skew across nodes. Also trends down. |
 | `raft.balancer.slow_nodes` | gauge | Nodes currently classified degraded by Tier 0. Normally `0`. |
 
-**Reading them:**
+- A healthy cluster shows a burst of `planned` and then `succeeded`, and both imbalance gauges fall.
+- A high `timed_out` rate means that recipients drop suggestions, or that `SuggestionTimeout` is too short
+  for your gossip latency.
+- A `drain` outcome means that Tier 0 evacuated a node. Check the disk of that node.
+- If `raft.balancer.slow_nodes` alternates between `0` and `1`, raise `SlowNodeMultiplier` or
+  `SlowNodeExitPasses`.
+- A high `skipped_passes_total` means that the view is often incomplete. A node is silent, or the report TTL
+  does not match the report interval.
 
-- Healthy: a burst of `planned` then `succeeded`, and both imbalance gauges drifting toward zero.
-- A high `timed_out` rate means suggestions aren't landing — recipients are dropping them, or
-  `SuggestionTimeout` is too tight for your gossip latency.
-- A `drain` outcome means Tier 0 evacuated a node it judged degraded — check that node's disk before
-  assuming the balancer got it wrong.
-- `raft.balancer.slow_nodes` flipping between `0` and `1` across passes means the thresholds are too
-  tight for your latency variance. Raise `SlowNodeMultiplier` or `SlowNodeExitPasses`.
-- A high `skipped_passes_total` means the view is often incomplete — a node may be silent, or report
-  TTL/interval are mismatched.
-
-> The two imbalance gauges are process-global and only meaningful on the P0 leader (other nodes report
-> `0`). Don't rely on them in test harnesses that run several nodes inside one process.
+> The two imbalance gauges are process-global and meaningful only on the P0 leader (other nodes report
+> `0`). Do not rely on them in test harnesses that host several nodes in one process.
 
 ---
 
 ## Safety
 
-**The balancer is advisory and can never violate correctness.**
+**The balancer is advisory and cannot violate correctness.**
 
-- Every actual leadership change goes through Kommander's normal leadership-transfer path, which
-  re-validates term and leadership at the moment of the move. The balancer only *suggests*.
-- A stale, dropped, or out-of-date report can only cause a **wasted or skipped** move — never an unsafe
-  one. The node that owns the partition is the final authority and rejects anything that no longer
-  applies.
-- There's a single decider (the P0 leader), so two nodes can't issue conflicting plans.
-- With an incomplete picture, the controller **waits**.
-- All state is in memory; losing the controller means the next P0 leader starts fresh.
+- Each leadership change goes through the normal transfer path, which re-validates term and leadership at the
+  moment of the move.
+- A stale or dropped report can cause only a **wasted or skipped** move. The partition's leader makes the
+  final decision.
+- The P0 leader is the single decider, and two nodes do not issue conflicting plans.
 
-The only failure modes are "didn't rebalance" or "rebalanced something pointlessly," and both
-self-correct on the next pass. There is no path to data loss or split-brain through this feature.
+The failure modes are a missed move and a pointless move. Both self-correct on a later pass.
 
 ---
 
@@ -364,75 +296,48 @@ self-correct on the next pass. There is no path to data loss or split-brain thro
 | Concern | Where |
 |---|---|
 | Per-partition load measurement (the EWMA accumulator) | `Kommander/Diagnostics/PartitionLoadAccumulator.cs` |
-| Building a node's own report | `RaftManager.BuildLocalLoadReport()` |
+| A node's load report | `LoadReportService.BuildLocalLoadReport()` |
 | The report types | `Kommander/System/NodeLoadReport.cs`, `PartitionLoad.cs` |
-| Reducing reports into the snapshot | `Kommander/System/GlobalLeadershipView.cs` |
-| The two-tier planner (pure function) | `Kommander/System/LeaderBalancePlanner.cs`, `LeaderMove.cs` |
-| The controller / balancing pass | `Kommander/System/RaftSystemCoordinator.cs` (`RunBalancerPassAsync`) |
-| The suggestion message + send/receive | `Kommander/Data/TransferLeadershipSuggestionRequest.cs`, `RaftManager.SendTransferLeadershipSuggestion` / `ReceiveTransferLeadershipSuggestion` |
-| The actual handoff primitive | `RaftManager.TransferLeadershipAsync` |
-| Configuration knobs | `Kommander/RaftConfiguration.cs` |
+| The reduced snapshot of the reports | `Kommander/System/GlobalLeadershipView.cs` |
+| The planner (pure function) | `Kommander/System/LeaderBalancePlanner.cs`, `LeaderMove.cs` |
+| The Tier 0 classification | `Kommander/System/SlowNodeDetector.cs` |
+| The controller / balancing pass | `Kommander/System/LeaderBalancer.cs` (`RunPassAsync`), called from `RaftSystemCoordinator.RunBalancerPassAsync` |
+| The suggestion message + send/receive | `Kommander/Data/TransferLeadershipSuggestionRequest.cs`, `RaftRpcRouter.SendTransferLeadershipSuggestion` / `ReceiveTransferLeadershipSuggestion` |
+| The handoff primitive | `RaftManager.TransferLeadershipAsync` |
+| Configuration options | `Kommander/RaftConfiguration.cs` |
 | Metrics | `Kommander/Diagnostics/KommanderMetrics.cs` |
 
-A good reading order if you're learning the code: `PartitionLoadAccumulator` → `NodeLoadReport` →
-`GlobalLeadershipView` → `LeaderBalancePlanner` → `RunBalancerPassAsync`. That follows the data from
-"how busy is one partition" all the way up to "what should we move."
+To learn the code, read `PartitionLoadAccumulator` → `NodeLoadReport` → `GlobalLeadershipView` →
+`LeaderBalancePlanner` → `LeaderBalancer.RunPassAsync`.
 
 ---
 
 ## Maintaining & extending
 
-A few principles to keep things correct as you work on this:
+- **The planner must be pure.** The mutable state (cooldowns, outstanding moves) belongs to the controller,
+  which passes it *in*. The policy is then testable without a live cluster.
+- **Read ownership and load only from the global view.** Planning and move confirmation must both use it. A
+  second owner map drifts from the reduction (for example, it forgets the TTL) and confirms moves
+  incorrectly.
+- **Preserve in-process self-delivery** of suggestions (see the callout above). It is the common case.
+- **Add a new block reason on both sides.** A new partition lifecycle state, or a new reason to block a
+  move, goes in the planner's filters *and* in the recipient's validation.
+- **The feature must be advisory.** Do not make this state durable, and do not let the controller drive
+  transfers directly.
 
-- **The planner must stay pure.** Keep all mutable state (cooldowns, outstanding moves) in the
-  controller and pass it *in*. This is what makes the policy testable without a live cluster.
-- **There is exactly one way to read ownership/load from reports** — the global view. Both planning and
-  the confirm-completed-moves step must use it. Never hand-roll a second, ad-hoc owner map; it will
-  drift from the real reduction (e.g. forget the TTL) and confirm moves incorrectly.
-- **Preserve in-process self-delivery** of suggestions when the controller leads the partition (see the
-  callout above). It is the common case.
-- **A move's eligibility filters are load-bearing.** If you add a new partition lifecycle state or a new
-  reason a move should be blocked, add it to the planner's filters *and* the recipient's validation —
-  both sides check independently on purpose.
-- **Keep it advisory.** Resist the temptation to make any of this durable or to have the controller
-  drive transfers directly. The "suggest, then observe reality" loop is what makes the feature safe and
-  self-healing.
-
-Ideas that fit on top of this design (not yet built): blending host-level CPU/memory into the
-load score, operator-supplied anti-affinity hints (keep certain partitions apart), and evicting a
-node's report immediately when it leaves the cluster instead of waiting for it to age out.
-
-> **Related:** the same per-node load report also carries a per-partition **log-replication rate** and
-> **WAL queue depth** signal, exposed through `IRaft` for load-based split decisions. See the
+> **Related:** the same load report also carries a per-partition **log-replication rate** and **WAL queue
+> depth** for load-based split decisions. See the
 > [Per-Partition Log-Replication Rate Signal guide](partition-log-rate-signal-developer-guide.md).
 
 ---
 
 ## FAQ
 
-**Does enabling this risk my data?**
-No. It only moves *leadership*, never data, and every move goes through the same safe handoff Raft uses
-internally. The balancer can only ever cause a wasted move, which self-corrects.
-
-**Will it constantly move things around?**
-No. Cooldowns, deadbands, stability gates, and per-pass caps make it gentle and convergent. Once the
-cluster is balanced it goes quiet until something changes.
-
 **What happens during a node failure or election?**
-A partition with no current leader doesn't appear in any report, so the balancer ignores it that
-pass. It never starts or speeds up elections — it only relocates leaderships that already exist.
-
-**Why suggestions instead of the controller doing the transfer?**
-Because only a partition's own leader can hand off its leadership. The controller usually isn't that
-leader, so it has to ask. This also keeps the owning node as the final authority, which is what makes
-stale decisions harmless.
+The balancer ignores a leaderless partition in that pass, as no report contains it. The
+balancer does not start or speed up elections.
 
 **It's enabled but nothing is moving — why?**
-Check `raft.balancer.skipped_passes_total` (incomplete view — a node may be silent) and
-`raft.balancer.moves_total{outcome=timed_out}` (suggestions not landing — possibly `SuggestionTimeout`
-too small for your gossip latency). Also confirm the imbalance is beyond `CountDeadband`; if
-the cluster is already close to even, there's nothing to do.
-
-**Where does it run?**
-Only on the leader of the system partition (P0). Other nodes only emit reports and act on suggestions
-they receive.
+Check `raft.balancer.skipped_passes_total` (incomplete view) and
+`raft.balancer.moves_total{outcome=timed_out}` (suggestions that do not land). Also check that the imbalance
+is beyond `CountDeadband`.

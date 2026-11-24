@@ -1,77 +1,64 @@
 # Kommander (Raft Consensus)
 
-Kommander is an open-source distributed consensus library for C#/.NET. It uses the Raft protocol to provide leader election, partitioned log replication, durable write-ahead logging, and cluster coordination for replicated services.
-
-Kommander is designed to keep the consensus core separate from storage, discovery, and transport concerns. Applications can choose RocksDB, SQLite, or in-memory WAL implementations; static, dynamic, or multicast discovery; and gRPC, REST/JSON, or in-memory communication depending on their deployment and testing needs.
+Kommander is an open-source distributed consensus library for C#/.NET. It implements the Raft protocol with partitioned log replication on a durable write-ahead log (WAL). You can select or replace the storage engine, the discovery provider and the network transport.
 
 [![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
 [![NuGet](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
 
 ## Used In Production
 
-Kommander is the consensus layer of these production products:
+Kommander is the consensus layer of two production products.
 
 - **[CamusDB](https://camusdb.github.io/):** a distributed SQL database for .NET. Its transactional key-value storage layer is replicated with Kommander.
 - **[Kahuna](https://kahunakv.github.io/):** distributed locking with fencing tokens and leases, and a consistent key/value store with transactions and watchers.
 
 ## Features
 
-- **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
-- **Partitioned replication:** Nodes can lead some partitions and follow others, allowing application data to be distributed across independent Raft groups. Partition `0` is reserved for replicated system configuration; application partitions start at `1`.
-- **Elastic partitions:** Create, split, merge, and remove partitions at runtime without restarting any node. The partition map is replicated through the system partition so every node converges on every change, and two-phase protocols ensure no key range is ever uncovered during a split or merge. See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md).
-- **Dynamic cluster membership:** Add and remove nodes from a running cluster. The voting roster is a committed, versioned record on the system partition (never gossip- or discovery-derived), so quorum is always consistent. New nodes join as non-voting learners, catch up, and are auto-promoted to voters; a SWIM-style gossip layer disseminates the roster and detects failures advisorily. See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
-- **Log catch-up & backfill:** A leader detects a follower that has fallen behind and backfills the missing entries in bounded, anchored chunks, enforcing the Raft Log Matching Property so a follower's log never grows a gap or a divergent tail. Followers too far behind the compaction floor are caught up with a snapshot instead. See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md).
-- **Partition quiescence:** An idle leader stops sending per-partition heartbeats after a configurable idle window and sends followers a one-time quiesce marker; followers then gate elections on the SWIM failure detector instead of a per-partition timer. This drops steady-state heartbeat traffic from `O(nodes × partitions)` toward per-node SWIM probing, making deployments with hundreds or thousands of mostly-idle partitions practical. Any write wakes the partition instantly, and a dead leader is still detected promptly via SWIM. See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md).
-- **Leader balancing:** Leaders are elected independently, so over time they can pile up on one node while peers sit idle. The leader balancer watches how leaderships are distributed and how loaded each one is, then spreads them evenly — equalizing the *count* first and the *load* (a smoothed throughput + queue-depth score) second. The system-partition leader plans moves and sends advisory *suggestions* to each partition's current leader, which performs the safe Raft handoff; it is throttled, self-healing, off by default, and can never affect correctness. See [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md).
-- **Replication factor & replica placement:** Instead of every node replicating every partition, each range can keep a fixed number of copies (e.g. 3) on a committed subset of nodes, with quorum computed over that range's replicas only — so adding machines spreads data out and keeps commit quorums small. Replicas are added as catch-up learners, promoted, and removed one at a time so every step is quorum-safe, and an optional planner continually repairs and rebalances placement as nodes join, leave, or die. Off by default; full replication remains the default. See [Replica Placement Developer Guide](docs/replica-placement-developer-guide.md).
-- **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
-- **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
-- **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
-- **Cluster discovery options:** Static discovery for fixed clusters, dynamic discovery for application-managed membership lists, and multicast discovery for local-network discovery.
-- **Transport choices:** gRPC for networked clusters, REST/JSON for HTTP-based integration and debugging, and in-memory communication for tests.
-- **Node authentication:** Shared-secret HMAC or mutual TLS authentication for node-to-node REST and gRPC traffic, with optional server certificate thumbprint pinning.
-- **Batch replication:** Replicate multiple log entries in a single proposal to reduce coordination overhead.
-- **Manual proposal control:** Use automatic commits for the common path, or disable auto-commit and explicitly call `CommitLogs` or `RollbackLogs`.
-- **Hybrid logical clocks:** Proposal tickets use HLC timestamps to preserve causality across physical time and logical counters.
-- **Actorless partition executors:** Each partition is driven by an explicit serial executor instead of an actor, making ownership and blocking boundaries easier to reason about.
-- **Fair I/O schedulers:** Synchronous WAL reads and writes are processed through configurable fair schedulers so storage work does not block partition state transitions.
-- **Application callbacks:** Restore, replication, replication-error, and leadership events let applications rebuild and advance their own state machines.
-- **ASP.NET Core integration:** Route extensions expose Raft gRPC and REST endpoints from an existing web host.
-- **Verified beyond unit tests:** [Jepsen](https://github.com/kahunakv/kommander-jepsen) tests a real cluster under injected faults, deterministic simulation testing (DST) searches real in-process clusters for states that break Raft, and TLA+ models check the commit and durability path. See [Correctness Testing](#correctness-testing).
+- **Raft consensus:** each partition has a separate leader election and a separate replicated log, with checkpoints.
+- **Partitioned replication:** application data is distributed across independent Raft groups. A node can lead some partitions and follow others.
+- **[Elastic partitions](docs/elastic-partitions-developer-guide.md):** create, split, merge, and remove partitions at runtime. The hash ring is fully covered during a split or a merge.
+- **[Dynamic cluster membership](docs/dynamic-membership-developer-guide.md):** add and remove nodes in a running cluster. The voting roster is a committed, versioned record on the system partition.
+- **[Log catch-up and backfill](docs/log-backfill-developer-guide.md):** a lagging follower receives the missing entries in bounded and anchored chunks. If the leader has compacted them, the follower receives a snapshot.
+- **[Partition quiescence](docs/partition-quiescence-developer-guide.md):** idle partitions stop their heartbeats. This makes thousands of mostly idle partitions practical.
+- **[Leader balancing](docs/leader-balancer-developer-guide.md):** spreads partition leaders across nodes by count and then by load. Off by default.
+- **[Replica placement](docs/replica-placement-developer-guide.md):** stores a fixed number of copies of each range on a subset of the nodes, with quorum computed over that range's replicas. Off by default, which means full replication.
+- **Durable WAL with automatic compaction:** RocksDB and SQLite adapters, plus an in-memory adapter for tests.
+- **Pluggable transport:** gRPC or REST/JSON, with route extensions for an existing ASP.NET Core host. Tests can use the in-memory transport.
+- **Pluggable discovery:** static and dynamic node lists, and UDP multicast.
+- **[Node authentication](docs/node-transport-authentication-developer-guide.md):** shared-secret HMAC or mutual TLS, with optional certificate pinning.
+- **Batch and manual proposals:** replicate several entries in one proposal, and commit or roll back explicitly when you turn off auto-commit.
+- **Hybrid logical clocks:** proposal tickets use timestamps that preserve causality.
+- **[Thread-free embedded mode](docs/thread-free-embedded-mode-developer-guide.md):** a node can run on single-threaded WebAssembly.
+- **[Correctness testing](#correctness-testing):** Jepsen and deterministic simulation test the code, and TLA+ models check the commit path.
 
 ## About Raft And Kommander
 
-Raft is a consensus protocol that helps a cluster of nodes maintain a replicated state machine by synchronizing a durable log. A leader receives proposed changes, writes them locally, replicates them to followers, and commits them after a quorum acknowledges the proposal.
+Raft synchronizes a durable log across a cluster so that the nodes maintain the same state machine. A leader writes each proposed change to its log and replicates it to the followers. The change is committed after a quorum acknowledges it.
 
-Kommander implements this model with partitioned Raft groups. Each partition elects its own leader, so a node can be the leader for one partition and a follower for another. This improves throughput when workloads can be routed by key while preserving ordered replication inside each partition.
-
-The library keeps storage, discovery, and communication pluggable. That separation lets applications use the same Raft behavior with different persistence engines, network transports, and cluster discovery strategies.
+In Kommander, each partition is a separate Raft group with a separate leader. Order is preserved within a partition, and throughput grows when the workload can be routed by key.
 
 ## Documentation
 
-| Guide | What it covers |
+Start with the [Architecture Overview](docs/architecture-overview.md). The other guides cover one topic each.
+
+| Topic | Guides |
 | --- | --- |
-| [Architecture Overview](docs/architecture-overview.md) | A beginner-friendly tour of the whole system: concepts, the component map, and the main runtime flows (election, write path, catch-up, restart, compaction). Start here. |
-| [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) | How a lagging follower is brought back in sync: the live-vs-backfill split, the Log Matching anchor, multi-round convergence, and the snapshot handoff. |
-| [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) | Adding/removing nodes at runtime, the committed roster, learner promotion, and the SWIM failure detector. |
-| [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) | Creating, splitting, merging, and removing partitions at runtime, the two-phase protocols, and the generation fence. |
-| [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) | How idle partitions stop heartbeating and lean on SWIM for liveness: the quiesce/wake flows, the failover-timing rule, and the configuration knobs. |
-| [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md) | How leaderships are spread evenly across the cluster: load reports, the global view, the two-tier (count then load) planner, the transfer-suggestion mechanism, configuration, and observability. |
-| [Replica Placement Developer Guide](docs/replica-placement-developer-guide.md) | Replication factor and per-partition replica sets: per-range quorums, partial materialization, the learner → voter → removal lifecycle, the placement planner/controller, routing, and configuration. |
-| [System-Partition State Snapshots Developer Guide](docs/system-partition-state-snapshots-developer-guide.md) | Storing cluster-wide control state on partition 0 and moving from full-snapshot-per-mutation to compaction-safe delta logs: the `IRaftSystemStateTransfer` hook, below-floor repair, cold restart, and the retain floor. |
-| [Node Transport Authentication Developer Guide](docs/node-transport-authentication-developer-guide.md) | Authenticating node-to-node traffic: the `Disabled`/`SharedSecret`/`MutualTls` modes, what a shared secret does and does not prove, certificate pinning and its rotation story, the fail-closed startup checks, and configuration. |
+| Cluster | [Dynamic Membership](docs/dynamic-membership-developer-guide.md) · [Node Transport Authentication](docs/node-transport-authentication-developer-guide.md) |
+| Partitions | [Elastic Partitions](docs/elastic-partitions-developer-guide.md) · [Partition Quiescence](docs/partition-quiescence-developer-guide.md) · [Partition Scaling](docs/partition-scaling-developer-guide.md) · [System-Partition State Snapshots](docs/system-partition-state-snapshots-developer-guide.md) |
+| Placement and balance | [Replica Placement](docs/replica-placement-developer-guide.md) · [Leader Balancer](docs/leader-balancer-developer-guide.md) · [Partition Log Rate Signal](docs/partition-log-rate-signal-developer-guide.md) |
+| Replication | [Log Catch-Up & Backfill](docs/log-backfill-developer-guide.md) · [Heterogeneous Write Coalescing](docs/heterogeneous-write-coalescing-developer-guide.md) |
+| Storage | [WAL Commit Durability](docs/wal-commit-durability-developer-guide.md) · [Shared RocksDB Memory](docs/shared-rocksdb-memory-developer-guide.md) |
+| WebAssembly | [Thread-Free Embedded Mode](docs/thread-free-embedded-mode-developer-guide.md) |
 
 ## Packages And Targets
 
-Kommander multi-targets `.NET 8.0`, `.NET 10.0` and `.NET 11.0`.
-
-Install from NuGet:
+Kommander multi-targets `.NET 8.0`, `.NET 10.0` and `.NET 11.0`. Install it from NuGet.
 
 ```shell
 dotnet add package Kommander
 ```
 
-Or with the NuGet Package Manager Console:
+You can also use the NuGet Package Manager Console.
 
 ```powershell
 Install-Package Kommander
@@ -81,20 +68,20 @@ Install-Package Kommander
 
 | Concept | Meaning |
 | --- | --- |
-| **Node** | A running `RaftManager` instance. Each node has a local endpoint built from `RaftConfiguration.Host` and `RaftConfiguration.Port`. |
-| **Partition** | A separately elected Raft group. Partition `0` is the system partition (see below); application data normally uses user partitions, which start at `1`. |
+| **Node** | A running `RaftManager` instance. Its endpoint is built from `RaftConfiguration.Host` and `RaftConfiguration.Port`. |
+| **Partition** | A separately elected Raft group. Partition `0` is the system partition. User partitions start at `1`. |
 | **Leader** | The node currently allowed to accept proposals for a partition. |
-| **Follower** | A node that receives and persists append-log requests from a partition leader. |
-| **Proposal** | A set of log entries written by the leader and replicated to followers. A proposal is complete after quorum acknowledgment. |
-| **Commit** | The durable state transition that marks proposed logs as committed. `ReplicateLogs` auto-commits by default; callers can disable that and call `CommitLogs` or `RollbackLogs` explicitly. |
-| **Checkpoint** | A special replicated log entry used to mark a stable point in a partition log. |
-| **WAL** | The write-ahead log used to persist proposed, committed, rolled-back, and checkpoint entries. |
+| **Follower** | A node that receives and persists log entries from a partition leader. |
+| **Proposal** | A set of log entries written by the leader and replicated to followers. It is complete after quorum acknowledgment. |
+| **Commit** | The durable state transition that marks proposed logs as committed. |
+| **Checkpoint** | A replicated log entry that marks a stable point in a partition log. |
+| **WAL** | The write-ahead log, which persists all entry types. |
 
-Kommander replicates its own configuration on partition `0` using the reserved `_RaftSystem` log type. The system partition can also **co-locate consumer data**: entries written with any non-`_RaftSystem` log type are replicated and dispatched to the consumer callbacks just like a user partition, while Kommander's own `_RaftSystem` entries continue to drive the system coordinator. Routing on partition `0` is by log type, so the two never interfere. Partition `0` itself can never be created, split, merged, or removed.
+Kommander replicates its configuration on partition `0` with the reserved `_RaftSystem` log type. Entries on partition `0` with any other log type are dispatched to the consumer callbacks, as on a user partition. The lifecycle operations do not accept partition `0`.
 
 ## Quick Start
 
-This example creates one node using static discovery, RocksDB storage, and gRPC communication. In a real cluster, run one `RaftManager` per node with a unique host/port and a discovery list containing the other nodes.
+This example creates one node that uses static discovery and gRPC, with RocksDB storage. In a real cluster, run one `RaftManager` per node. Give each node a unique host and port, and a discovery list of the other nodes.
 
 ```csharp
 using System.Text;
@@ -161,9 +148,7 @@ await raft.LeaveCluster(dispose: true);
 
 ## Hosting gRPC Or REST Endpoints
 
-When using network transports, each process must expose matching Raft endpoints.
-
-For gRPC:
+With a network transport, each process must expose the matching Raft endpoints. This host exposes gRPC.
 
 ```csharp
 using Kommander.Communication.Grpc;
@@ -173,7 +158,7 @@ app.MapGrpcRaftRoutes();
 app.Run();
 ```
 
-For REST/JSON:
+This host exposes REST/JSON.
 
 ```csharp
 using Kommander.Communication.Rest;
@@ -183,34 +168,27 @@ app.MapRestRaftRoutes();
 app.Run();
 ```
 
-The sample server in `Kommander.Server` maps both gRPC and REST endpoints and starts the cluster from command-line options.
+The sample server in `Kommander.Server` maps both.
 
 ## Transport Security And Node Authentication
 
 ### Threat Model
 
-TLS encrypts traffic and proves the server's identity when the certificate is validated correctly. It does not authenticate the calling node. Without an additional check, any client that can reach a Raft port can send handshake, vote, append, or step-down messages.
+TLS encrypts traffic and proves the server's identity when the certificate is validated correctly. It does not authenticate the calling node. Unless you enable node authentication, any client that can reach a Raft port can send handshake, vote, append, or step-down messages.
 
-Kommander separates these two concerns:
-
-1. **Transport security** — TLS encrypts the wire and validates the remote server certificate.
-2. **Node authentication** — every inbound REST and gRPC Raft request proves it belongs to the same cluster.
-
-In-memory communication (used in tests) is excluded from these requirements.
+In-memory communication is excluded from these requirements.
 
 ### Authentication Modes
 
-`RaftTransportSecurityOptions.NodeAuthenticationMode` controls which mode is active:
+Set the mode in `RaftTransportSecurityOptions.NodeAuthenticationMode`.
 
 | Mode | Description |
 | --- | --- |
-| `Disabled` | No authentication. Existing unauthenticated clusters keep working. A warning is logged at startup. |
-| `SharedSecret` | HMAC-SHA256 per-request signature derived from a shared cluster secret. Recommended for production. |
-| `MutualTls` | Mutual TLS. Both sides authenticate during the handshake; no per-request signature is sent. See [Mutual TLS](#mutual-tls). |
+| `Disabled` | No authentication. A warning is logged at startup. |
+| `SharedSecret` | HMAC-SHA256 signature per request, derived from a shared cluster secret. Recommended for production. |
+| `MutualTls` | Both sides authenticate during the TLS handshake. No per-request signature is sent. See [Mutual TLS](#mutual-tls). |
 
 ### Shared Secret Protocol
-
-Each request carries four signed fields:
 
 | Header | Content |
 | --- | --- |
@@ -219,7 +197,7 @@ Each request carries four signed fields:
 | `X-Kommander-Cluster-Timestamp` | Unix milliseconds |
 | `X-Kommander-Cluster-Nonce` | Random 128-bit nonce, base64url |
 
-The signature covers `method + path + sender + timestamp + nonce + SHA-256(body)`. Validation rejects missing fields, malformed fields, timestamp skew beyond the configured window (default 60 s), and replayed nonces. All HMAC comparisons use constant-time equality.
+The signature covers `method + path + sender + timestamp + nonce + SHA-256(body)`. A request is refused when a field is missing or malformed, when its timestamp is outside the configured window (default 60 s), or when its nonce was already used. HMAC comparisons use constant-time equality.
 
 ### Configuring Shared Secret
 
@@ -237,14 +215,11 @@ RaftConfiguration configuration = new()
 };
 ```
 
-Generate at least 256 bits of random secret material and distribute it through a secret manager, Docker secret, Kubernetes Secret, or environment variable. Do not put the secret in source control.
+Generate at least 256 bits of random secret material. Distribute it through a secret manager, a Kubernetes or Docker secret, or an environment variable. Do not put the secret in source control.
 
 ### Mutual TLS
 
-In `MutualTls` mode both sides authenticate during the TLS handshake: the client validates the
-server certificate and the server requires and validates a client certificate. No HMAC header is
-sent or checked, so there is no shared secret to distribute or rotate through configuration, and no
-per-request replay window to reason about.
+In `MutualTls` mode the client validates the server certificate, and the server requires and validates a client certificate. The HMAC headers are not used.
 
 ```csharp
 RaftConfiguration configuration = new()
@@ -266,7 +241,7 @@ RaftConfiguration configuration = new()
 };
 ```
 
-Or with the `Kommander.Server` host:
+The `Kommander.Server` host has equivalent flags. The published container passes the same flags to `dotnet /app/Kommander.Server.dll`.
 
 ```shell
 dotnet run --project Kommander.Server -- \
@@ -278,20 +253,11 @@ dotnet run --project Kommander.Server -- \
   --trusted-client-cert-thumbprint 5E9B... A31C... 7F02...
 ```
 
-The published container passes the same flags to `dotnet /app/Kommander.Server.dll`.
-
-`--client-certificate` may be omitted, in which case the node presents its `--https-certificate`.
+If you omit `--client-certificate`, the node presents its `--https-certificate`.
 
 #### Computing thumbprints
 
-Thumbprints are **uppercase hex of the SHA-256 hash over the DER-encoded certificate, with no
-separators**. Two common values do *not* work and will silently never match:
-
-- `X509Certificate2.Thumbprint` in .NET is SHA-1.
-- `openssl x509 -fingerprint -sha256` prints colon-separated hex.
-
-Colon-separated and lower-case values are normalized on input, so pasting `openssl` output works.
-To compute the canonical form directly:
+A thumbprint is the **uppercase hex of the SHA-256 hash over the DER-encoded certificate**. Note that `X509Certificate2.Thumbprint` in .NET is SHA-1 and does not match. Colons and lower-case letters are normalized on input, which means that you can paste the output of `openssl x509 -fingerprint -sha256`. This command prints the canonical form.
 
 ```sh
 openssl pkcs12 -in node-1.pfx -clcerts -nokeys -passin pass: \
@@ -303,42 +269,31 @@ openssl pkcs12 -in node-1.pfx -clcerts -nokeys -passin pass: \
 
 | Approach | Identity proven | Cost |
 | --- | --- | --- |
-| **Shared** — every node presents the same `.pfx` | Membership in the cluster, *not* which node is calling. Any holder of the file can impersonate any node. | One certificate to distribute. |
-| **Per-node** — each node has its own certificate, and every node lists the others' thumbprints | Genuine per-node identity; a single compromised node can be revoked by removing one thumbprint. | N thumbprints to distribute, updated on membership changes. |
+| **Shared:** all nodes present the same `.pfx` | Membership in the cluster only. Any holder of the file can impersonate any node. | One certificate to distribute. |
+| **Per-node:** each node has a separate certificate and lists the thumbprints of the others | Per-node identity. You can revoke a compromised node by removing one thumbprint. | N thumbprints to distribute and update on membership changes. |
 
-The shared approach has the same trust granularity as a shared secret, with better key handling and
-no header-level replay surface. Leaving `TrustedClientCertificateThumbprints` empty accepts any
-client certificate that completes the handshake; a warning is logged at startup.
+If `TrustedClientCertificateThumbprints` is empty, any client certificate that completes the handshake is accepted, and a warning is logged at startup.
 
 #### Rotating certificates
 
-With thumbprint pinning, rotation is a two-phase rollout. Skipping the first phase partitions the
-cluster as soon as the first node rotates:
+If you skip the first step, the cluster is partitioned as soon as the first node rotates.
 
-1. Add the new certificate's thumbprint to **every** node's `TrustedClientCertificateThumbprints`,
-   so both old and new are accepted. Restart each node.
-2. Switch each node's `ClientCertificatePath` to the new certificate, one node at a time.
-3. Remove the old thumbprint from every node.
+1. Add the thumbprint of the new certificate to `TrustedClientCertificateThumbprints` on all nodes, next to the old one. Restart each node.
+2. Switch `ClientCertificatePath` to the new certificate, one node at a time.
+3. Remove the old thumbprint from all nodes.
 
 #### Operational consequences
 
-Two effects of requiring client certificates are worth planning for:
+- **The HTTPS port becomes cluster-internal.** Kestrel requires a client certificate from all callers on that listener, including callers of routes outside `/v1/raft/*`. Bind a separate listener for any public HTTPS surface.
+- **HTTP/3 is disabled** on HTTPS listeners in this mode. This is logged once at startup.
 
-- **The HTTPS port becomes cluster-internal.** Client certificates must be requested during the
-  initial TLS handshake, because HTTP/2 forbids the renegotiation that optional certificates rely on
-  and HTTP/3 has no equivalent. Kestrel therefore requires a certificate from *every* caller on that
-  listener, not only on `/v1/raft/*`. Bind a separate listener for any public HTTPS surface.
-- **HTTP/3 is disabled** on HTTPS listeners in this mode, for the same reason. This is logged once at
-  startup.
-
-`MutualTls` cannot be combined with `AllowInsecureCertificateValidation`; the combination throws at
-startup, since it would disable exactly the validation the mode depends on.
+The combination of `MutualTls` and `AllowInsecureCertificateValidation` throws at startup.
 
 ### Certificate Validation
 
 | Option | Default | Description |
 | --- | ---: | --- |
-| `RequireTls` | `true` | Reject requests that arrive over plain HTTP. Throws at startup if `HttpScheme` is `http://`. |
+| `RequireTls` | `true` | Reject requests that arrive over unencrypted HTTP. Throws at startup if `HttpScheme` is `http://`. |
 | `AllowInsecureCertificateValidation` | `false` | Skip remote certificate validation. Development only. A warning is logged at startup. |
 | `TrustedServerCertificateThumbprints` | empty | SHA-256 hex thumbprints of accepted server certificates. When set, only pinned certificates are accepted regardless of chain trust. |
 | `TrustedClientCertificateThumbprints` | empty | SHA-256 hex thumbprints of accepted **client** certificates, used in `MutualTls` mode. When empty, any client certificate that completes the handshake is accepted. |
@@ -360,15 +315,11 @@ When neither `AllowInsecureCertificateValidation` nor thumbprints are set, the p
 
 ### Secret Rotation
 
-To rotate the shared secret without downtime:
-
-1. Sign outbound requests with the new secret.
-2. Accept both old and new secrets on inbound requests during a transition window (requires a secondary secret field, not yet built in — use a rolling restart in the interim).
-3. Remove the old secret after all nodes are updated.
+A node has one secret at a time, and nodes with different secrets cannot authenticate each other. Plan a maintenance window to change the secret, or use `MutualTls`, where you can roll credentials one node at a time.
 
 ## Creating A Node
 
-`RaftManager` is the main implementation of `IRaft`:
+`RaftManager` is the main implementation of `IRaft`.
 
 ```csharp
 IRaft raft = new RaftManager(
@@ -403,7 +354,7 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Components | `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadScheduler`, `WalScheduler` |
 | Events | `OnRestoreStarted`, `OnRestoreFinished`, `OnReplicationError`, `OnLogRestored`, `OnReplicationReceived`, `OnLeaderChanged` |
 
-The transport entry points are intended for communication adapters and HTTP/gRPC endpoint handlers, not normal application writes.
+The transport entry points are for communication adapters and endpoint handlers. Application code should use the replication members.
 
 ## Configuration
 
@@ -417,8 +368,8 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `TransportSecurity` | see below | Node authentication and TLS validation settings. See [Transport Security And Node Authentication](#transport-security-and-node-authentication). |
 | `HttpScheme` | `https://` | Scheme used by `RestCommunication`. |
 | `GrpcScheme` | `https://` | URL scheme prepended to peer endpoints when opening gRPC channels. Set to `http://` (plus `Http2UnencryptedSupport`) for cleartext test environments. |
-| `GrpcChannelsPerNode` | `4` | Number of pooled gRPC channels (and matching streaming calls) created per peer URL. Each channel owns its own `SocketsHttpHandler` and TCP/HTTP2 connection, so effective per-peer concurrency is approximately `GrpcChannelsPerNode × MaxConcurrentStreams`. Replication appends to a peer always use the first streaming call, so they arrive in order; other traffic is spread round-robin. Clamped to [1, 64] at runtime. Set to `1` to restore single-connection behaviour. A channel that stops reconnecting (30 s in `TransientFailure` with no connect attempt, the dead-loop state of grpc-dotnet issue #2734) is disposed and rebuilt in its slot, and the streaming call bound to the slot re-opens on the new channel; `SharedChannels.GetChannelHealth(url)`, the `raft.transport.channel_rebuilds_total` counter and the `raft.transport.channels_in_transient_failure` gauge show it per peer. |
-| `GrpcEnableMultipleHttp2Connections` | `false` | When `true`, each pooled channel's handler may open additional TCP/HTTP2 connections on demand, raising the per-channel stream ceiling further on saturated links. |
+| `GrpcChannelsPerNode` | `4` | Pooled gRPC channels (and matching streaming calls) per peer URL. Clamped to [1, 64] at runtime. See [gRPC Channels](#grpc-channels). |
+| `GrpcEnableMultipleHttp2Connections` | `false` | When `true`, each pooled channel may open additional TCP/HTTP2 connections on demand, which raises the stream ceiling on saturated links. |
 | `HttpAuthBearerToken` | empty | **Deprecated.** Legacy bearer token. Use `TransportSecurity.SharedSecret` instead. |
 | `HttpTimeout` | `5` | REST request timeout in seconds. |
 | `HttpVersion` | `2.0` | REST HTTP version. |
@@ -432,26 +383,52 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `EndElectionTimeout` | `4000 ms` | Upper election timeout bound. |
 | `StartElectionTimeoutIncrement` | `100 ms` | Obsolete, no effect. A failed election draws a fresh random timeout. |
 | `EndElectionTimeoutIncrement` | `200 ms` | Obsolete, no effect. A failed election draws a fresh random timeout. |
-| `EnableQuiescence` | `true` | When `true`, idle partitions stop sending per-partition heartbeats and followers gate elections on SWIM node liveness. Set to `false` to restore per-partition heartbeating on every interval. Requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` (validated at construction). See [Partition Quiescence](#partition-quiescence). |
+| `EnableQuiescence` | `true` | Idle partitions stop per-partition heartbeats, and followers gate elections on SWIM node liveness. Requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` (validated at construction). See [Partition Quiescence](#partition-quiescence). |
 | `QuiesceAfter` | `1500 ms` | How long a partition must be idle (no proposals, no in-flight replication) before its leader quiesces it. |
-| `PingInterval` | `1000 ms` | SWIM failure-detector probe cadence. With quiescence on, a quiesced follower detects a dead leader roughly one `PingInterval` after the crash; must be `> 0` and `< StartElectionTimeout`. |
+| `PingInterval` | `1000 ms` | SWIM probe cadence. With quiescence on, a follower detects a dead leader roughly one `PingInterval` after the crash. |
 | `SlowRaftStateMachineLog` | `50 ms` | Slow partition state-machine operation warning threshold. |
 | `SlowRaftWALMachineLog` | `25 ms` | Obsolete, no effect. Use `WalStallWarnThreshold`. |
-| `WalStallStepDownTimeout` | `3 s` | Durable-write stall watchdog. A leader whose own WAL write has been unanswered by the storage engine for this long steps down in the same term (its waiting proposals fail at once so callers re-route), notifies the most caught-up peer so the successor's election starts within a round trip, and refuses to campaign again until the write completes. Raft's election timing only measures a leader's network liveness — a leader on a paused disk keeps heartbeating — so this is the bound that sheds it. `0` disables the watchdog and the candidacy gate. |
-| `CompactionLiveReplicaLagBudget` | `1000000` | Entries the leader retains below the compaction checkpoint for a live, acking follower that has not replicated them, so a follower behind by less than this is served by log backfill instead of a snapshot. Sized to cover a 30–60 s device pause under load. The leader sends the floor to its followers, which hold their own compaction at it, so the hold survives a leader change. A replica that has gone silent holds for `CompactionSilentPeerRetentionWindow`. `0` disables the hold. |
-| `WalStallWarnThreshold` | `500 ms` | Age past which a pending WAL write on any node is logged as a stall (one line on crossing, a reminder every 10 s, one line when it clears with the duration). The continuous signals are the `raft.wal.oldest_pending_write_age_ms` gauge and the `raft.wal.write_duration_ms` histogram. Every append ack also carries the follower's pending-write age and its *durable* commit frontier: a leader ships no entry-carrying backfill and starts no snapshot transfer to a peer reporting a stall at or above this age (`raft.backfill.wal_stall_pauses_total`, `raft.snapshot.transfers_deferred_wal_stall_total`), holds WAL retention at the peer's durable frontier within `CompactionLiveReplicaLagBudget` so the catch-up is served from the log once its disk answers, and a node refuses to open a snapshot session while its own disk is stalled (`raft.snapshot.installs_refused_wal_stall_total`). `0` disables the log lines only; the peer rules then use 500 ms. |
+| `WalStallStepDownTimeout` | `3 s` | How long a leader's WAL write can be unanswered by the storage engine before the leader steps down. `0` disables the watchdog and the candidacy gate. See [WAL Stall Handling](#wal-stall-handling). |
+| `CompactionLiveReplicaLagBudget` | `1000000` | Entries that the leader retains below the compaction checkpoint for a live follower that has not replicated them. A follower behind by less than this is served by log backfill. The default covers a 30–60 s device pause under load. The leader sends the floor to its followers, and the hold survives a leader change. A silent replica holds for `CompactionSilentPeerRetentionWindow`. `0` disables the hold. |
+| `WalStallWarnThreshold` | `500 ms` | Age past which a pending WAL write on any node is logged as a stall. `0` disables the log lines only. The peer rules then use 500 ms. See [WAL Stall Handling](#wal-stall-handling). |
 | `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
 | `WriteIOThreads` | `4` | Fair scheduler workers for synchronous WAL writes. |
-| `IdleWorkerMaxSpinBeforePark` | `20 µs` | Upper bound of how long one idle worker of the executor pool, the WAL write scheduler or the WAL read scheduler polls for work before it parks. Idle workers are parked and cost no CPU; this spin trades a little CPU for hand-offs with no kernel wake when work arrives in a fast stream. `Zero` turns it off. |
-| `BackfillThreshold` | `10` | How many entries a follower may lag before the leader engages backfill. Below this, the live replication path handles catch-up. |
-| `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round, bounding message size and keeping backfill fair to live traffic. |
-| `CompactEveryOperations` | `10000` | Successfully persisted commit/follower-append operations between automatic WAL compaction triggers per partition. Set to `0` or below to disable automatic compaction. |
+| `IdleWorkerMaxSpinBeforePark` | `20 µs` | Upper bound of how long one idle worker of the executor pool, the WAL write scheduler or the WAL read scheduler polls for work before it parks. The spin costs a little CPU and avoids a kernel wake when work arrives in a fast stream. `Zero` turns it off. |
+| `BackfillThreshold` | `10` | How many entries a follower may lag before the leader starts backfill. |
+| `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round. |
+| `CompactEveryOperations` | `10000` | Persisted commit/follower-append operations between automatic WAL compaction triggers per partition. `0` or below disables automatic compaction. |
 | `CompactNumberEntries` | `100` | Max entries removed per adapter compaction batch. Values below `1` are treated as `1`. |
 | `MaxEntriesPerCompaction` | `5000` | Upper bound on entries removed by one triggered compaction pass before yielding. Values below `CompactNumberEntries` are clamped up. |
 
+### WAL Stall Handling
+
+Election timing measures the network liveness of a leader only, and a leader on a paused disk can send heartbeats. `WalStallStepDownTimeout` is the bound that moves leadership off such a node.
+
+- A leader whose oldest WAL write is unanswered past the timeout steps down in the same term. Its waiting proposals fail at once, which lets callers re-route.
+- It notifies the most caught-up peer, and that peer's election starts within a round trip.
+- It does not campaign again until the write completes.
+
+Each append acknowledgement carries the follower's pending-write age and its durable commit frontier. When a peer's pending write reaches `WalStallWarnThreshold`, these rules apply.
+
+| Rule | Metric |
+| --- | --- |
+| The leader sends no entry-carrying backfill to the peer. | `raft.backfill.wal_stall_pauses_total` |
+| The leader starts no snapshot transfer to the peer. | `raft.snapshot.transfers_deferred_wal_stall_total` |
+| A node does not open a snapshot session while its local disk is stalled. | `raft.snapshot.installs_refused_wal_stall_total` |
+
+The leader also retains the WAL from the peer's durable frontier, within `CompactionLiveReplicaLagBudget`. The catch-up is then served from the log when the disk answers.
+
+A stall is logged when it crosses the threshold, every 10 s after that, and when it clears. The `raft.wal.oldest_pending_write_age_ms` gauge and the `raft.wal.write_duration_ms` histogram give the continuous signals.
+
+### gRPC Channels
+
+Each pooled channel has a separate TCP/HTTP2 connection. The effective concurrency per peer is approximately `GrpcChannelsPerNode × MaxConcurrentStreams`. Replication appends to a peer always use the first streaming call, which preserves their order. Other traffic is spread round-robin.
+
+A channel that spends 30 s in `TransientFailure` with no connect attempt (grpc-dotnet issue #2734) is disposed and rebuilt, and its streaming call re-opens on the new channel. `SharedChannels.GetChannelHealth(url)` shows this per peer. The metrics are the `raft.transport.channel_rebuilds_total` counter and the `raft.transport.channels_in_transient_failure` gauge.
+
 ## Replicating Logs
 
-Replicate a single entry:
+Call `ReplicateLogs` on the partition leader.
 
 ```csharp
 RaftReplicationResult result = await raft.ReplicateLogs(
@@ -462,7 +439,7 @@ RaftReplicationResult result = await raft.ReplicateLogs(
 );
 ```
 
-Replicate multiple entries in one proposal:
+You can replicate several entries in one proposal.
 
 ```csharp
 RaftReplicationResult result = await raft.ReplicateLogs(
@@ -473,7 +450,7 @@ RaftReplicationResult result = await raft.ReplicateLogs(
 );
 ```
 
-`RaftReplicationResult` contains:
+`ReplicateLogs` returns a `RaftReplicationResult`.
 
 | Property | Description |
 | --- | --- |
@@ -482,11 +459,11 @@ RaftReplicationResult result = await raft.ReplicateLogs(
 | `TicketId` | Hybrid logical clock timestamp that identifies the proposal. |
 | `LogIndex` | Last log index assigned to the proposal. |
 
-You may also replicate to the system partition (`0`) to co-locate consumer state with the partition map — useful for coordination data that must share a leader with partition lifecycle operations. The only restriction is the log `type`: `_RaftSystem` is reserved for Kommander, so `ReplicateLogs(0, "_RaftSystem", …)` throws a `RaftException`. Any other type is accepted and routed to the consumer callbacks.
+You can also replicate to the system partition (`0`), for example for coordination data that must share a leader with partition lifecycle operations. The `_RaftSystem` log type is reserved: `ReplicateLogs(0, "_RaftSystem", …)` throws a `RaftException`.
 
 ## Manual Commit And Rollback
 
-`ReplicateLogs` auto-commits by default. Set `autoCommit: false` to stop after quorum proposal completion, then commit or roll back explicitly:
+`ReplicateLogs` auto-commits by default. Set `autoCommit: false` to stop after the proposal reaches quorum, and then commit it with its ticket.
 
 ```csharp
 RaftReplicationResult proposal = await raft.ReplicateLogs(
@@ -504,7 +481,7 @@ if (proposal.Success)
 }
 ```
 
-Rollback uses the same ticket:
+A rollback uses the same ticket.
 
 ```csharp
 (bool rolledBack, RaftOperationStatus status, long rollbackLogId) =
@@ -513,13 +490,11 @@ Rollback uses the same ticket:
 
 ## Checkpoints
 
-Replicate a checkpoint for a user partition:
+A checkpoint marks the history that compaction can remove.
 
 ```csharp
 RaftReplicationResult checkpoint = await raft.ReplicateCheckpoint(1, cancellationToken);
 ```
-
-Checkpoint entries use `RaftLogType.ProposedCheckpoint`, `CommittedCheckpoint`, or `RolledBackCheckpoint` internally.
 
 ## Leadership APIs
 
@@ -533,8 +508,6 @@ string endpoint = await raft.WaitForLeader(1, cancellationToken);
 
 ## Operation Status Values
 
-`RaftOperationStatus` describes why an operation succeeded, failed, or is still in progress:
-
 | Status | Meaning |
 | --- | --- |
 | `Success` | Operation completed successfully. |
@@ -543,26 +516,24 @@ string endpoint = await raft.WaitForLeader(1, cancellationToken);
 | `LeaderInOldTerm` | A request came from a leader with an old term. |
 | `LeaderAlreadyElected` | A leader was already known for the term. |
 | `LogsFromAnotherLeader` | A follower received logs from a node other than the expected leader. |
-| `ActiveProposal` | Another proposal is still active. |
+| `ActiveProposal` | Another proposal is active. |
 | `ProposalNotFound` | The supplied proposal ticket was not found. |
 | `ProposalTimeout` | The proposal did not complete in time. |
 | `ReplicationFailed` | Replication failed before commit. |
 | `Pending` | Internal state used while asynchronous work is in progress. |
 | `LogMismatch` | A follower rejected a backfill batch because it does not hold the anchored preceding entry; the leader backtracks and retries lower. |
-| `SnapshotRequired` | Reserved for wire compatibility — never produced. The backfill→snapshot handoff happens internally on the leader; observe it via `GetSnapshotStatuses`. |
+| `SnapshotRequired` | Reserved for wire compatibility and not produced. To observe the snapshot handoff, use `GetSnapshotStatuses`. |
 
 ## Partition Routing
 
-Use partition helpers to map application keys to user partitions:
+The partition helpers map application keys to user partitions. They do not return `0`.
 
 ```csharp
 int partition = raft.GetPartitionKey("tenant-42/order-1001");
 int prefixPartition = raft.GetPrefixPartitionKey("tenant-42");
 ```
 
-`GetPartitionKey` uses the prefix before the last `/` separator. `GetPrefixPartitionKey` hashes the complete string provided.
-
-The partition helpers map keys onto user partitions only and never return `0`. You *can* replicate to partition `0` explicitly to co-locate consumer state with the system partition (see [Replicating Logs](#replicating-logs)); the only rejected write is the reserved `_RaftSystem` log type.
+`GetPartitionKey` uses the prefix before the last `/` separator. `GetPrefixPartitionKey` hashes the complete string.
 
 ## Events
 
@@ -592,11 +563,9 @@ raft.OnLeaderChanged += (partitionId, leaderEndpoint) =>
 };
 ```
 
-System partition events also exist on `RaftManager` for internal configuration replication, but they are not part of `IRaft`.
+The system partition events on `RaftManager` are for internal configuration replication and are not part of `IRaft`.
 
 ## WAL Adapters
-
-Kommander persists Raft logs through `IWAL`.
 
 | Adapter | Use case |
 | --- | --- |
@@ -606,45 +575,23 @@ Kommander persists Raft logs through `IWAL`.
 
 ### WAL Durability And Compaction
 
-RocksDB WAL keys include both partition id and log id, so partitions that share an internal RocksDB shard can safely store overlapping log indexes. This uses RocksDB WAL format `2.0.0`; existing RocksDB WAL directories from the old id-only key format must be recreated or migrated before opening them with this release.
+Acknowledged RocksDB writes use synchronous write options by default, and SQLite uses `PRAGMA synchronous=FULL`. You can construct both adapters with `syncWrites: false` for CI or benchmarks. Throughput improves, but a process or machine crash can lose acknowledged writes.
 
-Acknowledged RocksDB append writes use synchronous write options in both the single-entry and batched paths by default. SQLite uses `PRAGMA synchronous=FULL` for partition WAL databases by default. For CI or benchmark scenarios where crash durability is not being tested, both durable adapters can be constructed with `syncWrites: false`; this improves write throughput but acknowledged writes may be lost on process or machine crash.
+Automatic compaction starts for a partition after `CompactEveryOperations` persisted commit or follower-append operations. A pass removes entries below the last committed checkpoint in batches of `CompactNumberEntries`, up to `MaxEntriesPerCompaction`. If your application does not replicate checkpoints, compaction has little to remove.
 
-Automatic compaction runs per partition after `CompactEveryOperations` successfully persisted commit/follower-append operations. A pass reads the last committed checkpoint and removes entries with ids below that checkpoint in batches of `CompactNumberEntries`, capped by `MaxEntriesPerCompaction`. Compaction runs through the partition-aware read scheduler; adapter-level locks still serialize SQLite deletes with writes.
-
-Compaction only removes history older than the last committed checkpoint. If an application never replicates checkpoints, there is little or nothing eligible to compact.
-
-RocksDB:
+RocksDB WAL format `2.0.0` keys entries by partition id and log id. Directories from the older id-only format must be recreated or migrated.
 
 ```csharp
-IWAL wal = new RocksDbWAL("./data", "node-1", logger);
+IWAL rocksDb = new RocksDbWAL("./data", "node-1", logger);
+IWAL rocksDbNoSync = new RocksDbWAL("./data", "node-1", logger, syncWrites: false);
+
+IWAL sqlite = new SqliteWAL("./data", "node-1", logger);
+IWAL sqliteNoSync = new SqliteWAL("./data", "node-1", logger, syncWrites: false);
+
+IWAL memory = new InMemoryWAL(logger);
 ```
 
-RocksDB with fsync disabled for tests:
-
-```csharp
-IWAL wal = new RocksDbWAL("./data", "node-1", logger, syncWrites: false);
-```
-
-SQLite:
-
-```csharp
-IWAL wal = new SqliteWAL("./data", "node-1", logger);
-```
-
-SQLite with synchronous writes disabled for tests:
-
-```csharp
-IWAL wal = new SqliteWAL("./data", "node-1", logger, syncWrites: false);
-```
-
-In-memory:
-
-```csharp
-IWAL wal = new InMemoryWAL(logger);
-```
-
-Custom adapters implement:
+A custom adapter implements `IWAL`.
 
 ```csharp
 public interface IWAL : IDisposable
@@ -669,9 +616,7 @@ public interface IWAL : IDisposable
 }
 ```
 
-`IWAL` also declares `RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)` with a default
-implementation that forwards to the single-argument `Write`. Adapters that can distinguish a durable
-(fsync'd) write from a buffered one should override it; adapters that cannot may leave the default in place.
+`IWAL` also declares `RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)`, with a default implementation that forwards to the single-argument `Write`. Override it if your adapter can distinguish a durable (fsync'd) write from a buffered one.
 
 ## Communication Adapters
 
@@ -681,9 +626,7 @@ implementation that forwards to the single-argument `Write`. Adapters that can d
 | `RestCommunication` | Networked clusters using REST/JSON endpoints. |
 | `InMemoryCommunication` | Unit tests and in-process simulations. |
 
-For `RestCommunication`, configure `HttpScheme`, `HttpTimeout`, and `HttpVersion` on `RaftConfiguration`, and `TransportSecurity` for node authentication and certificate validation.
-
-Custom transports implement `ICommunication`.
+For `RestCommunication`, set `HttpScheme`, `HttpTimeout`, and `HttpVersion` on `RaftConfiguration`. Custom transports implement `ICommunication`.
 
 ## Discovery Adapters
 
@@ -693,9 +636,7 @@ Custom transports implement `ICommunication`.
 | `DynamicDiscovery` | Mutable in-memory node list controlled by the application. |
 | `MulticastDiscovery` | UDP multicast discovery on local networks. |
 
-`RedisDiscovery` is present in source as a placeholder and returns no nodes in this release. Do not use it for cluster formation.
-
-Custom discovery providers implement:
+`RedisDiscovery` is a placeholder in this release and returns no nodes. Do not use it. Custom discovery providers implement `IDiscovery`.
 
 ```csharp
 public interface IDiscovery
@@ -707,7 +648,7 @@ public interface IDiscovery
 
 ## Elastic Partitions
 
-Partitions can be created, split, merged, and removed at runtime without restarting any node. All lifecycle operations are serialized through the system partition and replicated to every node, so the partition map is always consistent and durable.
+Partition lifecycle operations do not need a restart. They are serialized through the system partition and replicated to all nodes.
 
 ```csharp
 // Create a new unrouted partition addressed by id directly.
@@ -728,9 +669,9 @@ RaftPartitionLifecycleResult merged = await raft.MergePartitionsAsync(
 RaftPartitionLifecycleResult removed = await raft.RemovePartitionAsync(partitionId: 10);
 ```
 
-All operations require the caller to be the leader of the relevant partition(s). Splits and merges use a two-phase commit so the hash ring is never incomplete during the transition. The system partition (`0`) is never a valid target — `CreatePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, and `RemovePartitionAsync` all reject it with a `RaftException`.
+The caller must be the leader of the relevant partitions. Splits and merges use a two-phase commit, and the hash ring is complete during the transition. All four methods throw a `RaftException` for the system partition (`0`).
 
-The **generation fence** protects writes during topology changes. Pass `expectedGeneration` to `ReplicateLogs` to detect when the partition a client cached has been split or merged:
+The **generation fence** protects writes during topology changes. Pass `expectedGeneration` to detect that the partition a client cached was split or merged.
 
 ```csharp
 long gen = raft.GetPartitionGeneration(partitionId);
@@ -747,7 +688,7 @@ if (result.Status == RaftOperationStatus.PartitionMoved)
 }
 ```
 
-The **term fence** protects writes whose preconditions were computed under a leadership that may have ended. Read the partition's term with `GetPartitionTerm` when the belief-only work starts (a staged intent, a lock check), and stamp the resulting write with `expectedTerm`. The executor refuses the write with `TermMismatch` **before anything is appended** when the node no longer serves in that term, so the answer is a definite "did not take effect":
+The **term fence** protects writes whose preconditions were computed under a leadership that may have ended. Read the term with `GetPartitionTerm` when that work starts, for example at a staged intent or a lock check, and stamp the write with `expectedTerm`. If the node no longer serves in that term, the write returns `TermMismatch` **before anything is appended**. The result is a definite "did not take effect".
 
 ```csharp
 long term = raft.GetPartitionTerm(partitionId); // -1 when this node does not host the partition
@@ -764,9 +705,9 @@ if (result.Status == RaftOperationStatus.TermMismatch)
 }
 ```
 
-`RaftProposalEntry.ExpectedTerm` applies the same fence to a `ReplicateEntries` batch (one mismatch refuses the whole batch). Subscribe to `OnLeadershipLost` to drop belief-only state the moment this node stops leading a partition; the event carries the term the node led in.
+`RaftProposalEntry.ExpectedTerm` applies the same fence to a `ReplicateEntries` batch. One mismatch refuses the entire batch. Subscribe to `OnLeadershipLost` to drop such state as soon as this node stops leading a partition. The event carries the term that the node led in.
 
-Subscribe to `OnPartitionMapChanged` to react to map updates without polling:
+Subscribe to `OnPartitionMapChanged` to receive map updates.
 
 ```csharp
 raft.OnPartitionMapChanged += snapshot =>
@@ -776,7 +717,7 @@ raft.OnPartitionMapChanged += snapshot =>
 };
 ```
 
-For large datasets, register a snapshot transfer implementation to copy state from source to target in one step instead of shipping individual log entries:
+A split moves no application data. You can register a snapshot transfer that copies the state from source to target once, on the coordinator node only. The application must bring the state to the other replicas.
 
 ```csharp
 raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
@@ -786,13 +727,13 @@ raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
 raft.RegisterPartitionStateTransfer(new MyPartitionStateTransfer());
 ```
 
-See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) for a full walkthrough of the two-phase protocols, crash recovery, routing, the generation fence, snapshot transfer, and how to extend the system.
+For more information, see the [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md).
 
 ## Dynamic Cluster Membership
 
-Nodes can join and leave a running cluster without a restart or an operator editing discovery. The authoritative voting roster is a committed, versioned record on the system partition (partition `0`) — it is changed only through Raft, never by a gossip message or a raw discovery snapshot — so every node agrees on exactly who can vote. A separate gossip + SWIM layer spreads the roster faster and detects dead nodes, but it is strictly advisory: only the system-partition leader, through a committed change, ever alters who counts toward quorum.
+Nodes can join and leave a running cluster. The voting roster is a committed, versioned record on the system partition, and it changes only through Raft. A gossip and SWIM layer spreads the roster faster and detects dead nodes, but it is advisory.
 
-A new node joins as a non-voting **learner**, receives replication to catch up, and is automatically promoted to **voter** once it is within `LearnerPromotionLag` entries of the committed log for `LearnerPromotionStableWindow`. Because learners never count toward quorum, adding a node can never stall commits.
+A new node joins as a non-voting **learner**. It becomes a **voter** when it is within `LearnerPromotionLag` entries of the committed log for `LearnerPromotionStableWindow`. Learners do not count toward quorum, and adding a node cannot stall commits.
 
 ```csharp
 // New node joins an existing cluster by contacting seed endpoints.
@@ -816,7 +757,7 @@ ClusterMemberRole role = raft.LocalRole;
 await raft.LeaveCluster(dispose: true);
 ```
 
-Subscribe to `OnMembershipChanged` to react to roster updates without polling. It fires in commit order on join, promotion, leave, and failure-driven eviction; use `MembershipVersion` as a monotonic sequence number:
+`OnMembershipChanged` fires in commit order on each roster change, including a failure-driven eviction. Use `MembershipVersion` as a monotonic sequence number.
 
 ```csharp
 raft.OnMembershipChanged += membership =>
@@ -826,22 +767,20 @@ raft.OnMembershipChanged += membership =>
 };
 ```
 
-Membership changes are single-server (one node added, promoted, or removed per committed step), so any two consecutive configurations always share a majority. A removal that would leave zero voters is refused with `InsufficientVoters`.
+Each committed step changes one node. A removal that would leave zero voters is refused with `InsufficientVoters`.
 
-> **Transport support:** the committed roster, joins, graceful leave, and cross-partition learner promotion all work on every transport (gRPC, REST, and in-memory), as do gossip dissemination and the SWIM failure detector. gRPC carries them over the `Gossip`, `Ping`, and `PingReq` RPCs; REST over `/v1/raft/gossip`, `/v1/raft/ping`, and `/v1/raft/ping-req`. The failure detector is **enabled by default** (`PingInterval` defaults to `1 s`); set `PingInterval` to `TimeSpan.Zero` to disable it, which is only valid when `EnableQuiescence` is `false`. See the developer guide's transport matrix for the current state.
+Membership and the failure detector work on all transports. The failure detector is enabled by default (`PingInterval` is `1 s`). To disable it, set `PingInterval` to `TimeSpan.Zero`, which is valid only if `EnableQuiescence` is `false`.
 
-See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) for the design motivations, the full lifecycle walkthroughs, the SWIM failure detector, configuration, the code map, an operations runbook, and the invariants to preserve when extending the system.
+For the lifecycle and an operations runbook, see the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 
 ## Log Catch-Up & Backfill
 
-A follower can fall behind its leader — it was slow, briefly partitioned, paused, or just joined. Kommander keeps it in sync through two distinct paths:
+Catch-up is automatic and uses two paths.
 
-- The **live path** broadcasts each new proposal/commit to followers that are keeping up. It is intentionally unanchored, so a transiently-behind follower never stalls a live proposal.
-- The **backfill path** engages once a follower lags by more than `BackfillThreshold`. The leader reads the missing range from its own log and ships it in bounded chunks (`MaxBackfillEntriesPerRound`), each **anchored** with the preceding entry's index and term. The follower enforces the Log Matching Property: it applies a chunk only if it already holds that anchor, otherwise it rejects with `LogMismatch` and the leader backtracks. This is what guarantees a follower's log never grows a gap or keeps a divergent tail.
+- The **live path** broadcasts each new proposal and commit. It is unanchored, and a follower that is briefly behind does not stall a live proposal.
+- The **backfill path** starts when a follower lags by more than `BackfillThreshold`. The leader sends the missing range in chunks of `MaxBackfillEntriesPerRound`, each **anchored** with the index and term of the preceding entry. A follower that does not hold the anchor answers `LogMismatch`, and the leader backtracks. A follower's log can therefore contain no gap and no divergent tail.
 
-If a follower needs entries the leader has already compacted away (below the **compaction floor**), backfill cannot help; the leader's heartbeat path detects the empty backfill read and hands off to snapshot install internally (no status crosses the wire for this). Failed snapshot transfers are retried with exponential backoff, and `raft.GetSnapshotStatuses(partitionId)` reports any follower whose snapshot keeps failing — including the permanent case where no snapshot transfer implementation is registered.
-
-Backfill is automatic and needs no application calls. You can observe how far a follower is behind:
+If the leader has compacted the entries that a follower needs, it installs a snapshot. Failed transfers are retried with exponential backoff. `raft.GetSnapshotStatuses(partitionId)` lists the followers whose snapshot fails repeatedly, including the permanent case where no snapshot transfer implementation is registered.
 
 ```csharp
 long? lag = await raft.GetFollowerLagAsync(partitionId: 1, followerEndpoint: "host2:8002");
@@ -852,17 +791,15 @@ if (progress is { WalStalled: false } && progress.EntriesBehind(raft.GetCommitIn
     // the follower can plausibly apply what was just committed
 ```
 
-`GetFollowerLagAsync` reports the follower's protocol commit frontier, which a follower advances for entries it has merely queued for its disk. `GetFollowerProgress` reports what its disk has actually written (the durable frontier) plus its pending-write age and stall flag, as carried in every acknowledgement — the evidence an application should use before waiting on a follower to apply something. It is `null` on a node that is not the partition's leader.
+`GetFollowerLagAsync` uses the follower's protocol commit frontier, which includes entries that are only queued for its disk. `GetFollowerProgress` uses what the disk has written, plus the pending-write age and the stall flag. Use `GetFollowerProgress` before you wait for a follower to apply something. It is `null` on a node that does not lead the partition.
 
-See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) for the full flows, the live-vs-backfill rationale, configuration tuning, the code map, and the invariants to preserve when extending it.
+For more information, see the [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md).
 
 ## Partition Quiescence
 
-Heartbeats in Kommander are per-partition: every leader periodically tells each follower "I'm still your leader of this partition." With many mostly-idle partitions, that steady-state cost grows as `O(nodes × partitions)` even when nothing is being written. **Quiescence** removes that waste.
+Heartbeats are per partition, and their cost grows as `O(nodes × partitions)` even when the cluster is idle. After an idle time of `QuiesceAfter`, the leader of a partition sends its followers one **quiesce marker** and stops the heartbeats. The followers then depend on the **SWIM failure detector**, which probes each node once for all of its partitions. They fail over on SWIM `Suspect`, after roughly one `PingInterval`.
 
-When a partition has had no writes for `QuiesceAfter` (default 1500 ms), its leader sends followers a one-time **quiesce marker** and then stops heartbeating that partition. Quiesced followers stop watching the per-partition election timer and instead rely on the cluster-wide **SWIM failure detector** — which already tracks "is that node alive?" once per node, independent of how many partitions it leads. The result is that idle partitions cost essentially nothing on the wire, while a genuinely dead leader is still detected promptly (followers fail over on SWIM `Suspect`, after roughly one `PingInterval`).
-
-Quiescence is transparent: any write instantly un-quiesces the partition and resumes normal replication and heartbeating. It is enabled by default and is a pure local optimization — it never changes elections, quorum, or the commit path.
+Any write wakes the partition. Quiescence is enabled by default and is a local optimization: it does not change quorum or the commit path.
 
 ```csharp
 RaftConfiguration config = new()
@@ -873,17 +810,17 @@ RaftConfiguration config = new()
 };
 ```
 
-Because quiesced followers depend on SWIM for failover, `RaftConfiguration.Validate()` (run at construction) requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` whenever quiescence is enabled; set `EnableQuiescence = false` to restore classic per-partition heartbeating.
+When quiescence is enabled, `RaftConfiguration.Validate()` requires `PingInterval > 0` and `PingInterval < StartElectionTimeout`.
 
-See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) for the quiesce/wake flows, the failover-timing rule, the code map, and the invariants to preserve when extending it.
+For more information, see the [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md).
 
 ## Leader Balancing
 
-Each partition elects its leader independently, with nothing coordinating *where* leaders land. Bad luck in election timing can leave one node holding most of the leaders — doing the heartbeat, replication, and commit work for all of them — while its peers sit nearly idle. Even when the *counts* are even, the **hot** partitions can cluster on one node. The **leader balancer** corrects both.
+Each partition elects its leader independently. Over time, one node can lead most partitions, or most of the busy ones. The **leader balancer** corrects both cases.
 
-The leader of the system partition acts as the controller. Every node periodically gossips an advisory **load report** of the partitions it leads and how busy each is (a smoothed throughput + queue-depth score). The controller reduces these into a global view and runs a two-tier plan: **count balance** first (drive each node toward the cluster average), then **load balance** (count-neutral hot/cold swaps when load is still skewed). Because only a partition's own leader can hand off its leadership, the controller does not transfer directly — it sends a **suggestion** to the current leader, which validates and performs the standard Raft handoff. Moves are throttled, gated by cooldowns and stability checks, and confirmed by observing the next round of reports, so the balancer is convergent and self-healing.
+The leader of the system partition is the controller. Nodes gossip a **load report** of the partitions they lead and a smoothed throughput and queue-depth score for each. The controller plans moves in two tiers: **count balance** toward the cluster average, then count-neutral **load balance** swaps. It sends a **suggestion** to the current leader, which validates it and performs the standard Raft handoff.
 
-It is **off by default** and purely advisory: a stale or dropped suggestion can only cause a wasted or skipped move, never an unsafe one, since every actual transfer is re-validated by the partition leader.
+The balancer is **off by default**. A stale or dropped suggestion can waste or skip a move and cannot affect safety.
 
 ```csharp
 RaftConfiguration config = new()
@@ -896,17 +833,15 @@ RaftConfiguration config = new()
 };
 ```
 
-Progress is observable via the `Kommander` meter: `raft.balancer.moves_total` (by outcome), `raft.balancer.skipped_passes_total`, and the `raft.balancer.count_imbalance` / `raft.balancer.load_imbalance` gauges (which trend toward zero as the cluster converges).
+The `Kommander` meter exposes `raft.balancer.moves_total` (by outcome), `raft.balancer.skipped_passes_total`, and the `raft.balancer.count_imbalance` and `raft.balancer.load_imbalance` gauges. The gauges trend toward zero as the cluster converges.
 
-See [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md) for the load score, the global view, the two-tier planner, the suggestion mechanism, the full configuration and metrics reference, the code map, and the invariants to preserve when extending it.
+For more information, see the [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md).
 
 ## Utilities
 
-Kommander also exposes a small set of utility APIs used by the library and available to callers.
-
 ### Hashing
 
-`HashUtils` provides xxHash-based helpers and jump consistent hashing:
+`HashUtils` provides xxHash-based helpers and jump consistent hashing.
 
 ```csharp
 int nodeId = HashUtils.SmallSimpleHash("node-1");
@@ -919,7 +854,7 @@ int consistent = HashUtils.ConsistentHash("tenant-42", numBuckets: 128);
 
 ### Hybrid Logical Clocks
 
-`HybridLogicalClock` and `HLCTimestamp` are used by proposals and exposed in replication results:
+Proposals use `HybridLogicalClock` and `HLCTimestamp`, and replication results expose them.
 
 ```csharp
 HybridLogicalClock clock = new();
@@ -928,7 +863,7 @@ HLCTimestamp timestamp = clock.SendOrLocalEvent(nodeId: 1);
 
 ### Parallelization Extensions
 
-`Kommander.Support.Parallelization` contains `ForEachAsync` extensions for `IEnumerable<T>`, `IAsyncEnumerable<T>`, `List<T>`, arrays, and `HashSet<T>`:
+`Kommander.Support.Parallelization` contains `ForEachAsync` extensions for `IEnumerable<T>`, `IAsyncEnumerable<T>`, `List<T>`, arrays, and `HashSet<T>`.
 
 ```csharp
 using Kommander.Support.Parallelization;
@@ -945,16 +880,7 @@ await items.ForEachAsync(maxDegreeOfParallelism: 8, async item =>
 
 ## ASP.NET Core Sample Server
 
-`Kommander.Server` is a runnable ASP.NET Core host that:
-
-- creates a `RaftManager`;
-- uses `StaticDiscovery`;
-- uses `RocksDbWAL`;
-- uses `GrpcCommunication`;
-- maps REST and gRPC Raft routes;
-- starts a background replication service.
-
-Important command-line options:
+`Kommander.Server` is a runnable ASP.NET Core host with `StaticDiscovery` and `GrpcCommunication`. It starts a background replication service. It maps the REST and gRPC Raft routes. It is a demonstration host and is not a complete production deployment template.
 
 | Option | Description |
 | --- | --- |
@@ -968,35 +894,31 @@ Important command-line options:
 | `--https-ports` | HTTPS ports to bind. |
 | `--https-certificate` | HTTPS certificate path. |
 | `--https-certificate-password` | HTTPS certificate password. |
-| `--wal-adapter` | Parsed option with default `rocksdb`; the current server construction path always creates `RocksDbWAL`. |
-| `--rocksdb-wal-path` | Parsed RocksDB WAL path option. Not used by the current server construction path. |
-| `--rocksdb-wal-revision` | Parsed RocksDB WAL revision option. Not used by the current server construction path. |
-| `--sqlite-wal-path` | WAL path currently passed to `RocksDbWAL`. |
-| `--sqlite-wal-revision` | WAL revision currently passed to `RocksDbWAL`. |
+| `--wal-adapter` | `rocksdb` (default) or `sqlite`. |
+| `--rocksdb-wal-path`, `--rocksdb-wal-revision` | RocksDB WAL location. |
+| `--sqlite-wal-path`, `--sqlite-wal-revision` | SQLite WAL location. |
 
-The current server construction path uses `RocksDbWAL` with the configured SQLite path/revision option names. Prefer constructing your own host if you need exact storage-option naming.
+If the path of the selected adapter is empty, the server uses the path and revision options of the other adapter and logs a warning.
 
 ## Testing
-
-Build:
 
 ```shell
 dotnet build Kommander.sln
 ```
 
-Run tests:
+The stress tests run heavier race scenarios and are excluded from the normal test lane.
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress"
 ```
 
-Cluster stress tests are kept available but are excluded from the normal test lane because they intentionally run heavier race scenarios:
+Run the stress tests with the category filter.
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=Stress"
 ```
 
-Useful focused slices:
+You can also run a focused slice.
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~TestSmallDictionary
@@ -1007,70 +929,64 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 
 ## Correctness Testing
 
-Unit and cluster tests check the paths that we expect. Kommander also uses three methods that search for the paths that we do not expect. Each method finds a different class of defect, and each one found real defects that the other two did not find.
+Three methods search for defects that unit and cluster tests do not expect.
 
-| Method | What it tests | Where it runs |
+| Method | What it tests | Where |
 | --- | --- | --- |
-| [Jepsen](#jepsen) | A real five-node cluster in Docker, from the outside, under injected faults. Checkers verify the history of client operations. | Separate repository, run on demand. |
-| [Deterministic Simulation Testing (DST)](#deterministic-simulation-testing-dst) | Real three-node clusters in one process, with simulated time, network, and disk. A seeded random search looks for states that break Raft. | A short smoke run on every push and pull request. The full search runs nightly. |
-| [TLA+](#tla) | A formal model of the commit and durability path. The TLC model checker explores every reachable state of a small configuration. | `formal/run-tlc.sh`. |
+| [Jepsen](#jepsen) | A real five-node cluster in Docker, from the outside, under injected faults. | Separate repository, on demand. |
+| [Deterministic Simulation Testing (DST)](#deterministic-simulation-testing-dst) | Real three-node clusters in one process, in a simulated environment. | A smoke run on each push and pull request. The full search is nightly. |
+| [TLA+](#tla) | A formal model of the commit and durability path. | `formal/run-tlc.sh`. |
 
 ### Jepsen
 
-[Jepsen](https://jepsen.io) runs a five-node Kommander cluster in Docker. A nemesis injects faults while clients send operations: network partitions, process kills, process pauses, membership removal and rejoin, and clock skew between nodes. Each client operation is recorded, and a checker then verifies the full history. Two workloads are available:
+[Jepsen](https://jepsen.io) sends client operations to a five-node cluster while a nemesis injects network partitions, process kills and pauses, membership changes, and clock skew. A checker then verifies the recorded history. The suite has two workloads.
 
 - **`register`:** linearizability of a compare-and-set register over a replicated key/value map, checked with Knossos.
-- **`log-append`:** the Raft Log Matching Property, checked directly. Replicas must agree, no acknowledged entry is lost, no entry is duplicated, and each entry is applied exactly once.
+- **`log-append`:** the Raft Log Matching Property. Replicas must agree, and each acknowledged entry must be applied exactly once.
 
-Kommander is a library, not a server. For this reason, the suite includes a small ASP.NET host that embeds `IRaft` and applies committed entries to a key/value map. The host references Kommander by project, so a run tests the code in your working tree, not the last NuGet package. Both the gRPC and the REST transports can be tested.
-
-The Jepsen suite is in a separate repository: **[kommander-jepsen](https://github.com/kahunakv/kommander-jepsen)**. Its `FINDINGS.md` lists each confirmed anomaly with a reproducer.
+The suite embeds `IRaft` in a small ASP.NET host that references Kommander by project, and a run tests the code in your working tree. It can test the gRPC and the REST transports. The suite and its `FINDINGS.md` are in the **[kommander-jepsen](https://github.com/kahunakv/kommander-jepsen)** repository.
 
 ### Deterministic Simulation Testing (DST)
 
-DST runs the real Kommander code in three-node clusters inside one test process. The test replaces only the environment: virtual time, a simulated transport, and a simulated WAL decorator. A seeded generator builds a plan of actions, such as client writes, link faults, crashes, restarts, pauses, slow or full disks, compaction, and hung snapshot transfers.
+DST runs the real Kommander code in a simulated environment, with virtual time, a simulated transport, and a simulated WAL decorator. A seeded generator builds a plan of actions such as client writes and crashes. The harness checks the cluster after each step.
 
-The harness checks the cluster after each step:
-
-- **Safety invariants:** for example, one leader per term, committed entries agree on every node, leader completeness, committed ids never move backwards, and compaction never removes an entry that a follower still needs.
+- **Safety invariants:** for example, one leader per term and agreement of committed entries.
 - **Liveness rules:** a connected majority must elect a reachable leader within a bound, and the cluster must converge after the faults heal.
-- **Client history:** a checker verifies that each acknowledged write survives and that reads are correct.
+- **Client history:** each acknowledged write survives, and reads are correct.
 
-A failure is reproducible. The run saves the plan of actions, and a replay of that plan executes the same actions in the same order. A shrinker reduces a failing plan to the few actions that cause the failure. A plan with a known cause goes into a regression folder and is replayed on each run from then on.
+A saved plan replays the same actions in the same order, and a shrinker reduces a failing plan to the few actions that cause the failure. Plans with a known cause go into a regression folder that is replayed on each run.
 
-The `DSTSmoke` category runs on every push and pull request. The `DSTRandom` search runs in the nightly GitHub Actions job (`.github/workflows/nightly-dst.yml`), which shrinks each failure that it finds and uploads the plans as artifacts.
+The nightly job (`.github/workflows/nightly-dst.yml`) runs the `DSTRandom` search and uploads the shrunk plans as artifacts.
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=DSTSmoke"
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=DSTRandom"
 ```
 
-See [Kommander.Tests/Simulation/README.md](Kommander.Tests/Simulation/README.md) for replay, shrinking, regression promotion, and how to read a failure.
+For replay and how to read a failure, see [Kommander.Tests/Simulation/README.md](Kommander.Tests/Simulation/README.md).
 
 ### TLA+
 
-The `formal/` folder holds [TLA+](https://lamport.azurewebsites.net/tla/tla.html) models of the commit and durability path of one partition. The model covers the write-ahead state of each replica, the WAL scheduler and its single-fsync rule, crashes and restore, compaction, and anchored backfill over a network that loses, duplicates, and reorders messages. The TLC model checker explores every reachable state of a small configuration and reports the first state that breaks a property. One example property: a frontier that a follower reports as durable always survives a crash.
+The `formal/` folder contains [TLA+](https://lamport.azurewebsites.net/tla/tla.html) models of the commit and durability path of one partition. They include the single-fsync rule, crash and restore, and anchored backfill over an unreliable network. The TLC model checker explores all reachable states of a small configuration and prints the first state that breaks a property.
 
-The model is connected to the code by **trace validation**. A DST run can record the write-ahead events of each node, and TLC replays that trace through the same model operators. Each frontier value that the code calculated must equal the value that the model calculates. If the code and the model drift apart, the trace check fails.
+**Trace validation** connects the model to the code. TLC replays the write-ahead events that a DST run recorded through the same model operators, and each frontier value must match.
 
-Each fixed defect also has a **control** configuration that turns that one defect back on. The control must fail. If a control passes, the model cannot see that defect.
+Each fixed defect has a **control** configuration that turns the defect back on. The control must fail, which shows that the model can see the defect.
 
 ```shell
 formal/run-tlc.sh                    # every config and every stored trace
 formal/run-tlc.sh --trace <dir|file> # validate traces recorded by a DST run
 ```
 
-TLC needs Java 11 or later. The script downloads a pinned `tla2tools.jar`. See [formal/README.md](formal/README.md) for the properties, the configurations, and the findings.
+TLC needs Java 11 or later. The script downloads a pinned `tla2tools.jar`. For the properties and the findings, see [formal/README.md](formal/README.md).
 
 ## Current Limitations
 
-- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `LocalRole`, `OnMembershipChanged`) on every transport, including graceful leave, cross-partition learner promotion, gossip dissemination, and the SWIM failure detector over gRPC/REST. See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
-- Partition `0` is the system partition: it cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved. Application data may still be co-located there using any other log type (see Concepts).
-- RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
-- WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.
-- The Nixie actor runtime has been removed from the production library. Existing code that passed an `ActorSystem` to `RaftManager` must use the new constructor shown above.
+- Partition `0` cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved.
+- RocksDB WAL format `2.0.0` is not compatible with the id-only keys of releases before `0.10.7`. Start with a fresh data directory or migrate existing keys.
+- WAL compaction is checkpoint-driven. Uncheckpointed history is retained.
+- The Nixie actor runtime has been removed. Code that passed an `ActorSystem` to `RaftManager` must use the constructor shown above.
 - `RedisDiscovery` is not implemented in this release.
-- The sample server is a demonstration host, not a complete production deployment template.
 
 ## Contributing
 

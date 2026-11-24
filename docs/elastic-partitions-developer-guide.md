@@ -1,11 +1,7 @@
 # Elastic Partitions — Developer Guide
 
-**Audience:** contributors new to Kommander who want to understand, extend, or debug
-the elastic partition system.
-
-**Scope:** everything from the core Raft data structures through the full lifecycle of
-a partition — creation, splitting, merging, and removal — including the coordinator
-internals, crash recovery, snapshot transfer, and the generation fence.
+This guide is for contributors who extend or debug elastic partitions. It covers the
+partition lifecycle and the coordinator behind it.
 
 ---
 
@@ -34,14 +30,9 @@ internals, crash recovery, snapshot transfer, and the generation fence.
 
 ## 1. Background: Raft Partitions
 
-Raft is a distributed consensus algorithm. A group of nodes (a "cluster") elect one
-**leader** and the rest are **followers**. The leader accepts writes, replicates them to
-followers via a **Write-Ahead Log (WAL)**, and only confirms a write to the caller once
-a majority of nodes have durably stored it.
-
-In Kommander, a **partition** is one independent Raft group. Each partition has its own
-leader, its own WAL, and its own set of replicated log entries. A cluster can run many
-partitions simultaneously — each partition is completely independent from the others.
+A **partition** is one independent Raft group with a leader, a write-ahead log (WAL), and a set of
+replicated entries. Nodes can lead different partitions, and writes to different partitions proceed
+in parallel.
 
 ```
 Cluster (3 nodes: A, B, C)
@@ -52,28 +43,19 @@ Cluster (3 nodes: A, B, C)
   WAL: [1,2,3,...]    WAL: [1,2,...]       WAL: [1,...]
 ```
 
-Partitions allow you to spread work across the cluster. If your cluster has 3 nodes and
-3 partitions, each node can be the leader for one partition, and writes to different
-partitions can proceed in parallel without one leader becoming a bottleneck.
-
 ---
 
 ## 2. Purpose of Elastic Partitions
 
-A static partition count means you have to guess up front how many partitions your
-workload needs. Elastic partitions let you change the partition count at runtime without
-restarting any node:
+You can change the partition count at runtime while all nodes remain in service.
 
-- **Create** a new partition on demand for a new workload segment.
-- **Split** an existing partition into two when it becomes a hotspot.
-- **Merge** two lightly-loaded partitions to reclaim resources.
-- **Remove** a partition that is no longer needed.
+- **Create** a partition for a new workload segment.
+- **Split** a hot partition into two.
+- **Merge** two lightly loaded partitions.
+- **Remove** a partition you no longer need.
 
-All of these operations are coordinated changes to the **partition map** — the
-cluster-wide description of which partition IDs exist, what hash ranges they cover, and
-what lifecycle state they are in. The map is itself stored in Raft (in the system
-partition) so every node eventually learns about every change, and the change is durable
-across crashes.
+Each operation changes the **partition map**, which lists the partition ids with their hash ranges
+and lifecycle states. The map is committed in the system partition's Raft log and survives crashes.
 
 ---
 
@@ -81,7 +63,7 @@ across crashes.
 
 ### `RaftPartitionRange`
 
-Every partition in the map is described by one `RaftPartitionRange` record:
+One `RaftPartitionRange` record describes one partition in the map.
 
 ```csharp
 public sealed class RaftPartitionRange
@@ -92,6 +74,8 @@ public sealed class RaftPartitionRange
     public long Generation { get; set; }      // incremented on every map mutation touching this entry
     public RaftPartitionState State { get; set; }       // lifecycle state
     public RaftRoutingMode    RoutingMode { get; set; } // how keys map to this partition
+    public List<RaftReplica>  Replicas { get; set; }    // hosting nodes; empty = full replication
+    public int ReplicationFactor { get; set; }          // voter target; 0 = RaftConfiguration value
 }
 ```
 
@@ -100,7 +84,7 @@ public sealed class RaftPartitionRange
 ```
 Active    — partition is live and accepting writes
 Splitting — Phase 1 of a split has committed; waiting for Phase 2
-Draining  — Phase 1 of a merge has committed; partition should reject new writes
+Draining  — Phase 1 of a merge has committed; waiting for Phase 2
 Removed   — partition has been logically deleted (tombstone; WAL may be reclaimed)
 ```
 
@@ -115,7 +99,7 @@ Unrouted  — partition exists but is never returned by GetPartitionKey(). Used 
 
 ### `RaftPartitionMap`
 
-The whole partition map is serialized as a single JSON object:
+The map is serialized as a single JSON object.
 
 ```csharp
 public sealed class RaftPartitionMap
@@ -125,45 +109,38 @@ public sealed class RaftPartitionMap
 }
 ```
 
-`MapVersion` starts at 1 and increments with every mutation. Nodes use it to detect
-stale in-memory copies.
+`MapVersion` starts at 1 and increments with each mutation. Nodes use it to detect stale in-memory
+copies.
 
 ### `Generation` on `RaftPartition`
 
-The live `RaftPartition` object (kept in memory by each node) also carries a
-`Generation` property. It is updated from the map entry every time `StartUserPartitions`
-runs. The executor thread reads `Generation` for the **generation fence** (see
-[Section 10](#10-the-generation-fence)). The field is backed by `Interlocked` operations
-to guarantee visibility across threads on ARM64 and other weakly-ordered architectures.
+The live `RaftPartition` object on each node also carries a `Generation`. `StartUserPartitions`
+updates it from the map entry, and the executor thread reads it for the
+[generation fence](#10-the-generation-fence). The backing field uses `Interlocked` operations,
+which makes the value visible across threads on weakly ordered architectures such as ARM64.
 
 ---
 
 ## 4. The System Partition
 
-Kommander reserves **partition id 0** as the **system partition**. It is an ordinary
-Raft group whose log carries configuration entries instead of application data. The
-partition map is one of those configuration entries, stored under the key
-`RaftSystemConfigKeys.Partitions` as a JSON-serialized `RaftPartitionMap`.
+**Partition id 0** is the **system partition**. Its Raft log carries configuration entries, and the
+partition map is one of them. The map is stored under the key `RaftSystemConfigKeys.Partitions` as a
+JSON-serialized `RaftPartitionMap`.
 
-When the leader receives a write to the partition map (split, merge, create, remove), it:
+The leader replicates a changed map as a `RaftSystemConfig` log entry in the system partition WAL
+and applies it locally after the entry is committed.
+[Section 14](#14-the-partition-map-serialization-and-versioning) shows the steps.
 
-1. Mutates the in-memory `RaftPartitionMap`.
-2. Serializes the updated map back to JSON.
-3. Replicates the JSON as a `RaftSystemConfig` log entry in the system partition WAL.
-4. Only after the entry is committed (majority of nodes have durably stored it) does it
-   apply the change locally.
-
-Followers receive the committed entry via the standard `OnReplicationReceived` callback
-path, deserialize the JSON, and call `StartUserPartitions` to apply it.
+Followers receive the committed entry through `OnReplicationReceived` and apply the map with
+`StartUserPartitions`.
 
 ---
 
 ## 5. The Coordinator: Single Consumer, All Map Mutations
 
-`RaftSystemCoordinator` owns a single-consumer, unbounded `Channel<RaftSystemRequest>`.
-Every partition map mutation — split, merge, create, remove — is serialized through this
-channel. The background loop (`RunAsync`) reads one message at a time and dispatches it
-to the appropriate handler.
+All map mutations go through an unbounded `Channel<RaftSystemRequest>` that `RaftSystemCoordinator`
+owns. The background loop (`RunAsync`) reads one message at a time and dispatches it to the
+matching handler.
 
 ```
 Any thread                      Coordinator loop (single consumer)
@@ -181,16 +158,12 @@ LeaderChanged event             Receive(LeaderChanged)
        .Send(request)
 ```
 
-Because the channel is single-consumer, there are no data races on the in-memory
-`_pendingSplits`, `_pendingMerges`, or `systemConfiguration` dictionaries. You do not
-need any locks inside the handler methods — the channel provides the serialization
-guarantee.
+The single consumer serializes access to the coordinator's dictionaries, such as `_pendingSplits`
+and `systemConfiguration`. Handlers need no locks.
 
-**Test hooks:** `ReplicateOverride`, `StartPartitionsOverride`, and
-`ReplicateCheckpointOverride` let unit tests inject fake implementations of replication
-and partition activation without running a real Raft cluster. All tests in
-`TestRaftSystemCoordinator`, `TestSplitPartition`, `TestMergePartition`, and
-`TestPartitionLifecycle` use these hooks.
+**Test hooks:** unit tests fake replication with `ReplicateOverride` and
+`ReplicateCheckpointOverride`, and partition activation with `StartPartitionsOverride`. They need no
+running cluster.
 
 ---
 
@@ -218,18 +191,12 @@ and partition activation without running a real Raft cluster. All tests in
                                              (tombstone + WAL reclaimed)
 ```
 
-**Splitting** involves two partitions at once: the source (shrunk to its left half) and
-the new target (owning the right half). Both enter `Splitting` after Phase 1 and both
-return to `Active` after Phase 2.
+**Draining** is the state of a merge source. Phase 1 bumps its generation, and a write that carries
+the earlier generation returns `PartitionMoved`. The survivor remains `Active`. In Phase 2 the
+source becomes `Removed` and the survivor absorbs its range.
 
-**Draining** is the merge source. It should reject new writes (enforced by the executor
-reading `partition.State == Draining` and returning `PartitionMoved`). The survivor
-stays `Active` throughout. After Phase 2 the source becomes `Removed` and the survivor
-absorbs its range.
-
-**Removed** is a tombstone. It is never re-created in the `Partitions` dictionary — 
-`StartUserPartitions` skips `Removed` entries. The tombstone stays in the serialized
-map so nodes that missed Phase 2 can re-run WAL reclamation on restart.
+**Removed** is a tombstone that `StartUserPartitions` skips. The tombstone remains in the serialized
+map, which lets a node that missed Phase 2 re-run WAL reclamation on restart.
 
 ---
 
@@ -237,70 +204,63 @@ map so nodes that missed Phase 2 can re-run WAL reclamation on restart.
 
 ### Creating
 
-`CreatePartitionAsync(partitionId, mode, hashRange, ct)` — leader only.
+`CreatePartitionAsync(partitionId, mode, hashRange, ct)` is leader only. `HashRange` mode requires a
+`(start, end)` range. In `Unrouted` mode the range is ignored.
 
-The caller specifies an explicit partition id and routing mode. For `HashRange` mode a
-`(start, end)` range is required; for `Unrouted` mode the range is ignored.
+The coordinator checks these guards before it writes.
 
-**Guards checked by the coordinator before writing:**
+- The system partition map exists.
+- The partition id is not in the map. An id that is already `Active` returns success (idempotent).
+- The partition id is above the map's `HighestPartitionIdEver`, the highest id ever handed out. An
+  id whose tombstone is missing is therefore also refused.
+- For `HashRange`, `start <= end`.
+- For `HashRange`, the range does not overlap an existing `HashRange` entry.
+- When `RaftConfiguration.MaxPartitions` > 0, the partition count is below the bound.
 
-- The system partition map must already exist.
-- The partition id must not already appear in the map (unless it is `Active` — idempotent
-  return in that case).
-- The partition id must be above the map's `HighestPartitionIdEver`. The map records the
-  highest id it ever handed out, so an id whose tombstone is missing is still refused.
-- For `HashRange`, `start <= end` (no inverted ranges).
-- For `HashRange`, the new range must not overlap any existing `HashRange` entry.
-- When `RaftConfiguration.MaxPartitions` > 0, the map must hold fewer partitions than the bound
-  (see below).
-
-On success the coordinator appends the new entry with `Generation = 1`, `State = Active`,
-replicates, updates `systemConfiguration`, calls `StartPartitions`, and resolves the
-caller's `TaskCompletionSource`.
+On success the coordinator appends the entry with `Generation = 1` and `State = Active`, and
+continues with the steps in [section 14](#14-the-partition-map-serialization-and-versioning).
 
 ### The partition-count bound
 
-Every partition costs each replica that hosts it a WAL, elections, heartbeats, check-quorum,
-snapshot and checkpoint work, and file handles. `RaftConfiguration.MaxPartitions` (default `0`,
-no bound) caps how many data partitions the committed map may hold:
+Each partition costs its replicas resources such as a WAL and file handles.
+`RaftConfiguration.MaxPartitions` (default `0`, no bound) caps how many data partitions the
+committed map may hold.
 
-- The count covers every entry that is not `Removed`, excluding the system partition. `Splitting`
-  and `Draining` entries count, because they still hold resources.
+- The count covers all entries that are not `Removed`, excluding the system partition. `Splitting`
+  and `Draining` entries count.
 - At the bound, `CreatePartitionAsync` and `SplitPartitionAsync` answer
-  `RaftOperationStatus.PartitionLimitReached` with `Success = false`. The check runs on the
-  coordinator, after the request is validated and before the map changes: nothing is proposed,
-  the map version stays, and `HighestPartitionIdEver` does not advance, so the same id is usable
-  once a slot frees.
-- A create of an id that is already `Active` stays idempotent at the bound, because it adds
-  nothing. A removal or a merge frees a slot.
-- The bootstrap layout is never refused at run time. `Validate()` refuses an
-  `InitialPartitions` above the bound at startup instead.
-- The bound is per cluster. Only the system-partition leader checks it, so configure the same
-  value on every node: a leader change otherwise changes the effective bound.
+  `RaftOperationStatus.PartitionLimitReached` with `Success = false`. The check comes after the
+  request is validated and before the map changes. The map version and `HighestPartitionIdEver` do
+  not advance, and the same id is usable once a slot frees.
+- A create of an id that is already `Active` succeeds at the bound. A removal or a merge frees a
+  slot.
+- The bound does not apply to the bootstrap layout at run time. An `InitialPartitions` above it
+  fails `Validate()` at startup.
+- The bound is per cluster and the system-partition leader checks it. Configure the same value on
+  all nodes, or a leader change will change the effective bound.
 - Each refusal is counted in `raft.partitions.create_refused_total{path="create"|"split"}`. The
-  first refusal of an episode logs a warning; the episode ends when a later check finds room.
+  first refusal of an episode logs a warning. The episode ends when a later check finds room.
 
 ### Removing
 
-`RemovePartitionAsync(partitionId, ct)` — leader only (requires leadership of the system
-partition).
-
-**Guards:**
+`RemovePartitionAsync(partitionId, ct)` requires leadership of the system partition.
 
 - The partition must exist in the map.
-- If already `Removed` — idempotent: re-attempt WAL reclamation and return `Success`.
-- If `Splitting` or `Draining` — rejected with `Errored`. The caller must complete or
-  abort the pending phase before removing.
+- An entry that is already `Removed` is idempotent: WAL reclamation is attempted again and the call
+  returns `Success`.
+- A `Splitting` or `Draining` entry returns `Errored`. Complete or abort the pending phase first.
 
-On success the coordinator marks the entry `Removed`, bumps `Generation`, replicates,
-drains and stops the live `RaftPartition` object, evicts it from `manager.Partitions`,
-reclaims the WAL via `DeletePartitionWAL`, and then calls `StartPartitions` so the
-leader fires `OnPartitionMapChanged` (matching the contract followers already satisfy
-via `ConfigReplicated`).
+On success the coordinator takes these steps.
+
+1. Mark the entry `Removed` and bump `Generation`, then replicate.
+2. Drain and stop the live `RaftPartition`, and evict it from `manager.Partitions`.
+3. Reclaim the WAL with `DeletePartitionWAL`.
+4. Call `StartPartitions`, which fires `OnPartitionMapChanged` on the leader. Followers fire it
+   through `ConfigReplicated`.
 
 ### WAL Reclamation
 
-`IWAL.DeletePartitionWAL(partitionId)` is implemented by all three WAL adapters:
+`IWAL.DeletePartitionWAL(partitionId)` has one implementation per WAL adapter.
 
 | Adapter       | Implementation |
 |---------------|----------------|
@@ -308,23 +268,18 @@ via `ConfigReplicated`).
 | `SqliteWAL`   | `DELETE FROM logs WHERE partitionId = @id`; skips opening the DB file if it does not exist; closes and evicts the connection after deletion |
 | `RocksDbWAL`  | Iterator scan + `WriteBatch` delete of all keys with the partition prefix |
 
-All three are idempotent: calling `DeletePartitionWAL` on an already-reclaimed partition
-returns `Success` without error.
+All three are idempotent and return `Success` for a partition that is already reclaimed.
 
 ---
 
 ## 8. Splitting a Partition (Two-Phase Protocol)
 
-Splitting is the most complex operation. It uses a **two-phase commit** to ensure the
-cluster never enters a state where the same key range is owned by zero partitions or by
-two partitions simultaneously.
+A split is a **two-phase commit**. At no point is a key range owned by zero partitions or by two.
 
 ### Reason for Two Phases
 
-If the leader shrank partition 1 and created partition 2 in a single atomic step,
-a crash between the two writes would leave the cluster with a gap in the hash ring.
-Two-phase commit makes the intermediate state explicit: while both partitions are in
-`Splitting`, the cluster knows a split is in progress and can resume it on restart.
+While both partitions are `Splitting`, the committed map records that a split is in progress. After
+a crash, the cluster resumes it from that record.
 
 ### Phase 1 — Mark Both Splitting, Replicate
 
@@ -362,10 +317,8 @@ Leader calls SplitPartitionAsync(sourceId=1, plan)
           AutoCommit=true? → enqueue SplitPartitionCommit
 ```
 
-After Phase 1, every node knows about both partitions in `Splitting` state. The source's
-hash range has been shrunk; the target owns the right half. But both are marked
-`Splitting` — routing still works (keys hash to the right partition) but the application
-knows data movement is in progress.
+After Phase 1 keys already hash to the right partition. The `Splitting` state tells the application
+that data movement is in progress.
 
 ### Phase 2 — Commit Both to Active
 
@@ -391,32 +344,20 @@ Coordinator receives SplitPartitionCommit(sourceId)
 
 ### Guard: State Checks Prevent Double-Execution
 
-Before Phase 1: if the source is already `Splitting`, the request is rejected with
-`Errored` (duplicate split prevention).
-
-Before Phase 2: if either source or target is not in `Splitting` state, Phase 2 is
-rejected. This prevents double-execution in the crash-recovery path.
+- **Phase 1:** a source that is already `Splitting` returns `Errored`, which prevents a duplicate
+  split.
+- **Phase 2:** the commit is rejected unless both source and target are `Splitting`, which prevents
+  double execution in the crash-recovery path.
 
 ### Non-AutoCommit Path
 
-When `AutoCommit = false` the caller controls when Phase 2 runs. This allows the
-application to do work between phases — for example, copy data from the source to the
-target before committing. The caller later triggers Phase 2 by:
-
-```csharp
-// Phase 2 is enqueued by re-using the same mechanism internally.
-// In the current API, AutoCommit=false means the coordinator waits for
-// TrySplitPartitionCommit to be sent, which happens via crash recovery or a future
-// explicit commit API.
-```
-
-In practice, `SplitPartitionAsync` always sets `AutoCommit = true`. The `AutoCommit =
-false` path is used internally by tests and the snapshot transfer path to control
-sequencing.
+`SplitPartitionAsync` always sets `AutoCommit = true`. `AutoCommit = false` is used internally by
+tests and the snapshot transfer path to control sequencing. In that case Phase 2 waits
+for `TrySplitPartitionCommit`, which crash recovery can send. There is no public commit API.
 
 ### Split Boundary Rules (HashRange)
 
-For `HashRange` splits:
+A `HashRange` split uses these bounds.
 
 ```
 Source owns [S, E].
@@ -427,35 +368,29 @@ Source after split:  [S, B-1]
 Target after split:  [B,   E]
 ```
 
-If no boundary is provided the coordinator uses the midpoint:
-`B = S + (E - S) / 2`
-
-A range of size 1 (`S == E`) cannot be split — the midpoint equals `S`, which fails the
-`B > S` check.
+If the caller gives no boundary, the coordinator uses the midpoint `B = S + (E - S) / 2`. A range of
+size 1 (`S == E`) cannot be split. Its midpoint equals `S`, which fails the `B > S` check.
 
 ### Unrouted Splits
 
-An `Unrouted` split creates a second partition that also has no hash range. Both source
-and target have `StartRange = EndRange = 0` and `RoutingMode = Unrouted`. Neither
-appears in `GetPartitionKey` results. The application addresses them by partition id.
+In an `Unrouted` split, source and target both have `StartRange = EndRange = 0` and
+`RoutingMode = Unrouted`. The application addresses them by partition id.
 
 ---
 
 ## 9. Merging Partitions (Two-Phase Protocol)
 
-Merging absorbs a **source** partition into a **survivor** partition. The survivor's
-hash range is extended to cover the source's former range; the source is removed.
+A merge extends the **survivor**'s hash range over the **source**'s range and removes the source. It
+deletes the source WAL and moves no application state. Move that state before you merge.
 
 ### Pre-conditions
 
-- Both partitions must be `Active`.
-- Both must share the same `RoutingMode` (you cannot merge a `HashRange` partition into
-  an `Unrouted` one).
-- For `HashRange`, they must be **adjacent**: `source.EndRange + 1 == survivor.StartRange`
-  or `survivor.EndRange + 1 == source.StartRange`. Non-adjacent merges would leave a gap
-  in the hash ring.
-- The caller must be leader of **both** partitions. (`MergePartitionsAsync` checks both
-  before enqueuing.)
+- Both partitions are `Active` and share the same `RoutingMode`.
+- For `HashRange`, they are **adjacent**: `source.EndRange + 1 == survivor.StartRange` or
+  `survivor.EndRange + 1 == source.StartRange`. A non-adjacent merge would leave a gap in the hash
+  ring.
+- The caller is leader of **both** partitions. `MergePartitionsAsync` checks this before it enqueues
+  the request.
 
 ### Phase 1 — Mark Source Draining
 
@@ -479,9 +414,9 @@ Leader calls MergePartitionsAsync(survivorId, sourceId)
     Auto-enqueue MergePartitionCommit
 ```
 
-A `Draining` partition rejects new write proposals with `PartitionMoved`. Existing
-committed entries are still readable. In-flight proposals from before Phase 1 will
-either commit normally or time out.
+A write with the pre-merge `expectedGeneration` returns `PartitionMoved` from this point. A write
+with the fence disabled is not rejected. Committed entries remain readable, and proposals in flight
+from before Phase 1 either commit or time out.
 
 ### Phase 2 — Absorb and Remove
 
@@ -516,13 +451,12 @@ Coordinator receives MergePartitionCommit(sourceId)
 
 ## 10. The Generation Fence
 
-The **generation fence** protects against write-after-move: a client that cached a
-partition id before a split or merge should not silently write to the wrong partition
-after the map has changed.
+The **generation fence** protects against write-after-move, where a client that cached a partition
+id before a split or merge writes to the wrong partition.
 
 ### How It Works
 
-Every `ReplicateLogs` call accepts an optional `expectedGeneration` parameter:
+`ReplicateLogs` takes an optional `expectedGeneration`.
 
 ```csharp
 await raft.ReplicateLogs(
@@ -532,9 +466,8 @@ await raft.ReplicateLogs(
     expectedGeneration:  capturedGeneration);  // 0 = disabled
 ```
 
-When non-zero, the executor checks the live `partition.Generation` value before batching
-the log entry. If the live generation no longer matches, the call returns
-`PartitionMoved` immediately without touching the WAL.
+When the value is non-zero, the executor compares it with the live `partition.Generation` before it
+batches the entry. On a mismatch the call returns `PartitionMoved` and the WAL is not touched.
 
 ```
 Caller read generation=5 for partition 2
@@ -547,31 +480,27 @@ Caller calls ReplicateLogs(partitionId=2, expectedGeneration=5)
         Executor: 5 != 6 → return PartitionMoved
 ```
 
-The check happens **inside the executor**, on the executor's thread under the serialized
-drain cycle. This avoids the TOCTOU race that would exist
-if the caller checked `GetPartitionGeneration()` in application code and then called
-`ReplicateLogs` separately.
-
-The check runs in the single-item path and in `ExecuteBatchAsync` (the batching path that
-groups consecutive `ReplicateLogs` calls before a single WAL flush).
+The check executes on the executor thread, in the serialized drain cycle, for single items and in
+`ExecuteBatchAsync`. A check in application code, with `GetPartitionGeneration()` before
+`ReplicateLogs`, would have a time-of-check race.
 
 ### `GetPartitionGeneration(partitionId)`
 
-Returns the live in-memory generation for a partition. Returns 0 if the partition does
-not exist. Applications read this before initiating a batch of writes, capture it, and
-pass it as `expectedGeneration` to each write. If any write returns `PartitionMoved`,
-the client re-reads the partition map, finds the new partition(s), and retries.
+Returns the live in-memory generation of a partition, or 0 if the partition does not exist. Read it
+before a batch of writes and pass it as `expectedGeneration` to each write. On `PartitionMoved`,
+re-read the partition map to find the new partition and retry.
 
 ---
 
 ## 11. Snapshot Transfer During Split
 
-By default, after a split the application is responsible for moving data from the source
-partition to the target partition via normal `ReplicateLogs` calls (the *log-shipping*
-path). For large datasets this can be slow.
+A split moves no application data. By default the application moves the data from the source to the
+target with `ReplicateLogs` calls (the *log-shipping* path). The **snapshot transfer** path exports
+the range and imports it once, **on the coordinator node only**. To use it, implement
+`IRaftStateMachineTransfer` and call `RegisterStateMachineTransfer`.
 
-An application can register a faster path — **snapshot transfer** — by implementing
-`IRaftStateMachineTransfer` and calling `RegisterStateMachineTransfer`.
+The other replicas of the target partition do not receive the imported data. The application must
+bring the state to them.
 
 ### The Interface
 
@@ -591,11 +520,10 @@ public interface IRaftStateMachineTransfer
 ```
 
 > **Also outside splits:** when a follower falls below the leader's WAL compaction floor and no
-> `IRaftPartitionStateTransfer` is registered, the catch-up path also calls `ExportRange` with a
+> `IRaftPartitionStateTransfer` is registered, the catch-up path calls `ExportRange` with a
 > *boundless* plan (only `TargetPartitionId` set, meaning "the entire partition") and installs it
-> on the follower via `ImportRange`. If your range transfer cannot serve whole-partition exports,
-> register `IRaftPartitionStateTransfer` (see the replica placement guide) — the catch-up path
-> prefers it and then never touches this interface.
+> with `ImportRange`. If your range transfer cannot serve exports of the entire partition, register
+> `IRaftPartitionStateTransfer` (see the replica placement guide). The catch-up path prefers it.
 
 ### Transfer Sequence (runs between Phase 1 and Phase 2)
 
@@ -606,60 +534,58 @@ Phase 1 committed
          ▼
   RunSnapshotTransferAsync
          │
-  ExportRange(plan, snapshotIndex) ─── failure? ──► return (log-shipping fallback)
+  ExportRange(plan, snapshotIndex) ─── failure? ──► return ExportFailed
          │
          ▼
-  ImportRange(targetId, snapshot)  ─── failure? ──► return (log-shipping fallback)
+  ImportRange(targetId, snapshot)  ─── failure? ──► return ImportFailed
          │
          ▼
   ReplicateCheckpoint(targetId)    ─── failure? ──► retry once
          │                                │
-         ▼                         failure again? LogError, split continues
+         ▼                         failure again? LogError, return CheckpointFailed
   checkpoint committed to target WAL
-  all target replicas converge on the snapshot state
+  return Completed (state imported on the coordinator node only)
          │
          ▼
   Phase 2 (AutoCommit path): both Active
 ```
 
-**Why the checkpoint?** The snapshot was applied locally on the leader's state machine.
-Without replicating a checkpoint entry into the target partition's WAL, follower replicas
-of the target would have an empty state machine with no log entries to replay. The
-checkpoint is the mechanism that makes the snapshot visible to all replicas.
+The coordinator node does not have to lead the target partition. The checkpoint entry carries no
+application state.
 
-**Error semantics:**
+**Outcome.** A failed transfer does not fail the split, and Phase 2 completes in all cases. Read
+`RaftPartitionLifecycleResult.StateTransfer`, and move the state yourself when it is not `Completed`.
 
-| Step | Failure effect |
+| `RaftStateTransferOutcome` | Meaning |
 |------|----------------|
-| `ExportRange` throws | Transfer aborted, fallback to log-shipping. Phase 2 still completes. |
-| `ImportRange` throws | Transfer aborted, **checkpoint is not attempted** (nothing was imported). Fallback to log-shipping. |
-| Checkpoint fails | Retried once. Second failure logs a critical error: target replicas are diverged. Split still completes (but target data is inconsistent on followers). |
+| `NotAttempted` | The operation is not a split, or no implementation is registered on the coordinator node. |
+| `Completed` | The coordinator node imported the range, and the checkpoint on the target committed. |
+| `ExportFailed` | `ExportRange` threw. Nothing was imported. |
+| `ImportFailed` | `ImportRange` threw, and **the checkpoint is not attempted**. The import may be partial if the implementation is not atomic. |
+| `CheckpointFailed` | The import finished, but the checkpoint failed twice, for example because the coordinator node does not lead the target. An error is logged. |
 
-**Thread safety:** `RegisterStateMachineTransfer` uses `Volatile.Write`; the coordinator
-reads it with `Volatile.Read` via the `StateMachineTransfer` property. This guarantees
-visibility across threads on all architectures.
+**Thread safety:** `RegisterStateMachineTransfer` uses `Volatile.Write`, and the coordinator reads
+the `StateMachineTransfer` property with `Volatile.Read`.
 
-**Idempotency requirement:** `ImportRange` must be idempotent because in a future retry
-scenario (e.g., an extended retry on checkpoint failure) the coordinator may re-export
-and re-import. Applying the same snapshot twice must produce the same final state.
+**Idempotency:** `ImportRange` must be idempotent. A later retry can export and import the same
+snapshot again, and the final state must be the same.
 
 ### Registering the Transfer Implementation
 
 ```csharp
 raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
 
-// Deregister (revert to log-shipping):
+// Deregister:
 raft.RegisterStateMachineTransfer(null);
 ```
 
-Registration is **not replicated** — each node must register independently, typically at
-startup before `JoinCluster()`.
+Registration is **not replicated**. Register on each node at startup, before `JoinCluster()`.
 
 ---
 
 ## 12. Key-to-Partition Routing
 
-Two routing methods exist for application code:
+Application code has two routing methods.
 
 ```csharp
 // Route by the full key (uses InversePrefixedStaticHash internally)
@@ -669,45 +595,41 @@ int partitionId = raft.GetPartitionKey("orders/12345");
 int partitionId = raft.GetPrefixPartitionKey("tenant/acme");
 ```
 
-Both methods scan the live `partitions` dictionary and return the first `HashRange`
-partition whose `[StartRange, EndRange]` interval contains the hash of the key.
+Both methods return the `HashRange` partition whose `[StartRange, EndRange]` interval contains the
+hash of the key. They search the committed map, which also covers partitions that this node does
+not host. A node that has not applied a committed map searches its hosted partitions.
 
-**`Unrouted` partitions are never returned.** An application that creates an `Unrouted`
-partition addresses it directly by its id.
+`Unrouted` partitions are not returned. Address them by id.
 
-**What if no partition covers the hash?** Both methods throw `RaftException`. This should
-not happen in a correctly maintained cluster (the initial `DivideIntoRanges` guarantees
-full coverage of `[0, int.MaxValue]`), but can happen if all partitions are `Unrouted` or
-the map is in a partially-applied state.
+Both methods throw `RaftException` when no partition covers the hash. This can happen if
+all partitions are `Unrouted` or the map is partially applied. The initial `DivideIntoRanges` covers
+all of `[0, int.MaxValue]`.
 
-**During a split:** both the (shrunk) source and the (new) target are immediately visible
-after Phase 1 and `StartUserPartitions` runs. Keys that previously hashed into the right
-half of the source's range now hash into the target. Routing is correct throughout,
-including during the `Splitting` intermediate state.
+Routing is correct throughout a split. As soon as Phase 1 is applied, keys in the right half of the
+source's range hash to the target.
 
 ---
 
 ## 13. Crash Recovery
 
-The system partition WAL is replayed on every node restart. After replay the coordinator
-has `systemConfiguration` populated with the last committed partition map. Crash recovery
-detects and resumes any two-phase operations that were interrupted.
+System partition replay populates `systemConfiguration` with the last committed map. Crash recovery
+then resumes the two-phase operations that were interrupted.
 
 ### Recovery Trigger
 
-`RestoreCompleted` is the signal that WAL replay has finished. The coordinator calls
-`InitializePartitions(crashRecovery: true)`, which:
+`RestoreCompleted` signals that WAL replay has finished. The coordinator then calls
+`InitializePartitions(crashRecovery: true)`, which takes three steps.
 
-1. Calls `StartPartitions` to apply the current map to live `RaftPartition` objects.
-2. Reclaims WAL for any `Removed` tombstones (in case the previous node crashed before
-   `DeletePartitionWAL` ran).
-3. Scans for incomplete splits (`Splitting` pairs) and incomplete merges (`Draining`
-   entries) and re-enqueues their Phase 2 commits.
+1. Call `StartPartitions` to apply the current map to live `RaftPartition` objects.
+2. Reclaim the WAL of `Removed` tombstones, in case the node crashed before `DeletePartitionWAL`
+   ran.
+3. Find incomplete splits (`Splitting` pairs) and incomplete merges (`Draining` entries), and
+   re-enqueue their Phase 2 commits.
 
 ### Incomplete Split Recovery
 
-A split is incomplete if both a source and target partition are still in `Splitting`
-state. The coordinator re-enqueues `SplitPartitionCommit` for the source:
+A split is incomplete if a source and target are both in `Splitting`. The coordinator re-enqueues
+`SplitPartitionCommit` for the source.
 
 ```
 Map after crash:
@@ -722,14 +644,13 @@ Recovery:
   → TrySplitPartitionCommit runs → both become Active
 ```
 
-For `Unrouted` splits both partitions have `StartRange = EndRange = 0` so range adjacency
-cannot be used. Recovery matches by routing mode instead (any other `Splitting Unrouted`
-entry is the source's target).
+In an `Unrouted` split both partitions have `StartRange = EndRange = 0`, and adjacency cannot
+identify the pair. Recovery matches any other `Splitting Unrouted` entry as the source.
 
 ### Incomplete Merge Recovery
 
-A merge is incomplete if a `Draining` partition has no `_pendingMerges` entry. The
-coordinator finds the adjacent `Active` survivor and re-enqueues `MergePartitionCommit`:
+A merge is incomplete if a `Draining` partition has no `_pendingMerges` entry. The coordinator
+finds the adjacent `Active` survivor and re-enqueues `MergePartitionCommit`.
 
 ```
 Map after crash:
@@ -743,38 +664,31 @@ Recovery:
   → TryMergePartitionCommit runs → P2 absorbs [0,499], P1 becomes Removed
 ```
 
-**Known limitation (Unrouted merge):** with multiple `Active Unrouted` partitions, the
-survivor is identified by `FirstOrDefault` in list order, which may differ from the
-original intent before the crash. The correct fix is to store the survivor's id on the
-`Draining` entry itself (a `MergeSurvivorId` field on `RaftPartitionRange`). Until that
-field exists, `Unrouted` merge crash recovery is best-effort for multi-partition
-scenarios.
+**Known limitation (Unrouted merge):** with more than one `Active Unrouted` partition, recovery
+takes the first one in list order (`FirstOrDefault`), which can differ from the survivor chosen
+before the crash. `Unrouted` merge recovery is best-effort until the `Draining` entry records its
+survivor (a `MergeSurvivorId` field on `RaftPartitionRange`).
 
 ### Cases Without Crash Recovery
 
-`InitializePartitions(crashRecovery: false)` is passed in two cases:
+`InitializePartitions(crashRecovery: false)` is used in two cases.
 
-- `ConfigReplicated` — live replication events on followers. Followers must never drive
-  Phase 2 commits; only the leader does.
-- `LeaderChanged` as follower — a follower learning about a new leader only applies
-  the partition map.
+- `ConfigReplicated`, a live replication event on a follower.
+- `LeaderChanged` as follower, which applies the partition map.
 
-Crash recovery only runs on `RestoreCompleted` (WAL replay finished) and
-`LeaderChanged` as leader (a node winning an election should complete any in-progress
-operations).
+Crash recovery is limited to `RestoreCompleted` and `LeaderChanged` as leader. Followers must not
+drive Phase 2 commits.
 
 ---
 
 ## 14. The Partition Map: Serialization and Versioning
 
-The partition map lives in two places simultaneously:
-
-| Location | Who Reads It |
+| Location of the map | Who reads it |
 |----------|--------------|
-| `systemConfiguration["Partitions"]` (in-memory dictionary, coordinator only) | All coordinator mutation handlers (`TrySplitPartition`, `TryCreatePartition`, etc.) |
+| `systemConfiguration["Partitions"]` (in-memory dictionary, coordinator only) | The coordinator mutation handlers (`TrySplitPartition`, `TryCreatePartition`, etc.) |
 | System partition WAL (durable) | Read on restart via `ConfigRestored`/`ConfigReplicated` events |
 
-Every mutation handler follows the same pattern:
+All mutation handlers follow the same pattern.
 
 ```csharp
 // 1. Read from local cache (not WAL)
@@ -800,36 +714,34 @@ systemConfiguration[RaftSystemConfigKeys.Partitions] = newJson;
 StartPartitions(map.Partitions);
 ```
 
-Step 5 is critical. The coordinator is a single-consumer channel: if the caller enqueues
-a `CreatePartition` immediately after a `LeaderChanged`, the `CreatePartition` handler
-runs before the `ConfigReplicated` event arrives (which would otherwise update
-`systemConfiguration` via the replication callback). Without step 5, the second operation
-would find `systemConfiguration` empty and return `Errored`.
+Step 5 is critical. A `CreatePartition` enqueued directly after a `LeaderChanged` is handled before
+the `ConfigReplicated` event arrives. If step 5 did not update the cache, that handler would find
+`systemConfiguration` empty and return `Errored`.
 
-The opposite hazard matters as much. Step 4 writes the **whole** map, built in step 1 from the
-local copy. If committed entries from another P0 leader are installed after step 1 (the handler
-waited on a remote leadership confirmation, and the node lost and won P0 leadership meanwhile),
-the write would overwrite them, and the in-order install guard would then refuse them as older
-than the write: the committed map goes back in time on every node. Two rules prevent this:
+Step 4 writes the **entire** map, built in step 1 from the local copy. Another P0 leader's entries
+can be installed after step 1, when the handler waited on a remote leadership confirmation and the
+node lost and won P0 leadership meanwhile. The write would then overwrite them, and the in-order
+install guard would refuse them as older than the write. The committed map would go back in time on
+all nodes. Two rules prevent this.
 
 - **Committed entries go first.** `ConfigReplicated`, `ConfigRestored` and
-  `ConfigCheckpointRestored` deliveries are also queued apart from the channel, and the loop
-  installs all of them before it dispatches the next handler, whatever their channel position.
-  A handler therefore never starts on a map that the log has already moved past.
-- **Stale-base fence.** `Replicate` installs any delivery that arrived since the handler was
-  dispatched. Every entry committed before this node's P0 term has been delivered by then: the
-  promotion barrier publishes leadership only after every prior-term entry was applied, and the
-  applicator delivers each system entry before it moves the applied frontier
-  (`TestSystemLeaderChangeDeliveryOrder` pins this). If one was installed, it proposes nothing and returns
-  `RaftOperationStatus.StaleSystemConfiguration`, and it keeps refusing for the rest of that
-  dispatch. Every caller stops on that status: the placement pass re-plans on its next tick, and
-  the split and merge Phase 2 commits and `TrySetInitialPartitions` send themselves back through
-  the channel, so they start over from the installed state as a new dispatch.
+  `ConfigCheckpointRestored` deliveries are also queued apart from the channel. The loop installs
+  all of them before it dispatches the next handler, whatever their channel position. A handler
+  therefore starts on a map that the log has not moved past.
+- **Stale-base fence.** `Replicate` first installs any delivery that arrived since the handler was
+  dispatched. If it installed one, it proposes no write and returns
+  `RaftOperationStatus.StaleSystemConfiguration` for the rest of that dispatch. The fence is
+  complete: entries committed before this node's P0 term were all delivered by then. The promotion
+  barrier publishes leadership after all prior-term entries are applied, and the applicator
+  delivers each system entry before it moves the applied frontier
+  (`TestSystemLeaderChangeDeliveryOrder`). Callers stop on that status. The placement pass re-plans
+  on its next tick. The split and merge Phase 2 commits and `TrySetInitialPartitions` send
+  themselves back through the channel and start over from the installed state.
 
 The remote calls that a handler can wait on from the loop (`GetReadIndex`, `GetFollowerLag`) are
-bounded by `RaftConfiguration.RemoteProbeTimeout` (the leadership confirmation timeout plus 3 s),
-so one dead connection cannot hold the loop for minutes. A partition-leadership resolution probes
-all its candidates at once under one such budget.
+bounded by `RaftConfiguration.RemoteProbeTimeout` (the leadership confirmation timeout plus 3 s).
+One dead connection cannot block the loop for minutes. A partition-leadership resolution probes all
+its candidates at once under one such budget.
 
 ---
 
@@ -867,7 +779,8 @@ Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
     CancellationToken ct = default);
 ```
 
-`RaftPartitionLifecycleResult` carries `Success`, `Status`, and `Generation`.
+`RaftPartitionLifecycleResult` carries `Success`, `Status`, `Generation`, and `StateTransfer`, the
+outcome of the [snapshot transfer](#11-snapshot-transfer-during-split) of a split.
 
 ### Read-Only Queries
 
@@ -917,49 +830,44 @@ void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer);
 
 ## 16. Key Invariants and Safety Rules
 
-These invariants must hold at all times. Violation corrupts the partition map.
+A violation of these invariants corrupts the partition map.
 
-1. **Single mutation path.** All partition map mutations go through the coordinator
-   channel. Never mutate `systemConfiguration` or the in-memory map from outside the
-   coordinator loop.
+1. **Single mutation path.** All partition map mutations go through the coordinator channel. Do not
+   mutate `systemConfiguration` or the in-memory map from outside the coordinator loop.
 
-2. **No overlapping HashRange entries.** Two `HashRange` partitions must not have
-   overlapping `[StartRange, EndRange]` intervals. Validated on `CreatePartition` and
-   enforced by the split boundary logic (source is shrunk before the target is added).
+2. **No overlapping HashRange entries.** `[StartRange, EndRange]` intervals do not overlap.
+   `CreatePartition` validates this, and a split shrinks the source before it adds the target.
 
-3. **No inverted bounds.** `StartRange <= EndRange` always, for every `HashRange` entry.
-   Validated on `CreatePartition`.
+3. **No inverted bounds.** `StartRange <= EndRange` for each `HashRange` entry. `CreatePartition`
+   validates this.
 
-4. **Splitting pairs are symmetric.** Phase 1 always marks both source and target
-   `Splitting` atomically (in one replicated map write). Phase 2 marks both `Active` in
-   one replicated write. There is no valid state where one is `Splitting` and the other
-   is `Active`.
+4. **Splitting pairs are symmetric.** Phase 1 marks both source and target `Splitting` in one
+   replicated map write, and Phase 2 marks both `Active` in one. A state where one is `Splitting`
+   and the other is `Active` is not valid.
 
-5. **Never remove a `Splitting` or `Draining` partition.** Removing a `Splitting`
-   source orphans the target forever; removing a `Draining` source bypasses
-   `MergePartitionCommit`. Both are rejected by `TryRemovePartition`.
+5. **Never remove a `Splitting` or `Draining` partition.** To remove a `Splitting` source orphans
+   the target forever. To remove a `Draining` source bypasses `MergePartitionCommit`.
+   `TryRemovePartition` returns `Errored` for both.
 
-6. **`Removed` entries are never re-added.** Once a partition id enters `Removed` state
-   it is never reused or upgraded back to `Active`. The tombstone persists in the map.
-   The map also carries `HighestPartitionIdEver`, raised by every create and split in the
-   same committed entry and never lowered. `GetNextAvailablePartitionId` steps past it, and
-   create/split refuse an id at or below it, so a spent id stays spent even if its tombstone
-   is ever lost. Maps written before the field existed load it as 0, which disables the
-   floor until the first id is minted on the new version.
+6. **`Removed` entries are never re-added.** A `Removed` id is not reused, and its tombstone
+   persists in the map. `HighestPartitionIdEver` is raised by each create and split in the same
+   committed entry and is never lowered. `GetNextAvailablePartitionId` steps past it, and
+   create/split refuse an id at or below it, even if the tombstone is lost. Maps written before the
+   field existed load it as 0, which disables the floor until the first id is minted on the new
+   version.
 
 7. **`OnPartitionMapChanged` fires on leader and followers.** The leader fires it from
    `StartPartitions` at the end of each successful mutation. Followers fire it via
    `ConfigReplicated → InitializePartitions(crashRecovery: false) → StartPartitions`.
 
-8. **Crash recovery runs once, on the right node.** `InitializePartitions(crashRecovery:
-   true)` is called only on `RestoreCompleted` and on `LeaderChanged` for the node that
-   just became leader. Followers pass `crashRecovery: false` on `LeaderChanged` to
-   prevent them from driving Phase 2 commits.
+8. **Crash recovery runs once, on the right node.** `InitializePartitions(crashRecovery: true)` is
+   called on `RestoreCompleted`, and on `LeaderChanged` for the node that just became leader. See
+   [Cases Without Crash Recovery](#cases-without-crash-recovery).
 
 9. **`Generation` is visible across threads.** `RaftPartition.Generation` is backed by
    `Interlocked.Read`/`Interlocked.Exchange`. `StateMachineTransfer` is accessed via
-   `Volatile.Read`/`Volatile.Write`. Never add cross-thread fields to `RaftPartition`
-   without a thread-safety mechanism.
+   `Volatile.Read`/`Volatile.Write`. A new cross-thread field on `RaftPartition` needs a
+   thread-safety mechanism.
 
 ---
 
@@ -970,9 +878,8 @@ These invariants must hold at all times. Violation corrupts the partition map.
 1. Add a value to `RaftSystemRequestType`.
 2. Add a message builder to `RaftSystemRequest` (constructor or property).
 3. Add a `case` in `RaftSystemCoordinator.Receive`.
-4. Implement the handler as a private `async Task TryXxx(...)` method. Follow the
-   pattern: read map → validate → mutate → replicate → update cache → `StartPartitions`
-   → resolve TCS.
+4. Implement the handler as an `async Task TryXxx(...)` method. Follow the pattern: read map →
+   validate → mutate → replicate → update cache → `StartPartitions` → resolve TCS.
 5. Add a public method on `IRaft` and `RaftManager` that performs leader checks and
    enqueues the request via `systemCoordinator.Send`.
 6. Add tests in `Kommander.Tests/Scheduler/` using `ReplicateOverride` and
@@ -981,8 +888,8 @@ These invariants must hold at all times. Violation corrupts the partition map.
 ### Adding a field to `RaftPartitionRange`
 
 1. Add the property to `RaftPartitionRange.cs`.
-2. Verify JSON round-trip (the class uses standard `System.Text.Json` with no custom
-   converters; adding a public property is sufficient).
+2. Verify the JSON round-trip. The class uses standard `System.Text.Json`, and a public property is
+   sufficient.
 3. Update `StartUserPartitions` in `RaftManager` to propagate the new field to the live
    `RaftPartition` object (if applicable).
 4. Update `GetPartitionMap()` to include the field in the snapshot.
@@ -990,7 +897,7 @@ These invariants must hold at all times. Violation corrupts the partition map.
 
 ### Adding a field to `RaftPartition` that is read cross-thread
 
-Use the same pattern as `Generation`:
+Use the same pattern as `Generation`.
 
 ```csharp
 private long _myField;
@@ -1002,8 +909,7 @@ public long MyField
 }
 ```
 
-For reference-type fields, use `Volatile.Read`/`Volatile.Write` (as done for
-`_stateMachineTransfer`).
+For reference-type fields, use `Volatile.Read`/`Volatile.Write`, as `_stateMachineTransfer` does.
 
 ---
 
@@ -1022,11 +928,9 @@ All elastic partition tests are in `Kommander.Tests/Scheduler/`.
 
 ### Test Conventions
 
-- All tests use `ReplicateOverride` so no real Raft cluster is needed.
-- `WaitForIdleAsync` uses a drain sentinel (not `Task.Delay`) to wait for the coordinator
-  queue to empty. Always prefer it over fixed delays.
-- Crash recovery tests use `MakeConfigRestored` + `RaftSystemRequestType.RestoreCompleted`
-  to simulate WAL replay. `ConfigRestored` is the replay event; `ConfigReplicated` is a
-  live event and does not run crash recovery.
-- Tests that verify a follower does NOT drive Phase 2 set `ReplicateOverride` to record
-  calls and assert the call count is zero after `WaitForIdleAsync`.
+- `WaitForIdleAsync` uses a drain sentinel to wait for the coordinator queue to empty. Prefer it
+  over a fixed `Task.Delay`.
+- Crash recovery tests use `MakeConfigRestored` + `RaftSystemRequestType.RestoreCompleted` to
+  simulate WAL replay. `ConfigReplicated` is a live event and does not start crash recovery.
+- Tests that verify a follower does NOT drive Phase 2 record calls through `ReplicateOverride` and
+  assert that the call count is zero after `WaitForIdleAsync`.

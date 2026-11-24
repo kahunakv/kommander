@@ -1,14 +1,12 @@
 # Replication Factor & Per-Partition Replica Placement — Developer Guide
 
-This guide is for developers who **use, understand, or maintain** Kommander's replication factor
-and per-partition replica placement. It assumes you know roughly what Kommander is (a Raft-based
-distributed system) but **no prior knowledge of replica placement**.
-
-If you are brand new to Kommander, skim the [Architecture Overview](architecture-overview.md) first —
-it explains partitions, leaders, and the system partition, which this guide builds on. The
+This guide is for developers who use or maintain replication factor and replica placement. It
+builds on the partition and system-partition concepts in the
+[Architecture Overview](architecture-overview.md). Placement applies the learner lifecycle of the
 [Dynamic Cluster Membership guide](dynamic-membership-developer-guide.md) and the
-[Leader Balancer guide](leader-balancer-developer-guide.md) are close relatives: placement reuses
-their learner/promotion lifecycle and their planner/controller pattern, applied per partition.
+planner/controller pattern of the [Leader Balancer guide](leader-balancer-developer-guide.md) per
+partition. Placement decides *which nodes host a range*, and the leader balancer decides *which of
+those replicas leads*.
 
 ---
 
@@ -28,29 +26,23 @@ their learner/promotion lifecycle and their planner/controller pattern, applied 
 12. [Safety](#safety)
 13. [Code map](#code-map)
 14. [Known limitations](#known-limitations)
-15. [FAQ](#faq)
 
 ---
 
 ## Summary
 
-Historically, Kommander was a **full-replication** multi-Raft: every partition replicated to *every*
-node in the cluster. That is simple and works well for a handful of machines, but it means adding
-nodes makes the cluster *store more copies* and *commit more slowly*, instead of spreading data out.
+With a **replication factor** (RF) configured, each partition range has a fixed number of copies,
+for example 3, on a *subset* of nodes recorded in the committed partition map. Quorum for a range
+is computed over *that range's* voter replicas: a 24-node cluster commits an RF=3 range with 2-of-3
+acks. Nodes materialize the partitions they replicate, and an optional controller rebalances
+replicas as nodes join or leave.
 
-**Replica placement** changes that. With a **replication factor** (RF) configured, each partition
-range keeps a fixed number of copies — say 3 — hosted on a *subset* of nodes recorded in the
-committed partition map. Quorum for a range is computed over *that range's* voter replicas only, so a
-24-node cluster still commits an RF=3 range with 2-of-3 acks. Nodes materialize only the partitions
-they replicate, and an optional controller continually rebalances replicas as nodes join, leave, or
-die.
-
-The feature is **off by default** (`ReplicationFactor = 0` keeps today's full replication), and a
-range whose replica set is empty always behaves the legacy way, so existing clusters and maps keep
-working unchanged. When a replication factor *does* apply to such a range — a cluster that
-bootstrapped at or below its factor, or a factor turned on later — the controller converts it to a
-placed range once `EnablePlacementRebalancer` is on (see
-[Interplay](#interplay-initial-placement-splitmerge-membership)).
+The feature is **off by default** (`ReplicationFactor = 0`, full replication). A range whose replica
+set is empty is fully replicated, and existing clusters and maps work unchanged. When a replication
+factor applies to such a range, the controller converts it to a placed range once
+`EnablePlacementRebalancer` is on (see
+[Interplay](#interplay-initial-placement-splitmerge-membership)). This covers a cluster that
+bootstrapped at or below its factor and a factor turned on later.
 
 ```
 Full replication (before):          RF = 3 on six nodes (after):
@@ -67,21 +59,13 @@ Full replication (before):          RF = 3 on six nodes (after):
 
 ## Limits of full replication
 
-Three things go wrong as a full-replication cluster grows:
+A full-replication cluster has three limits as it grows.
 
-1. **Every node carries every range.** A cluster of dozens of machines still stores a complete copy
-   of all data on each node, and every node runs a partition executor for every Raft group. Storage,
-   WAL I/O, heartbeat fan-out, and replication work scale with `partitions × nodes`.
-
-2. **Quorum width grows with the cluster.** With 24 voters, every partition needs 13 acks to commit.
-   Every write is bounded by the 13th-slowest node in the *whole cluster*. Adding machines makes
-   writes slower — the opposite of scale-out.
-
-3. **No way to place data.** Capacity, locality (rack/zone), and per-range load cannot influence
-   where a range lives, because a range lives *everywhere*.
-
-A replication factor solves all three: fixed durability per range, small constant-width quorums, and
-an explicit, committed record of where each range lives that a planner can optimize.
+1. **Every node carries every range.** Storage and replication work scale with
+   `partitions × nodes`.
+2. **Quorum width grows with the cluster.** With 24 voters, a partition needs 13 acks to commit.
+3. **Data cannot be placed.** Capacity, locality (rack/zone), and per-range load cannot influence
+   where a range lives.
 
 ---
 
@@ -89,51 +73,45 @@ an explicit, committed record of where each range lives that a planner can optim
 
 ### Replica set
 Each entry in the committed partition map (`RaftPartitionRange`) can carry a list of **replicas**:
-which nodes host that range, and each replica's role. The map remains the single committed, versioned
-truth, mutated only through the system partition (P0) — placement rides the same record that already
-carries the range's hash bounds, state, and generation.
+the nodes that host the range and the role of each one. The map is changed through the system
+partition (P0) only.
 
-**An empty replica list means legacy full replication** — every roster voter hosts the range. This is
-both the migration story (old maps deserialize with empty lists) and the off-switch (with
-`ReplicationFactor = 0` nothing ever populates them).
+**An empty replica list means legacy full replication**: all roster voters host the range. Old maps
+load with empty lists, and `ReplicationFactor = 0` leaves them empty.
 
 ### Replica roles
-A replica is in one of three roles, mirroring the cluster-membership lifecycle but scoped to one
-range:
+A replica has one of three roles, scoped to one range.
 
 | Role | Hosts the range? | Counts toward quorum? | Meaning |
 |---|---|---|---|
 | `Voter` | yes | **yes** | a full copy; the normal state |
 | `Learner` | yes | no | catching up after being added; promoted once it keeps up |
-| `Removing` | yes | no | marked for removal; still serves until the final drop |
+| `Removing` | yes | no | marked for removal; serves until the final drop |
 
 ### Effective replication factor
-`RaftConfiguration.ReplicationFactor` is the cluster-wide target; each range may carry an override.
-The effective RF is `min(target, number of live voters)` — a cluster with fewer voters than RF
-degrades to full replication (all voters host the range), with no loss of safety. With the rebalancer
-on, the controller records that full set as an explicit replica set and the planner expands it back
-out (repair) as voters join, or trims it once voters exceed RF. With the rebalancer off the set stays
-empty and every node that joins adds one more copy; `IRaft.GetPartitionsAwaitingPlacement()` lists
-such ranges.
+`RaftConfiguration.ReplicationFactor` is the cluster-wide target, and a range may carry an
+override. The effective RF is `min(target, number of live voters)`. A cluster with fewer voters
+than RF is fully replicated (all voters host the range), with no loss of safety.
+
+With the rebalancer on, the controller records that full set as an explicit replica set, and the
+planner expands it as voters join or trims it once voters exceed RF. With the rebalancer off, the
+set remains empty and each node that joins adds one more copy.
+`IRaft.GetPartitionsAwaitingPlacement()` lists such ranges.
 
 ### Generation as the fence
-Every placement change bumps the range's `Generation`, exactly like a split or merge does. Consumers
-that cache the map fence their proposals on the generation; a proposal racing a placement change is
-rejected with `PartitionMoved` and retried against the refreshed map. No new fencing machinery
-exists — placement reuses the one you already know.
+A placement change bumps the range's `Generation`, as a split or merge does. A proposal fenced on an
+older generation returns `PartitionMoved`. Retry it against the refreshed map.
 
 ### Single mover per range
-At most **one** replica of a given range is in a transitional role (`Learner` or `Removing`) at a
-time. This is the per-partition application of Raft's one-change-at-a-time membership rule: it
-guarantees any two successive committed configurations of the range overlap in a quorum, which is
-what makes replica moves split-brain-free.
+At most **one** replica of a range is in a transitional role (`Learner` or `Removing`) at a time.
+Two successive committed configurations of the range therefore overlap in a quorum, which prevents
+split brain during a move.
 
 ---
 
 ## Per-partition peers and quorum
 
-The partition state machine never knew about the cluster directly — it sees peers only through its
-host interface:
+The partition state machine sees peers through its host interface.
 
 ```csharp
 // Scheduling/IRaftPartitionHost.cs — the state machine's entire view of "who else is out there"
@@ -141,8 +119,8 @@ IReadOnlyList<RaftNode> Nodes { get; }
 bool IsVoter(string endpoint);
 ```
 
-Every quorum computation — pre-vote, election, vote acceptance, commit — reads `host.Nodes` filtered
-by `host.IsVoter`. So the entire feature pivots on re-answering those two questions per partition:
+All quorum computations (elections, commit, check-quorum, read-index confirmation) use `host.Nodes`
+filtered by `host.IsVoter`, and the host adapter answers both per partition.
 
 ```csharp
 // RaftPartitionHostAdapter
@@ -151,67 +129,55 @@ public bool IsVoter(string endpoint) => manager.IsPartitionVoter(partition.Parti
 ```
 
 `GetPartitionPeers` returns the range's replica set (minus self) when one is assigned, and the
-whole-cluster projection otherwise (legacy ranges, and always for P0 — the system partition
-replicates everywhere by design). `IsPartitionVoter` returns true only for the range's `Voter`
-replicas; learners and removing replicas are peers (they receive appends and can catch up) but never
-count in the quorum denominator.
+whole-cluster projection otherwise. P0 always uses the whole-cluster projection. `IsPartitionVoter`
+returns true for the range's `Voter` replicas only. Learners and removing replicas are peers that
+receive appends and do not count in the quorum denominator.
 
-Two campaign gates complete the picture: a node will not start an election or pre-vote for a range
-unless it is a cluster-roster Voter **and** a `Voter` replica of that specific range. Without the
-second check, a perfectly legitimate cluster member that happens to be only a learner replica of a
-range could campaign for it and count itself into a quorum the committed replica set never granted
-it.
+A node starts an election or pre-vote for a range only if it is a cluster-roster Voter **and** a
+`Voter` replica of that range. The second check prevents a learner replica of the range from
+counting itself into a quorum that the committed replica set did not grant it.
 
-Everything else — commit counting, check-quorum, read-index confirmation — follows automatically,
-because it all flows through the same two host members.
-
-A replica-set change commits through P0's log, so P0's quorum alone would let it take effect while
-the target range's own voters are unreachable. The coordinator therefore fences every `AddReplica`,
+A replica-set change commits through P0's log, and P0's quorum alone would let it take effect while
+the target range's own voters are unreachable. The coordinator therefore fences `AddReplica`,
 `PromoteReplica`, and the first (quorum-changing) commit of `RemoveReplica` on a quorum-confirmed
-leadership of the target range: a read-index round on the range's leader, run locally when the P0
-leader leads the range and forwarded through `ICommunication.GetReadIndex` otherwise. A range with
-no reachable, confirmed leader answers `RaftOperationStatus.LeadershipNotConfirmed` and the map is
-untouched; the placement pass retries on a later tick. Re-driving an interrupted removal (a
-replica already marked `Removing`) is exempt, because its final drop changes no quorum.
+leadership of the target range. The fence is a read-index round on the range's leader: local when
+the P0 leader leads the range, and forwarded through `ICommunication.GetReadIndex` otherwise. If no
+confirmed leader is reachable, the result is `RaftOperationStatus.LeadershipNotConfirmed`, the map
+is untouched, and the placement pass retries on a later tick. The final drop of a replica already
+marked `Removing` changes no quorum and is exempt.
 
-The fence runs on the coordinator loop, between the handler's read of the map and its write. Each
+The fence waits on the coordinator loop, between the handler's read of the map and its write. Each
 forwarded `GetReadIndex` is bounded by `RaftConfiguration.RemoteProbeTimeout`, and a candidate that
 does not answer in time counts as unconfirmed. If committed map entries from another P0 leader are
-installed while the handler waits, the write is refused with
-`RaftOperationStatus.StaleSystemConfiguration` and nothing is proposed: the map the handler built
-no longer matches the log. The placement pass re-plans from the installed map on its next tick.
-See the elastic partitions guide, section 14, for the general rule.
+installed meanwhile, the write returns `RaftOperationStatus.StaleSystemConfiguration` and is not
+proposed. The placement pass re-plans from the installed map on its next tick. For the general rule,
+see section 14 of the [elastic partitions guide](elastic-partitions-developer-guide.md).
 
 ---
 
 ## Partial materialization
 
-When a node applies a committed map (`RaftManager.StartUserPartitions`), it now asks per range:
-*am I in this range's replica set?*
+When a node applies a committed map (`RaftManager.StartUserPartitions`), it checks for each range
+whether it is in the replica set.
 
-- **Yes (any role), or the set is empty (legacy):** materialize/update the local `RaftPartition` as
-  before.
-- **No:** do not materialize it. If the node *was* hosting it, the partition is removed from the
-  routing dictionaries immediately, then drained and stopped in the background, and its WAL for that
-  range is reclaimed.
+- **In the set (any role), or the set is empty (legacy):** materialize or update the local
+  `RaftPartition`.
+- **Not in the set:** do not materialize it. If the node *was* hosting it, the partition leaves the
+  routing dictionaries immediately. It is drained and stopped in the background, and its WAL for
+  that range is reclaimed.
 
-Reclaiming on un-host is safe for a specific reason worth internalizing: the only committed way a
-node leaves a replica set is the final step of the two-commit removal (next section). Observing
-"I am absent from the committed replica set" *is* observing that commit, so no later configuration of
-the range can need this node's copy.
+The reclaim is safe. A node can leave a replica set only through the final step of the two-commit
+removal (next section), and no configuration after that commit can need this node's copy.
 
-One consequence ripples into routing: the local partition dictionary no longer contains every range,
-so anything that answers "which partition owns this key?" or "what does the map look like?" now reads
-a snapshot of the **committed map**. A node can route any key to any
-range — including ranges it does not host.
+Key routing and map queries read a snapshot of the **committed map**, and a node can route a key to
+a range that it does not host.
 
 ---
 
 ## Replica moves
 
-Every placement change is one committed map mutation at a time, processed serially on the P0
-coordinator's single-consumer loop — the same discipline as roster changes and split/merge, and on
-the same loop, so they can never interleave badly.
+Placement changes are committed one at a time on the P0 coordinator's single-consumer loop, the same
+loop that serializes roster changes and split/merge.
 
 ### Adding a replica (range R, node X)
 
@@ -223,9 +189,9 @@ the same loop, so they can never interleave badly.
                                                          commit is the quorum entry
 ```
 
-Step 1 makes every node apply the new map; X materializes R as a follower/learner and the range's
-leader starts replicating to it. The controller watches X's commit lag on R; once it stays within
-`LearnerPromotionLag` for the stable window, it commits the promotion.
+In step 1, X materializes R as a learner and the range's leader starts to replicate to it. The
+controller commits the promotion after X's commit lag on R is within `LearnerPromotionLag` for the
+stable window.
 
 ### Removing a replica (range R, node Y)
 
@@ -238,34 +204,39 @@ leader starts replicating to it. The controller watches X's commit lag on R; onc
                                                          reclaims R's WAL locally
 ```
 
-If Y currently *leads* R, its leadership is handed to another voter replica **before** step 1, and the
-hand-off is confirmed: when the P0 leader itself leads R the local converging transfer runs; otherwise
-a transfer suggestion goes to the leader node and the controller waits, bounded (three election
-timeouts, between two and ten seconds), until the quorum-confirmed leader of R is someone else. A
-hand-off that does not complete refuses the removal for this pass with `LeadershipNotConfirmed` and
-the next pass retries; the attempt and its outcome are logged at Information, a refusal at Warning.
-The hand-off is mandatory: an election does *not* recover a leader that left the replica set on
-its own when the range is quiesced (its followers gate elections on SWIM liveness of the leader's node,
-which stays alive), so a removal that went ahead left the range leaderless (Kahuna 1.12.7, 2026-10-18).
-As a safety net the followers now also treat a leader that is no longer in the range's replica set as
-vacated — see the partition-quiescence guide. If the process crashes
-between the two commits, the map durably shows a `Removing` replica, and the controller's next pass
-re-issues the removal, which skips straight to the final drop. Every handler is idempotent against
-its own retry.
+If Y *leads* R, its leadership is handed to another voter replica **before** step 1, and the
+hand-off is confirmed.
+
+- When the P0 leader itself leads R, the local converging transfer is used.
+- Otherwise a transfer suggestion goes to the leader node. The controller waits (three election
+  timeouts, between two and ten seconds) until the quorum-confirmed leader of R is someone else.
+
+A hand-off that does not complete refuses the removal for this pass with `LeadershipNotConfirmed`,
+and the next pass retries. The attempt and its outcome are logged at Information, a refusal at
+Warning.
+
+The hand-off is mandatory. Followers of a quiesced range gate elections on the SWIM liveness of the
+leader's node. If the leader left the replica set, its node remains alive and an election does
+*not* recover the range. As a safety net, followers also treat a leader that is no longer in the
+range's replica set as vacated. For more information, see the
+[partition-quiescence guide](partition-quiescence-developer-guide.md).
+
+If the process crashes between the two commits, the map durably shows a `Removing` replica. The
+controller's next pass re-issues the removal, which skips to the final drop. All handlers are
+idempotent against their own retry.
 
 ### Moving a replica (Y → X)
 
-A move is nothing new: *add X (learner → voter), then remove Y* — never both in flight at once
-(single mover). The range holds a full committed-voter quorum at every intermediate step.
+A move adds X (learner → voter) and afterwards removes Y. The two are not in flight at once (single
+mover), and the range has a full committed-voter quorum at each intermediate step.
 
 ---
 
 ## Seeding a new replica: whole-partition snapshots
 
-Step 2 of an add — "X catches up via the normal backfill / snapshot path" — has a catch: in the
-steady state the range's WAL prefix is compacted, so a freshly added replica **cannot** be
-bootstrapped by log backfill alone. It needs a whole-partition state snapshot from the leader.
-Register the transfer that produces one:
+In the steady state the range's WAL prefix is compacted, and a new replica **cannot** be
+bootstrapped by log backfill alone. It needs a snapshot of the entire partition state from the
+leader. Register the transfer that produces one.
 
 ```csharp
 public interface IRaftPartitionStateTransfer
@@ -286,175 +257,166 @@ public interface IRaftPartitionStateTransfer
 raft.RegisterPartitionStateTransfer(new MyPartitionStateTransfer());
 ```
 
-Register it on **every** node that can host or lead user partitions — the leader needs the export,
-the new replica needs the import, and registration is not replicated. Transfers produced through
-this interface travel with `SnapshotKind.PartitionState`, so every node must run a Kommander
-version that understands that kind before the transfer is registered.
+Register it on **every** node that can host or lead user partitions: the leader needs the export,
+the new replica needs the import, and registration is not replicated. These transfers travel with
+`SnapshotKind.PartitionState`. All nodes must use a Kommander version that understands that kind
+before the transfer is registered.
 
-Without this registration, the catch-up path falls back to calling
-`IRaftStateMachineTransfer.ExportRange` with a *boundless* plan (only `TargetPartitionId` set,
-meaning "the entire partition"). That works only for applications whose split/merge range transfer
-can also serve whole-partition exports; if yours rejects a boundless plan, a below-floor replica
-can never be seeded until the dedicated transfer is registered. This mirrors what
-`IRaftSystemStateTransfer` already does for the system partition (id 0) — see the system partition
-state snapshots guide for the P0 story.
+If no transfer is registered, the catch-up path calls `IRaftStateMachineTransfer.ExportRange` with
+a *boundless* plan (only `TargetPartitionId` set, meaning "the entire partition"). If your range
+transfer cannot serve such a plan, a below-floor replica can't be seeded until the dedicated
+transfer is registered. The system partition (id 0) uses `IRaftSystemStateTransfer`; see the
+[system partition state snapshots guide](system-partition-state-snapshots-developer-guide.md).
 
 ### How the receiver stages a snapshot
 
-The receiving node stages the whole snapshot before calling `ImportPartitionState`, and hands the
-importer a seekable stream it may read more than once. Staging is bounded by:
+The receiving node stages the complete snapshot before it calls `ImportPartitionState`, and gives
+the importer a seekable stream it may read more than once.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `SnapshotMaxPendingBytes` | 512 MiB | Staged bytes across all receive sessions, including snapshots whose install is running. A session that cannot fit, even after evicting others, is refused. |
+| `SnapshotMaxPendingBytes` | 512 MiB | Staged bytes across all receive sessions, including snapshots with an install in progress. A session that cannot fit, even after evicting others, is refused. |
 | `SnapshotMaxPendingSessions` | 8 | Concurrent receive sessions. |
-| `SnapshotStagingDirectory` | null | Node-private directory for spill files. Null keeps every session in memory. |
+| `SnapshotStagingDirectory` | null | Node-private directory for spill files. Null: all sessions are in memory. |
 | `SnapshotStagingMemoryBytes` | 64 MiB | With a staging directory, the resident budget: a session whose next chunk would exceed it moves to a spill file first. |
 
-Without a staging directory, `SnapshotMaxPendingBytes` is both the memory bound and the largest
-snapshot the node can receive, so a partition that outgrows it can never be re-seeded there. Set a
-staging directory on memory-limited nodes; `SnapshotMaxPendingBytes` can then be sized for the largest
-partition (it bounds disk plus memory) while `SnapshotStagingMemoryBytes` bounds what is resident.
-Spill files are deleted when their session ends, and any a crashed process left behind are removed at
-startup. A failed spill write (for example a full disk) fails only that session, and the leader
+If no staging directory is set, `SnapshotMaxPendingBytes` is both the memory bound and the largest
+snapshot the node can receive. A partition that outgrows it can't be re-seeded there. On
+memory-limited nodes you should set a staging directory, size `SnapshotMaxPendingBytes` for the
+largest partition (it bounds disk plus memory), and bound the resident part with
+`SnapshotStagingMemoryBytes`.
+
+Spill files are deleted when their session ends, and files left by a crashed process are removed at
+startup. A failed spill write (for example a full disk) fails that session alone, and the leader
 retries it.
 
-A leader starts a new session for every transfer attempt. When one opens, the receiver drops the
-same partition's older pending sessions from that leader at or below its snapshot index, and any
-from a lower leader term. Counters: `raft.snapshot.receive_sessions_superseded_total`
-and `raft.snapshot.receive_sessions_spilled_total` (both tagged `partition_id`).
+A leader starts a new session for each transfer attempt. When one opens, the receiver drops the same
+partition's older pending sessions from that leader at or below its snapshot index, and any from a
+lower leader term. The counters are `raft.snapshot.receive_sessions_superseded_total` and
+`raft.snapshot.receive_sessions_spilled_total` (both tagged `partition_id`).
 
 ### The install is a step of its own
 
 The last chunk starts the install on the partition executor and is answered at once with
-`InstallPending`; the leader asks for the outcome separately and waits for as long as the install
-reports progress. `ImportPartitionState` can therefore take as long as it needs:
-`SnapshotChunkAckTimeout` bounds only a chunk acknowledgement and each of those questions. (A leader from a release that does not ask keeps the older behaviour: its last chunk's call is
-held until the install completes.)
+`InstallPending`. The leader asks for the outcome separately and waits for as long as the install
+makes progress. `SnapshotChunkAckTimeout` bounds a chunk acknowledgement and each of those
+questions, and `ImportPartitionState` can take as long as it needs. (For a leader from a release
+that does not ask, the last chunk's call is held until the install completes.)
 
-A node runs **one install per partition**. While it is queued or running, the receiver stages nothing
-else for that partition: the partition's other pending sessions are dropped when the install starts,
-and a chunk that would open another is answered with `InstallPending` naming the running install, so
-its sender waits for that install's outcome instead of sending a second snapshot. At most one staged
-snapshot per partition sits beside the running import, whatever the leader — or a new leader — does.
-Counter: `raft.snapshot.receive_sessions_refused_installing_total` (`partition_id`).
+A node has **one install per partition** at a time. While it is queued or in progress, the receiver
+stages no other snapshot for that partition. The partition's other pending sessions are dropped
+when the install starts. A chunk that would open another session is answered with `InstallPending`
+naming the current install, and its sender waits for that outcome. At most one staged snapshot per
+partition sits beside the import in progress, even after a leader change. The counter is
+`raft.snapshot.receive_sessions_refused_installing_total` (`partition_id`).
 
-What an install costs is published, one figure per process:
+These instruments publish the install cost, one figure per process.
 
 | Instrument | Meaning |
 |---|---|
 | `raft.snapshot.receive_staged_bytes` | Bytes staged by sessions whose last chunk has not arrived. |
-| `raft.snapshot.receive_installing_bytes` | Staged bytes held by installs that are queued or running. |
-| `raft.snapshot.receive_in_memory_bytes` | The part of both held in memory. |
-| `raft.snapshot.install_peak_heap_bytes` | Highest managed-heap size sampled while an install was starting, running or ending. A high-water mark. |
+| `raft.snapshot.receive_installing_bytes` | Staged bytes of installs that are queued or in progress. |
+| `raft.snapshot.receive_in_memory_bytes` | The in-memory part of both. |
+| `raft.snapshot.install_peak_heap_bytes` | Highest managed-heap size sampled during an install. A high-water mark. |
 | `raft.snapshot.install_duration_ms` | Histogram: last chunk to outcome, tagged `partition_id` and `outcome`. |
 
-Each finished install also logs one Information line with its outcome, duration, staged and resident
-bytes, and the managed heap before and after.
+Each finished install also logs one Information line with its outcome, its duration, and its memory
+figures (staged and resident bytes, managed heap before and after).
 
 ---
 
 ## The placement planner and the P0 controller
 
-The design copies the leader balancer's proven shape: a **pure planner** over an immutable view,
-invoked by a **controller** that runs only on the P0 leader and turns plan output into committed
-mutations.
+A **pure planner** works over an immutable view. A **controller** on the P0 leader invokes it and
+turns its output into committed mutations.
 
 ### The planner (`PlacementPlanner.Plan`)
 
-Input: every placeable range (its voters, learners, RF, current leader), every candidate node
-(roster voters, with SWIM liveness and an optional zone tag), and the knobs. Output: a bounded list
-of `AddReplica` / `RemoveReplica` moves. Priorities, highest first:
+The input is the set of placeable ranges (voters, learners, RF, current leader), the candidate nodes
+(roster voters, with SWIM liveness and an optional zone tag), and the configuration. The output is a
+bounded list of `AddReplica` / `RemoveReplica` moves in this priority order.
 
-1. **Repair under-replication.** A range with fewer *healthy* voters than its RF (a node died or was
-   evicted) gets a new replica on the least-loaded live node. Repairs bypass the deadband — restoring
-   durability always wins.
-2. **Trim over-replication.** A range with more voters than RF (after a merge union, an RF decrease,
-   or a completed move) sheds the replica on the most-loaded node — a voter in a zone the range
-   doubles up on first, when zones are known. The current leader is spared only among equally
-   loaded candidates: the controller hands leadership off before it marks a leader replica
-   `Removing`, so load always outranks leadership. A replica stranded on a node that left the
-   roster is shed as soon as the healthy voters alone satisfy RF.
-3. **Balance skew.** A node carrying more replicas than the even-spread ceiling plus the deadband
-   donates one range to the least-loaded node that lacks it. The donation is expressed as an *add*;
-   the matching trim emerges on a later pass as over-replication once the learner promotes.
-   That trick keeps every individual step quorum-safe without any multi-step move bookkeeping. The
-   add is emitted only when that trim, predicted with the trim's own victim order, would shed a node
-   strictly more loaded than the filled target; otherwise the trim would remove the replica just
-   added and the pass would loop, so the planner holds still instead.
+1. **Repair under-replication.** A range with fewer *healthy* voters than its RF gets a new replica
+   on the least-loaded live node. Repairs bypass the deadband.
+2. **Trim over-replication.** A range with more voters than RF (after a merge union, an RF
+   decrease, or a completed move) sheds the replica on the most-loaded node. When zones are known,
+   a voter in a zone the range doubles up on goes first. The current leader is spared only among
+   equally loaded candidates. A replica stranded on a node that left the roster is shed as soon as
+   the healthy voters alone satisfy RF.
+3. **Balance skew.** A node with more replicas than the even-spread ceiling plus the deadband
+   donates one range to the least-loaded node that lacks it. The donation is an *add*, and the
+   matching trim follows on a later pass, as over-replication, after the learner promotes. The add
+   is emitted only if that trim, predicted with the trim's victim order, would shed a node strictly
+   more loaded than the filled target. Otherwise the trim would remove the new replica and the pass
+   would loop.
 
-Stability rules: one move per range per plan, never touch a range that is mid-transition, prefer the
-current placement on ties (churn costs more than perfection), spread across distinct zones when zone
-hints exist (anti-affinity across *nodes* is absolute; across zones it is best-effort), and cap the
-plan by `MaxReplicaMovesPerPass` and the remaining transfer budget. The planner holds no state, so it
-is trivially unit-testable and a new P0 leader loses nothing.
+Stability rules limit churn.
+
+- One move per range per plan, and no move for a range in mid-transition.
+- The current placement wins ties.
+- Anti-affinity across *nodes* is absolute. Across zones, when zone hints exist, it is best-effort.
+- `MaxReplicaMovesPerPass` and the remaining transfer budget cap the plan.
+
+The planner is stateless, and a new P0 leader loses no planner state.
 
 ### The controller (`RunPlacementPass`)
 
-The pass runs on its own timer — every `PlacementPassInterval` (default 5 s) whenever placement is
-in play (`ReplicationFactor > 0` or `EnablePlacementRebalancer`) — and self-gates on P0 leadership.
-It is fully independent of the leader balancer's timer, so a placed cluster that keeps
-`EnableLeaderBalancer` off still converges. On top of the tick cadence, a pass is kicked
-immediately after the commits that create placement work: a replication-factor override and a
-member removal (graceful leave or dead-node eviction). Each pass:
+The pass has a dedicated timer, `PlacementPassInterval` (default 5 s), which is active whenever
+placement is in play (`ReplicationFactor > 0` or `EnablePlacementRebalancer`). It acts on the P0
+leader and is independent of the leader balancer's timer: a placed cluster with
+`EnableLeaderBalancer` off converges. A replication-factor override or a member removal (graceful
+leave or dead-node eviction) triggers an immediate pass after its commit. Each pass has three
+steps.
 
-1. **Drives transitions to completion** — re-issues the final drop for any `Removing` replica and
-   promotes learners that have stayed caught-up for the stable window. This part runs **even when
-   the rebalancer is disabled**, so an interrupted move always converges.
-2. **Assigns initial placement to legacy ranges** — only when `EnablePlacementRebalancer` is on
-   and the roster is committed: ranges with an empty replica set and an effective RF above 0 get
-   the explicit set of every roster voter (a quorum no-op; see *Converting a legacy range* above),
+1. **Drive transitions to completion.** It re-issues the final drop for a `Removing` replica and
+   promotes learners that were caught up for the stable window. This happens **even when the
+   rebalancer is disabled**, and an interrupted move always converges.
+2. **Assign initial placement to legacy ranges**, if `EnablePlacementRebalancer` is on and the
+   roster is committed. Ranges with an empty replica set and an effective RF above 0 get the
+   explicit set of all roster voters (a quorum no-op; see *Converting a legacy range* below),
    `MaxReplicaMovesPerPass` ranges per pass in one commit. The same pass then plans against the
-   converted map, so the first trim can start without waiting another interval.
-3. **Plans new moves** — only when `EnablePlacementRebalancer` is on, and only with budget to
-   spare. Moves are budgeted by class: **repairs** (re-replicating an under-replicated range,
-   shedding a replica stranded on an evicted node) draw on `MaxConcurrentReplicaRepairs`, while
-   **balance** moves (cosmetic trims and skew spreading) draw on `MaxConcurrentReplicaTransfers`
-   and additionally yield to any repair in flight — durability work is never throttled by the
-   cosmetic budget, and total in-flight transitions stay bounded by the larger of the two.
+   converted map.
+3. **Plan new moves**, if `EnablePlacementRebalancer` is on and budget remains. **Repairs**
+   (re-replication of an under-replicated range, a shed from an evicted node) draw on
+   `MaxConcurrentReplicaRepairs`. **Balance** moves (trims and skew spreading) draw on
+   `MaxConcurrentReplicaTransfers` and yield to any repair in flight. The larger of the two budgets
+   bounds total in-flight transitions.
 
 **Worst-case convergence bound.** One relocation costs ~3 passes (add learner → observe caught up →
-promote after `LearnerPromotionStableWindow`) plus one trim pass, i.e. ~4 × `PlacementPassInterval`
-per batch of concurrent moves (~20 s at the defaults). Repairs proceed `MaxConcurrentReplicaRepairs`
-at a time, so re-replicating *N* under-replicated ranges takes on the order of
-`ceil(N / MaxConcurrentReplicaRepairs) × 4 × PlacementPassInterval` — at the defaults, ~20 s per
-batch of 3 ranges — plus the actual data-transfer time for each learner to catch up, which dominates
-for large ranges. Under the pre-split shared budget of 1 at the balancer's 30 s cadence the same
-drain ran at ≈ 2 minutes per replica, fully serialized.
+promote after `LearnerPromotionStableWindow`) plus one trim pass: ~4 × `PlacementPassInterval` per
+batch of concurrent moves (~20 s at the defaults). To re-replicate *N* under-replicated ranges
+takes about `ceil(N / MaxConcurrentReplicaRepairs) × 4 × PlacementPassInterval` (~20 s per batch of
+3 ranges at the defaults) plus the time for each learner to catch up, which dominates for large
+ranges.
 
-Learner lag is measured from the range leader's follower-progress table — directly when the P0 leader
-happens to lead the range, remotely otherwise. Unlike the cluster-membership promotion driver, a
-learner that has *never acked* the range counts as **not caught up**: under placement the learner is
-explicitly expected to serve this range, so silence means replication has not reached it yet.
+Learner lag comes from the range leader's follower-progress table, read remotely when the P0 leader
+does not lead the range. A learner that has not acked the range counts as **not caught up**, unlike
+in the cluster-membership promotion driver.
 
 ---
 
 ## Routing and forwarding
 
-The committed map is global, so any node can resolve any key to its partition id. But under placement
-the local node may not *host* that partition. Two paths:
+Any node can resolve a key to its partition id. When the local node does not *host* that partition,
+there are two paths.
 
-- **Consumer routes directly (the fast path).** `IRaft.GetPartitionReplicas(partitionId)` returns the
-  range's committed replica set (empty = every voter). Consumers cache it — refreshed on the existing
-  `OnPartitionMapChanged` event or on a `PartitionMoved` rejection — and send operations straight to
-  a replica, preferably the leader. To pick *which* replica leads,
-  `IRaft.GetPartitionLeaderHint(partitionId)` answers even for a range this node does not host: it is
-  reduced from gossiped load reports (each node advertises the partitions it believes it leads,
-  newest fresh claim wins), so a non-replica node can forward in one hop instead of two.
-  Contractually best-effort — the hint may be null, stale, or wrong; the receiving node re-checks
-  leadership on every forwarded operation, so use it as the first target and fall back to the
-  replica set on a miss. Load-report gossip is on whenever placement, the leader balancer, or
-  `EnableLoadReports` is enabled (`RaftConfiguration.LoadReportsEnabled`).
+- **The consumer routes directly (the fast path).** `IRaft.GetPartitionReplicas(partitionId)`
+  returns the range's committed replica set (empty = all voters). Cache it, and refresh it on
+  `OnPartitionMapChanged` or on a `PartitionMoved` result.
+  `IRaft.GetPartitionLeaderHint(partitionId)` names the replica that leads, also for a range this
+  node does not host. The hint comes from gossiped load reports (newest fresh claim wins) and may
+  be null, stale, or wrong. The receiving node re-checks leadership on each forwarded operation.
+  Use the hint as the first target and the replica set on a miss. Load-report gossip is on whenever
+  placement, the leader balancer, or `EnableLoadReports` is enabled
+  (`RaftConfiguration.LoadReportsEnabled`).
 
-- **Local forward fallback.** `ReplicateLogs` called on a non-replica node forwards the proposal to
-  the range's replicas (voters first — the leader is always a voter), trying the next replica on a
-  `NodeIsNotLeader` answer. The forwarded proposal runs through the remote node's own propose path,
-  so leader checks and the generation fence apply on the remote node. This fallback currently works on
-  the in-memory transport; on gRPC/REST it is not yet wired, and consumers should use the direct
-  path.
+- **Local forward fallback.** `ReplicateLogs` on a non-replica node forwards the proposal to the
+  range's replicas, voters first, and tries the next replica on a `NodeIsNotLeader` answer. Leader
+  checks and the generation fence apply on the remote node. This works on the in-memory transport
+  and is not wired on gRPC/REST, where consumers should use the direct path.
 
-`GetPartitionGeneration` answers for non-hosted ranges too (from the committed map), so a non-replica
-node can still build a correctly-fenced proposal before forwarding it.
+`GetPartitionGeneration` also answers for non-hosted ranges from the committed map, which lets a
+non-replica node build a fenced proposal.
 
 ---
 
@@ -462,97 +424,93 @@ node can still build a correctly-fenced proposal before forwarding it.
 
 **Initial placement.** When the P0 leader bootstraps a fresh cluster with `ReplicationFactor > 0`,
 each initial range gets an RF-sized, all-`Voter` replica set assigned round-robin over the nodes
-visible at bootstrap — a deterministic even spread (six nodes, four ranges, RF=3 ⇒ each range on 3
-distinct nodes, each node hosting exactly 2 ranges). A cluster at or below RF nodes keeps empty
-replica sets — full replication — at bootstrap. Dynamically created partitions get the RF
-least-loaded voters at creation time, or an empty set too while voters do not exceed RF.
+visible at bootstrap. For example, six nodes with four ranges at RF=3 put each range on 3 distinct
+nodes, and each node hosts exactly 2 ranges. A cluster at or below RF nodes has empty replica sets
+at bootstrap. A partition created later gets the RF least-loaded voters, or an empty set while
+voters do not exceed RF.
 
-**Converting a legacy range.** An empty replica set is not a final state when a factor applies to
-the range. On every pass the controller counts the `Active` ranges whose set is empty while their
-effective RF is above 0 (the `raft.placement.ranges_awaiting_initial` gauge and
-`IRaft.GetPartitionsAwaitingPlacement()` expose the same count), and — with
-`EnablePlacementRebalancer` on and a committed roster — gives up to `MaxReplicaMovesPerPass` of them,
-lowest id first, an explicit replica set in **one** map commit: **every current roster `Voter`**, each
-as a `Voter`, dead or alive, with the generation bumped. The set deliberately keeps every voter. A
-legacy range's quorum already is the roster's voter set, so recording it changes no quorum anywhere:
-nodes that have and have not applied the new map agree on the denominator, and no election in the
-apply window can produce disjoint majorities. A one-shot cut to RF voters has no such guarantee
-(with 5 voters and RF 3 a majority of the new set and a majority of the old one can be disjoint), and
-choosing "caught-up" voters does not close the gap under concurrent writes. The shrink to RF is left
-to the ordinary trim path — one voter per commit, behind the leadership fence and the leader
-hand-off — so the whole conversion is one quorum no-op followed by moves the planner already knows
-how to make safely. Roster members that are not voters (`Learner`, `Leaving`) stop hosting the
-converted ranges, which is the placed-model contract. With the rebalancer off nothing converts, and
-the P0 leader logs one Warning per leadership naming how many ranges wait: the conversion ends with
-copies being removed, which is what that switch authorizes.
+**Converting a legacy range.** On each pass the controller counts the `Active` ranges whose set is
+empty while their effective RF is above 0. The `raft.placement.ranges_awaiting_initial` gauge and
+`IRaft.GetPartitionsAwaitingPlacement()` expose the same count. With `EnablePlacementRebalancer` on
+and a committed roster, up to `MaxReplicaMovesPerPass` of them, lowest id first, get an explicit
+replica set in **one** map commit that bumps their generation. The set is **every current roster
+`Voter`**, dead or alive, each as a `Voter`.
 
-Consequences: a 3-node cluster at RF 3 converts to explicit three-voter sets, so a
-fourth node that joins hosts no data range until the balancer moves one onto it (it used to host a
-fourth copy of everything, forever); and a split made while voters do not exceed RF gives the child an
-empty set that the next pass converts the same way.
+A legacy range's quorum already is the roster's voter set, and recording it changes no quorum.
+Nodes that have and have not applied the new map agree on the denominator. A one-shot cut to RF
+voters would be unsafe: with 5 voters and RF 3, a majority of the new set and a majority of the old
+one can be disjoint, and a choice of "caught-up" voters does not close the gap under concurrent
+writes. The trim path shrinks the recorded set to RF one voter per commit, behind the leadership
+fence and the leader hand-off.
+
+Roster members that are not voters (`Learner`, `Leaving`) stop hosting the converted ranges. With
+the rebalancer off, no range converts, and the P0 leader logs one Warning per leadership with the
+number of ranges that wait.
+
+For example, a 3-node cluster at RF 3 converts to explicit three-voter sets, and a fourth node that
+joins hosts no data range until the balancer moves one onto it. A split made while voters do not
+exceed RF gives the child an empty set, which the next pass converts.
 
 **Split.** The child range **inherits the parent's replica set**. The data already lives on those
-nodes, so the child is at RF from birth with zero transfer; the rebalancer may spread it later.
+nodes, and the child is at RF from birth with no transfer. The rebalancer may spread it later.
 
-**Merge.** The survivor takes the **union** of both replica sets, so every node holding either
-range's data keeps serving; the union is usually over RF, which the rebalancer trims back — again as
-an ordinary over-replication case, no special machinery.
+**Merge.** The survivor takes the **union** of both replica sets, and all nodes that held either
+range's data serve it. The rebalancer trims a union that is over RF.
 
-**Membership.** A committed member removal (graceful leave or dead-node eviction) makes every range
-that had a replica there under-replicated; the planner re-replicates them at top priority. A newly
-promoted voter is a fresh target for spreading. Placement and roster changes are serialized on the
-same P0 loop, so they compose without racing.
+**Membership.** A committed member removal (graceful leave or dead-node eviction) makes each range
+that had a replica there under-replicated, and the planner repairs it at top priority. A newly
+promoted voter is a new target for spreading. Placement and roster changes are serialized on the
+same P0 loop.
 
-**Decommission drain (`RequestLeaveAsync`).** A *planned* departure inverts the repair order:
-instead of removing the member and repairing post-hoc (which can leave a range below quorum the
-moment the departing process stops), the node first commits the `Leaving` roster role and the pass
-evacuates its replicas **while it still serves**. No new planner input exists for this: a `Leaving`
-member drops out of the candidate set, so priority 1 already counts its ranges as
-under-replicated (the add draws on the repair budget) and the trim of its now-off-roster replica is
-classified as repair too. Three drain-specific rules live in the controller:
+**Decommission drain (`RequestLeaveAsync`).** In a *planned* departure the node first commits the
+`Leaving` roster role, and the pass evacuates its replicas **while it serves**. A `Leaving` member
+drops out of the candidate set. Priority 1 therefore counts its ranges as under-replicated (the add
+draws on the repair budget), and the trim of its replica counts as repair too. The controller adds
+three drain rules.
 
-- A transitional **learner sitting on the leaver is dropped** — promoting it would
-  make the leaver a voter the next pass has to evacuate again.
+- A transitional **learner on the leaver is dropped**. A promotion would make the leaver a voter
+  that the next pass has to evacuate again.
 - The pass **completes the removal itself**: once no non-`Removed` range names a `Leaving` member,
-  it commits the final `RemoveMember`. The drain is a property of committed state: a departing node that crashes after `Leaving` commits (or a P0 leadership change) still
-  converges.
-- Only **one member may be `Leaving` at a time**, guarded on roster state — two concurrent drains
+  it commits the final `RemoveMember`. The drain converges even if the departing node crashes after
+  `Leaving` commits or P0 leadership changes.
+- Only **one member may be `Leaving` at a time**, guarded on roster state. Two concurrent drains
   would shrink the voter set by two before either evacuation completes.
 
-A drain that cannot finish within `DecommissionDrainTimeout` rolls the role back to `Voter` (the
-campaign gates otherwise keep a `Leaving` node from ever campaigning again); if the pass's removal
-races that rollback, removal wins and the leave reports completed. A `Leaving` member that the SWIM
-detector evicts before the pass has evacuated it is a different exclusion: the roster records it
-as `Evicted` (`ClusterMembership.Departures`), the leave reports `Evicted` instead of completed,
-and the node re-admits itself — its replicas are still on it, and the learners the pass then adds
-to move them off can only be fed once it is a member again. Known limitation: a range whose
-*only* voter is the leaver (RF 1) can only drain while the leaver retains that range's leadership —
-if leadership is lost mid-drain the range has no electable voter until the drain times out and
-rolls back. Treat RF 1 decommission as unsupported.
+A drain that cannot finish within `DecommissionDrainTimeout` rolls the role back to `Voter`.
+Otherwise the node could not campaign again. If the pass's removal races that rollback, the removal
+wins and the leave is reported as completed.
+
+A `Leaving` member that the SWIM detector evicts before its evacuation is recorded in the roster as
+`Evicted` (`ClusterMembership.Departures`). The leave is reported as `Evicted`, and the node
+re-admits itself: its replicas are on it, and the learners that replace them can be fed only once
+it is a member again.
+
+Known limitation: a range whose *only* voter is the leaver (RF 1) can drain only while the leaver
+leads that range. If leadership is lost mid-drain, the range has no electable voter until the drain
+times out and rolls back. Treat RF 1 decommission as unsupported.
 
 ---
 
 ## Configuration
 
-All knobs live on `RaftConfiguration`:
+The settings are on `RaftConfiguration`.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `ReplicationFactor` | `0` | Target voter copies per range. **0 = full replication (feature off).** Prefer odd values: RF 4 needs 3-of-4 to commit — the same failure tolerance as RF 3, with an extra copy's cost. |
-| `EnablePlacementRebalancer` | `false` | Master switch for *ongoing* rebalancing (repair, trim, skew) and for converting legacy fully replicated ranges that a factor applies to. Initial placement at RF applies at bootstrap regardless; in-flight transitions always complete regardless. |
-| `PlacementPassInterval` | `5 s` | Cadence of the controller pass on the P0 leader, independent of the leader balancer's timer. Bounds convergence speed (see the worst-case bound above). Non-positive disables the timer; event-driven kicks still fire. |
-| `MaxReplicaMovesPerPass` | `4` | New moves initiated per controller pass, across all priorities. Bounds the blast radius of a bad plan. Keep ≥ `MaxConcurrentReplicaRepairs` + `MaxConcurrentReplicaTransfers` or it binds before the per-class budgets. |
-| `MaxConcurrentReplicaTransfers` | `1` | Balance-class moves (cosmetic trims, skew spreading) allowed mid-transition at once. Caps concurrent backfill/snapshot traffic so rebalancing never starves client writes. Repairs in flight count against it too, so balance work pauses during a repair wave. |
-| `MaxConcurrentReplicaRepairs` | `3` | Repair-class moves (re-replication of under-replicated ranges, sheds of replicas on evicted nodes) allowed mid-transition at once. Split from the transfer budget so restoring durability is never serialized behind it. |
-| `ReplicaCountDeadband` | `1` | Per-node replica-count imbalance tolerated before balancing moves are emitted. Prevents ping-ponging around an already-even spread. Repairs ignore it. |
-| `Zone` | `null` | Optional locality hint for the local node, gossiped on its load reports so the planner sees every node's zone; the planner (and the bootstrap assignment) prefer spreading a range's replicas across distinct zones. Whitespace-only values are normalized to null at `Validate()`. |
+| `ReplicationFactor` | `0` | Target voter copies per range. **0 = full replication (feature off).** Prefer odd values: RF 4 needs 3-of-4 to commit, the same failure tolerance as RF 3 at the cost of an extra copy. |
+| `EnablePlacementRebalancer` | `false` | Master switch for *ongoing* rebalancing (repair, trim, skew) and for the conversion of legacy ranges that a factor applies to. Initial placement at bootstrap and in-flight transitions do not depend on it. |
+| `PlacementPassInterval` | `5 s` | Cadence of the controller pass on the P0 leader. Bounds convergence speed (see the worst-case bound above). Non-positive disables the timer; event-driven passes are not affected. |
+| `MaxReplicaMovesPerPass` | `4` | New moves initiated per controller pass, across all priorities. Set it ≥ `MaxConcurrentReplicaRepairs` + `MaxConcurrentReplicaTransfers` or it binds before the per-class budgets. |
+| `MaxConcurrentReplicaTransfers` | `1` | Balance-class moves (trims, skew spreading) allowed mid-transition at once. Caps concurrent backfill/snapshot traffic. Repairs in flight count against it too, and balance work pauses during a repair wave. |
+| `MaxConcurrentReplicaRepairs` | `3` | Repair-class moves (re-replication of under-replicated ranges, sheds of replicas on evicted nodes) allowed mid-transition at once. |
+| `ReplicaCountDeadband` | `1` | Per-node replica-count imbalance tolerated before balance moves are emitted. Repairs ignore it. |
+| `Zone` | `null` | Optional locality hint for the local node, gossiped on its load reports. The planner and the bootstrap assignment prefer distinct zones for a range's replicas. Whitespace-only values are normalized to null at `Validate()`. |
 
 Per-range overrides go through `IRaft.SetReplicationFactorAsync(partitionId, rf)` (P0-leader-only;
-`0` clears the override). Changing an override adjusts the *target* only — replicas move on later
-controller passes — and deliberately does **not** bump the range's generation, because routing has
-not changed and consumer fences should stay valid.
+`0` clears the override). An override changes the *target*, and replicas move on later controller
+passes. Routing has not changed, and the range's generation is **not** bumped.
 
-A typical scale-out configuration:
+A typical scale-out configuration sets these values.
 
 ```csharp
 RaftConfiguration config = new()
@@ -568,43 +526,35 @@ RaftConfiguration config = new()
 
 ## Safety
 
-These are the invariants the implementation enforces; break one and you reintroduce a real
-distributed-systems failure mode.
+1. **Single mover per range.** The mutation handlers answer a second transitional replica with
+   `ConcurrentMembershipChange`. With two at once, two committed configurations can stop
+   overlapping in a quorum, which is a split brain.
 
-1. **Single mover per range.** Every mutation handler rejects a second transitional replica
-   (`ConcurrentMembershipChange`). Two transitional replicas at once is exactly the condition under
-   which two committed configurations can stop overlapping in a quorum — the split-brain Raft's
-   one-at-a-time membership rule exists to prevent.
+2. **Quorum only over committed voters.** Learners and removing replicas are peers and not quorum
+   members, which prevents quorum *inflation*. A node campaigns for a range only if the committed
+   set says it is a `Voter` of that range, which prevents a non-voter from counting itself.
 
-2. **Quorum only over committed voters.** Learners and removing replicas are peers, never quorum
-   members; a node campaigns for a range only if the committed set says it is a `Voter` of that
-   range. Both directions matter: excluding transitional replicas prevents quorum *inflation*, and
-   the campaign gate prevents a non-voter from counting itself.
+3. **Never below one voter.** Removal of the last voter replica of a range is refused
+   (`InsufficientVoters`). The range would be permanently uncommittable.
 
-3. **Never below one voter.** Removing the last voter replica of a range is refused
-   (`InsufficientVoters`) — it would make the range permanently uncommittable.
-
-4. **WAL reclaim only on committed absence.** A node deletes a range's WAL only when the committed
-   map no longer lists it as a replica (or the range itself is removed). Transient conditions never
+4. **WAL reclaim only on committed absence.** A node deletes a range's WAL when the committed map
+   no longer lists it as a replica, or the range itself is removed. A transient condition does not
    delete data a later configuration could need.
 
-5. **Anti-affinity.** Replica endpoints within a range are unique — one copy per node, always.
+5. **Anti-affinity.** Replica endpoints within a range are unique.
 
-6. **Idempotent re-drive.** Every lifecycle handler treats "already done" as success, and every
-   controller decision is re-derived from the committed map. P0 leadership can move at any point in
-   any sequence and the new leader converges without double-applying anything.
+6. **Idempotent re-drive.** Lifecycle handlers treat "already done" as success, and controller
+   decisions are re-derived from the committed map. P0 leadership can move at any point in a
+   sequence, and the new leader converges and applies each step once.
 
-7. **Legacy conversion is a quorum no-op.** The first replica set a legacy range receives is every
-   roster voter — the quorum it already had — never a subset. Cutting straight to RF voters would be
-   a multi-member configuration change whose old and new majorities need not overlap, which is the
-   split-brain the single-mover rule exists to prevent; the shrink happens afterwards, one voter per
-   commit, through the same trim path as any over-replicated range.
+7. **Legacy conversion is a quorum no-op.** The first replica set a legacy range receives is all
+   roster voters, the quorum it already had. A direct cut to RF voters would be a multi-member
+   change whose old and new majorities need not overlap.
 
-What the rebalancer *cannot* do, even misconfigured: it cannot commit through a minority (quorum math
-follows the committed voter set), cannot lose data by moving replicas (adds fully promote before the
-matching remove is planned), and cannot thrash forever against a balanced cluster (deadband + prefer-
-current-placement tiebreak make the even spread a fixed point — there is a test asserting exactly
-that).
+A misconfigured rebalancer cannot break these rules. Quorum follows the committed voter set, and a
+minority cannot commit. A move cannot lose data: an add fully promotes before the matching remove
+is planned. The deadband and the tie rule make the even spread a fixed point (a test asserts this),
+and a balanced cluster does not thrash.
 
 ---
 
@@ -620,9 +570,11 @@ that).
 | `Kommander/System/RaftSystemCoordinator.cs` | Wires the service into the serial P0 loop |
 | `Kommander/System/PartitionMapService.cs` | Initial placement at bootstrap; RF assignment for created partitions |
 | `Kommander/System/SplitMergeController.cs` | Child inherits replicas on split; survivor takes union on merge |
-| `Kommander/RaftManager.cs` | `GetPartitionPeers` / `IsPartitionVoter`, committed-map routing, partial materialization, un-host teardown, forwarding |
-| `Kommander/Scheduling/RaftPartitionHostAdapter.cs` | The two-line seam: `Nodes` / `IsVoter` become per-partition |
-| `Kommander/RaftPartitionStateMachine.cs` | Campaign gates also check the local node's per-range voter role |
+| `Kommander/PartitionRoutingTable.cs` | `GetPartitionPeers` / `IsPartitionVoter`, committed-map routing |
+| `Kommander/ReplicationGateway.cs` | The local forward fallback of `ReplicateLogs` |
+| `Kommander/RaftManager.cs` | Partial materialization (`StartUserPartitions`), un-host teardown (`StopUnhostedPartition`) |
+| `Kommander/Scheduling/RaftPartitionHostAdapter.cs` | `Nodes` / `IsVoter` become per-partition |
+| `Kommander/Consensus/ElectionCoordinator.cs` | Campaign gates also check the local node's per-range voter role |
 | `Kommander/IRaft.cs` | `GetPartitionReplicas`, `GetPartitionLeaderHint`, `HostsPartition`, `GetEffectiveReplicationFactor`, `SetReplicationFactorAsync` |
 | `Kommander/Communication/ICommunication.cs` | `ForwardReplicateLogs` (in-memory transport implements it) |
 | `Kommander.Tests/Scheduler/TestPlacementPlanner.cs` | Pure planner tests (even spread, repair, trim, stability, zones) |
@@ -632,48 +584,11 @@ that).
 
 ## Known limitations
 
-- **Wire forwarding.** The non-replica `ReplicateLogs` fallback is implemented for the in-memory
-  transport only; gRPC/REST transports report "unsupported" and the call fails as an unknown
-  partition. Consumers on those transports must route directly using `GetPartitionReplicas`.
-- **Zone at bootstrap.** Remote zones travel on gossiped load reports, so during initial cluster
-  assembly the bootstrap assignment may not have seen every node's zone yet and falls back to
-  even spread for the unknown ones; the rebalancer improves the zone spread on later passes as
-  reports flow. A durable alternative (zone as a committed roster property) remains a follow-up.
+- **Wire forwarding.** The non-replica `ReplicateLogs` fallback works on the in-memory transport
+  only. gRPC/REST transports report "unsupported" and the call fails as an unknown partition. Route
+  directly with `GetPartitionReplicas` on those transports.
+- **Zone at bootstrap.** Zones travel on gossiped load reports, and the bootstrap assignment may
+  not know all zones yet. It uses even spread for the unknown ones, and the rebalancer improves the
+  zone spread on later passes.
 - **Batch proposals.** `ReplicateEntries` (the heterogeneous batch API) does not forward from
-  non-replica nodes; batch producers should route directly.
-
----
-
-## FAQ
-
-**Do I need to do anything to keep my existing cluster working?**
-No. `ReplicationFactor` defaults to `0`, existing maps deserialize with empty replica sets, and an
-empty set means "every voter" — bit-for-bit today's behavior.
-
-**Why is an even RF discouraged?**
-RF 4 commits need 3 acks — the same single-failure tolerance as RF 3's 2-of-3, but with the storage
-and replication cost of a fourth copy. Go odd.
-
-**What happens if the cluster shrinks below RF?**
-The effective RF is capped at the live voter count, so the range degrades toward full replication
-(all voters host it) and re-expands as voters return. Safety is never affected — only how many
-copies exist.
-
-**Can a learner replica serve reads or votes?**
-No. It receives appends to catch up, but it never votes, never campaigns, and never counts in the
-quorum denominator. It starts doing all of that only at the `PromoteReplica` commit.
-
-**Who deletes the data on a node that lost a replica?**
-The node itself, when it applies the committed map that no longer lists it: it drains the partition
-executor, stops it, and reclaims that range's WAL. Nothing is deleted on rumor — only on the
-committed map.
-
-**What if P0 leadership changes in the middle of a move?**
-Nothing is lost. All durable state is in the committed map; the new P0 leader's first controller pass
-finds the `Learner` or `Removing` replica there and resumes exactly where the old leader stopped.
-The handlers are idempotent, so even a duplicated step is harmless.
-
-**How does this relate to the leader balancer?**
-They are complementary and share a design. Placement decides *which nodes host a range*; the leader
-balancer decides *which of those replicas leads*. Leadership can only ever land on a replica, because
-only replicas participate in the range's elections.
+  non-replica nodes. Batch producers should route directly.

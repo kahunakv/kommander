@@ -18,12 +18,15 @@ namespace Kommander.Data;
 /// but not yet committed; <see cref="LogIndex"/> is its assigned log index and <see cref="Ticket"/> is the
 /// shared manual ticket the caller commits or rolls back later via <c>CommitLogs</c>/<c>RollbackLogs</c>.</item>
 /// <item><see cref="RaftOperationStatus.PartitionMoved"/> — the entry was fenced out and <b>not</b> appended
-/// (per-entry fence, a deferred slice); <see cref="LogIndex"/> is <c>-1</c>.</item>
-/// <item>Any other status — the entry was not appended (typically a batch-level rejection propagated to every
-/// entry); <see cref="LogIndex"/> is <c>-1</c>.</item>
+/// by the per-entry fence; <see cref="LogIndex"/> is <c>-1</c>. The same status is also the failure status of a
+/// proposal that a split or a merge fenced after classification, and that proposal was not appended either.</item>
+/// <item>Any other status — a batch rejection, or a proposal that failed in flight; <see cref="LogIndex"/> is
+/// <c>-1</c>. A rejected batch was not appended. After <see cref="RaftOperationStatus.ProposalOutcomeUnknown"/> or
+/// <see cref="RaftOperationStatus.ProposalTimeout"/> the entry can be in the log and can commit later, so do not
+/// read <c>-1</c> as proof that it was not appended.</item>
 /// </list>
 /// </param>
-/// <param name="LogIndex">The entry's assigned log index, or <c>-1</c> when the entry was not appended.</param>
+/// <param name="LogIndex">The entry's assigned log index, or <c>-1</c> when <see cref="Status"/> is a failure.</param>
 /// <param name="Ticket">
 /// The shared manual-commit ticket for a trailing manual (<c>AutoCommit == false</c>) entry; always
 /// <see cref="HLCTimestamp.Zero"/> for auto-commit entries.

@@ -1,11 +1,8 @@
 # Heterogeneous Write Coalescing — Developer Guide
 
-This guide explains `ReplicateEntries`, the API that lets a consumer hand Kommander a **single batch of
-unrelated, per-entry-typed writes** for one partition and pay the per-proposal and per-round-trip cost once —
-while still getting an **independent result for every entry**. It is written for two readers: a developer
-building a consumer (a key/value store, a lock service, a transaction coordinator) who wants to stop making
-one `ReplicateLogs` call per record, and a developer extending the write path who needs the exact ordering,
-fencing, and durability rules. No prior Raft expertise is assumed.
+`ReplicateEntries` writes a batch of unrelated records to one partition and returns a separate result for each
+record. Each entry has a type of its choice. Use it when your application would otherwise make one
+`ReplicateLogs` call per record kind, for example in a key/value store or a transaction coordinator.
 
 ---
 
@@ -26,20 +23,14 @@ fencing, and durability rules. No prior Raft expertise is assumed.
 13. [Code map](#code-map)
 14. [Invariants you must not break](#invariants-you-must-not-break)
 15. [Testing](#testing)
-16. [Glossary](#glossary)
 
 ---
 
 ## Summary
 
-The single-type write surface, `ReplicateLogs`, wraps every payload in one `type`, one `autoCommit` flag,
-and returns one ticket for the whole call. A consumer that produces a burst of *unrelated* writes at once —
-key/value records, lock records, receipts, plus a prepare for a two-phase transaction — must therefore make
-one call per kind, each its own proposal and its own replication round trip.
-
-`ReplicateEntries` accepts a **heterogeneous** batch: each entry carries its own type, its own
-auto-commit/manual choice, and its own generation fence. Kommander turns the batch into **one proposal per
-commit group** and returns a **per-entry result array, index-aligned to the input**.
+`ReplicateLogs` takes one type and one `autoCommit` flag and returns one ticket for the call. A burst of mixed
+records costs one proposal and one replication round trip per kind. `ReplicateEntries` turns the burst into **one
+proposal per commit group** and returns a **result array that is index-aligned to the input**.
 
 ```
    ReplicateLogs("kv",     [a, b, c])   ─► proposal ─► round trip ─► ticket
@@ -51,22 +42,19 @@ commit group** and returns a **per-entry result array, index-aligned to the inpu
         one call ─► one auto-commit proposal ─► one round trip ─► per-entry results
 ```
 
-A batch is a **leading auto-commit group** plus an **optional single trailing manual group**:
+A batch is a leading auto-commit group plus an optional trailing manual group.
 
 ```
    [ auto, auto, auto,  manual, manual ]
      └──── commit together ────┘  └─ one ticket you commit or roll back later ─┘
 ```
 
-Every entry also carries an independent **generation fence**: an entry routed on a stale partition map is
-dropped (reported `PartitionMoved`) while its siblings proceed.
+Each entry also has an independent generation fence. An entry that was routed on a stale partition map is dropped
+with `PartitionMoved`, and the other entries proceed.
 
 ---
 
 ## `ReplicateEntries` versus `ReplicateLogs`
-
-`ReplicateLogs` is the right tool when every payload in a call shares one type and one fate. It stays, and is
-unchanged. `ReplicateEntries` exists for the case it cannot express:
 
 | You want to… | `ReplicateLogs` | `ReplicateEntries` |
 |---|---|---|
@@ -76,20 +64,15 @@ unchanged. `ReplicateEntries` exists for the case it cannot express:
 | Mix **auto-commit** records with a **manual** prepare in one call | ❌ two calls | ✅ auto prefix + trailing manual group |
 | Fence **individual** entries by partition generation | ❌ one fence for the call | ✅ per-entry fence |
 
-It saves **proposals and replication round trips** and gives a denser group commit. The `fsync` count
-stays at what the WAL scheduler already achieves — see
-[Ordering and durability guarantees](#ordering-and-durability-guarantees).
-
-> `ReplicateEntries` does **not** let you merge two *independent* manual tickets (for example prepares from
-> two different transactions) into one call. Each needs its own rollback decision, and the append-only log
-> can only truncate a suffix — so at most one manual group, and it must come last. Those remain separate
-> proposals whose WAL flushes still coalesce opportunistically in the scheduler.
+> You cannot merge two independent manual tickets, such as the prepares of two transactions, into one call. Each
+> needs its own rollback decision, and the append-only log can only truncate a suffix. Use separate proposals. Their
+> WAL flushes can coalesce in the scheduler.
 
 ---
 
 ## Batch structure
 
-You describe the batch as a list of `RaftProposalEntry`:
+A batch is a list of `RaftProposalEntry`.
 
 ```csharp
 public readonly record struct RaftProposalEntry(
@@ -101,20 +84,18 @@ public readonly record struct RaftProposalEntry(
 );
 ```
 
-The term fence is batch-level, unlike the per-entry generation fence: a term names the node, so one
-stale stamp means every entry was proposed to a node whose role the caller no longer knows, and two
-different non-zero stamps cannot both be current. Read the stamp with `IRaft.GetPartitionTerm`.
+The term fence applies to the batch. A stale term means that the caller no longer knows the node's role, and two
+different non-zero terms cannot both be current. Read the term with `IRaft.GetPartitionTerm`.
 
-Two shape rules are enforced **before anything is appended** (violations append nothing — no partial state):
+Two shape rules are checked before anything is appended.
 
-1. **All entries target the same partition.** The batch is per partition, like every proposal.
-2. **At most one manual group, and it must be last.** Once a manual (`AutoCommit == false`) entry appears, no
-   later entry may be auto-commit. `[auto, manual]`, `[manual, manual]`, and an all-manual batch are valid;
+1. **All entries target the same partition.**
+2. **At most one manual group, and it must be last.** After a manual (`AutoCommit == false`) entry, no later entry
+   can be auto-commit. `[auto, manual]`, `[manual, manual]`, and an all-manual batch are valid;
    `[auto, manual, auto]` and `[manual, auto]` are rejected.
 
-Rule 2 exists because a manual ticket is rolled back by **suffix truncation**. If a manual group could sit in
-the *middle* of a batch, truncating it would also destroy every entry appended after it. Forcing the manual
-group to the end keeps it a clean, truncatable suffix.
+A manual ticket is rolled back by **suffix truncation**. If a manual group were in the middle of a batch, the
+truncation would also destroy the entries after it.
 
 ```
    safe:      [ auto  auto | manual manual ]      rollback truncates only the manual suffix
@@ -127,19 +108,15 @@ group to the end keeps it a clean, truncatable suffix.
 
 ## The per-entry generation fence
 
-When a partition splits or merges, its **generation** is bumped. A consumer that routed a write using an old
-partition map is writing to a key range that may have moved. The generation fence rejects such stale writes.
+A split or merge bumps the partition's **generation**. The fence catches writes that were routed on an old partition
+map.
 
-Each entry sets `ExpectedGeneration` independently:
+| `ExpectedGeneration` | Meaning |
+|---|---|
+| `0` | Unfenced and always admitted. Use it for hash-routed writes that do not depend on the partition map generation. |
+| non-zero `N` | Admitted if the partition's current committed generation is `N`. Otherwise this entry is dropped with `PartitionMoved`, and its siblings are unaffected. |
 
-- **`0`** — unfenced. Use for hash-routed writes that do not depend on the partition map generation. Always
-  admitted.
-- **non-zero `N`** — fenced. Admitted only if the partition's current committed generation is still `N`;
-  otherwise this entry is dropped and reported `PartitionMoved`, **and its siblings are unaffected**.
-
-Because the fence is per entry, one batch may freely mix hash-routed (`0`) entries with fenced key-range
-entries, and even entries expecting *different* non-zero generations. Only entries whose fence misses are
-dropped.
+One batch can mix unfenced entries with entries that expect different generations.
 
 ```
    partition currently at generation 7
@@ -149,18 +126,14 @@ dropped.
      admitted     admitted     fenced ─► PartitionMoved   (siblings still commit)
 ```
 
-> **Residual to know about.** The fence is evaluated against the partition generation at the moment the batch
-> is classified, just before the append. For an *unambiguous key-range batch* (every admitted entry
-> non-zero, none hash-routed), the classify→append window is closed with an executor-side backstop, so a
-> split/merge landing mid-flight fences the whole admitted group. A **mixed** admitted set (hash-routed +
-> key-range in the same batch) cannot use that backstop without also fencing the hash-routed entries, so its
-> fence is best-effort at classification time. This matches the best-effort nature of the single-type fence.
+> **Limit of the fence.** The fence is evaluated when the batch is classified, just before the append. If all admitted
+> entries are fenced, the executor checks the generation again, and a split or merge that lands in between fences the
+> complete admitted group. If the admitted set also contains hash-routed entries, that second check would fence them
+> too. The fence is then best-effort at classification time, as it is for `ReplicateLogs`.
 
 ---
 
 ## Flow 1 — A heterogeneous auto-commit batch
-
-The common, highest-value case: many auto-commit records of mixed types committed together.
 
 ```csharp
 RaftBatchReplicationResult result = await raft.ReplicateEntries(
@@ -174,13 +147,11 @@ RaftBatchReplicationResult result = await raft.ReplicateEntries(
     cancellationToken);
 ```
 
-What happens:
-
-1. The batch is validated (shape, reserved-type) and each entry is classified against the generation fence.
-   All four are unfenced here, so all are admitted.
-2. Kommander builds **one** `RaftLog` list — each log keeping its own type — and creates **one** auto-commit
-   proposal. That is one AppendEntries fan-out per follower and one group-committed WAL write.
-3. When the proposal commits, every entry's result is filled in:
+1. The batch is validated and each entry is classified against the generation fence. These four are unfenced and
+   admitted.
+2. Kommander creates one auto-commit proposal, and each log has the type of its entry. The cost is one AppendEntries
+   fan-out per follower and one group-committed WAL write.
+3. When the proposal commits, the results are filled in.
 
 ```
    result.Success            = true
@@ -191,16 +162,14 @@ What happens:
    result.Entries[3]         = { Success, LogIndex=45, Ticket=Zero }   // kv
 ```
 
-Each entry's `LogIndex` is its assigned position in the log; auto-commit entries carry no caller-held ticket
-(`Ticket == Zero`). On a follower, the entries are ordinary typed log records — the consumer's registered
-restorers dispatch by `Type` exactly as they do for `ReplicateLogs`.
+`LogIndex` is the entry's position in the log. Auto-commit entries carry no ticket (`Ticket == Zero`). On a follower,
+the registered restorers dispatch by `Type`, as they do for `ReplicateLogs`.
 
 ---
 
 ## Flow 2 — A trailing manual group
 
-A batch may end with **one** manual group whose commit or rollback you control later — for example, a burst
-of auto-commit records plus a single transaction prepare.
+A batch can end with one manual group that you commit or roll back later, such as a transaction prepare.
 
 ```csharp
 RaftBatchReplicationResult result = await raft.ReplicateEntries(
@@ -213,8 +182,8 @@ RaftBatchReplicationResult result = await raft.ReplicateEntries(
     cancellationToken);
 ```
 
-The auto prefix commits with the batch. The manual entries are **durable but not committed** — they report
-`Pending` and share **one** ticket:
+The auto prefix commits with the batch. The manual entries are **durable but not committed**. They are `Pending` and
+share one ticket.
 
 ```
    result.Entries[0] = { Success, LogIndex=50, Ticket=Zero }        // kv (committed)
@@ -223,7 +192,7 @@ The auto prefix commits with the batch. The manual entries are **durable but not
    result.TicketId   = T                                            // the actionable ticket
 ```
 
-Later, you finish the manual group with the existing two-phase calls:
+Finish the manual group with the two-phase calls.
 
 ```csharp
 HLCTimestamp ticket = result.TicketId;
@@ -235,17 +204,13 @@ await raft.CommitLogs(partitionId, ticket, cancellationToken);
 await raft.RollbackLogs(partitionId, ticket, cancellationToken);
 ```
 
-Because the auto group commits **before** the manual group is proposed (see
-[Ordering and durability guarantees](#ordering-and-durability-guarantees)), the manual entries always sit at
-the highest indices, on top of a committed prefix. Rolling the ticket back can never touch the committed auto
-entries.
+The manual entries sit above a committed prefix, and a rollback of the ticket cannot touch the committed auto entries.
 
 ---
 
 ## Flow 3 — Per-entry fencing
 
-A batch that mixes a valid and a stale-generation entry appends the valid one and drops the stale one,
-without failing the batch:
+A stale-generation entry does not fail the batch.
 
 ```csharp
 RaftBatchReplicationResult result = await raft.ReplicateEntries(
@@ -261,96 +226,81 @@ RaftBatchReplicationResult result = await raft.ReplicateEntries(
 // result.Entries[1] == { PartitionMoved, LogIndex=-1, Ticket=Zero }
 ```
 
-The fenced entry keeps its input slot, with `LogIndex == -1`, so the array stays index-aligned. If **every**
-entry is fenced, nothing is appended and the whole batch reports `PartitionMoved` (overall `Success == false`)
-so the caller knows to refresh its partition map and retry.
+The fenced entry has `LogIndex == -1` in its input slot. If all entries are fenced, the batch returns
+`PartitionMoved` with `Success == false`. Refresh your partition map and retry.
 
 ---
 
 ## Reading the result
 
-`ReplicateEntries` returns a `RaftBatchReplicationResult`:
-
 ```csharp
 public sealed class RaftBatchReplicationResult
 {
-    public bool Success { get; }                       // batch admitted and ≥1 entry landed
+    public bool Success { get; }                       // every admitted group reached quorum
     public RaftOperationStatus Status { get; }         // overall status
-    public HLCTimestamp TicketId { get; }              // the manual ticket, or the auto ticket, or Zero
+    public HLCTimestamp TicketId { get; }              // the manual ticket, else the auto ticket; Zero on failure
     public IReadOnlyList<RaftEntryResult> Entries { get; } // index-aligned to the input list
 }
 
 public readonly record struct RaftEntryResult(
     RaftOperationStatus Status,
-    long LogIndex,        // assigned index, or -1 when the entry was not appended
+    long LogIndex,        // assigned index, or -1 on a failure status
     HLCTimestamp Ticket   // shared manual ticket for a manual entry, else Zero
 );
 ```
-
-**Per-entry statuses:**
 
 | `RaftEntryResult.Status` | Meaning | `LogIndex` | `Ticket` |
 |---|---|---|---|
 | `Success` | Auto-commit entry, appended and committed | its index | `Zero` |
 | `Pending` | Trailing manual entry, durable but not yet committed | its index | shared manual ticket |
 | `PartitionMoved` | Fenced out; not appended | `-1` | `Zero` |
-| any other | Not appended (batch-level failure propagated) | `-1` | `Zero` |
+| any other | The batch was rejected, or the proposal failed in flight | `-1` | `Zero` |
 
-**Overall result:**
-
-- `Success == true` when the batch was admitted and at least one entry landed. Individual entries may still
-  be `PartitionMoved` — always inspect per entry.
-- `Success == false` only on a batch-level rejection (bad shape) or when **every** entry was fenced out
-  (`Status == PartitionMoved`, nothing appended).
-
-**Index alignment.** `Entries[i]` always describes the input entry at position `i`, regardless of how the
-entries were split into auto and manual groups internally. `LogIndex` values come from the log position
-assigned to each entry.
+`Success == true` means that each admitted group reached quorum. Individual entries may be `PartitionMoved`, and you
+should inspect each one. After `ProposalOutcomeUnknown` or `ProposalTimeout`, the entry can be in the log and can commit
+later, although its `LogIndex` is `-1`. `Entries[i]` always describes the input entry at position `i`.
 
 ---
 
 ## Rejections and errors
 
+When a batch is rejected or all its entries are fenced out, no entry is appended and there is no partial state to clean
+up.
+
 | Condition | Result |
 |---|---|
 | Empty batch | `Success == true`, no entries — a no-op |
-| Auto-commit entry after a manual entry (bad shape) | Batch-level rejection: `Success == false`, `Status == Errored`, every slot `Errored`/`LogIndex -1`, nothing appended |
-| Every entry fenced out | `Success == false`, `Status == PartitionMoved`, every slot `PartitionMoved`, nothing appended |
+| Auto-commit entry after a manual entry (bad shape) | `Success == false`, `Status == Errored`, all slots `Errored`/`LogIndex -1` |
+| Stale `ExpectedTerm`, or two different non-zero ones | `Success == false`, `Status == TermMismatch` |
+| All entries fenced out | `Success == false`, `Status == PartitionMoved`, all slots `PartitionMoved` |
 | Some entries fenced, some admitted | `Success == true`, fenced slots `PartitionMoved`, admitted slots `Success`/`Pending` |
 | Reserved system log type on the system partition | Throws `RaftException` before any append |
-| Not the leader / lost leadership mid-flight | Admitted slots carry the failure status (e.g. `NodeIsNotLeader`); `Success == false` |
-
-A batch-level rejection is atomic: nothing is appended, so there is no partial state to clean up.
+| Not the leader | `Success == false`, `Status == NodeIsNotLeader`; that group was not appended |
+| Lost leadership mid-flight | `Success == false`; the affected slots carry the failure status, for example `ProposalOutcomeUnknown` |
+| Only the manual group fails | `Success == false`, `TicketId == Zero`; the auto slots are `Success` and committed |
 
 ---
 
 ## Ordering and durability guarantees
 
-**Auto commits before manual is proposed.** The auto group and the manual group are two separate proposals
-(the log commits or rolls back an entire proposal as a unit, and these two groups have different fates). They
-are proposed **sequentially** — the auto group commits first, then the manual group is proposed on top of it.
-This order is a safety requirement: if the two were posted together and the auto group failed
-to commit *after* the manual propose was already durable, a later `CommitLogs` on the manual ticket could
-advance the commit index past the uncommitted auto entries. Committing auto first makes the manual group a
-clean uncommitted suffix on a committed prefix.
+**Auto commits before manual is proposed.** The two groups are separate proposals, because the log commits or rolls
+back a proposal as a unit. The order is a safety requirement. If the groups were posted together and the auto group
+failed to commit after the manual propose was durable, a later `CommitLogs` on the manual ticket could advance the
+commit index past the uncommitted auto entries.
 
-**Flush coalescing is opportunistic.** Because the two groups are proposed sequentially, there is no
-guaranteed single `fsync` spanning both. Auto-commit-only batches are one proposal and ride one
-group-committed write; a batch with a manual group is two proposals whose WAL writes coalesce only as the
-scheduler's group commit happens to merge them with concurrent traffic. `ReplicateEntries` reduces the number
-of *proposals* and *round trips*; the scheduler's floor on syncs stays the same — see the
-[WAL Write Durability guide](wal-commit-durability-developer-guide.md) for the sync mechanics and the
-`WalGroupCommitLingerMs` lever that raises coalescing density.
+**Flush coalescing is opportunistic.** An auto-only batch rides one group-committed write. A batch with a manual
+group has two writes, and they coalesce if the scheduler merges them with concurrent traffic. `ReplicateEntries` reduces
+proposals and round trips, and the scheduler's floor on syncs stays the same. For more information, see the
+[WAL Write Durability guide](wal-commit-durability-developer-guide.md).
 
-**No ordering across entries beyond "auto before manual."** A batch is a set with one commit boundary per
-group and no cross-entry dependencies. Do not assume any order between two entries in the same
+**No ordering across entries beyond "auto before manual".** Do not assume any order between two entries in the same
 group.
 
 ---
 
 ## API reference
 
-The surface lives on `IRaft` (implemented by `RaftManager`):
+The method is on `IRaft`, and the supporting types are in `Kommander/Data/`.
 
 ```csharp
 Task<RaftBatchReplicationResult> ReplicateEntries(
@@ -359,13 +309,8 @@ Task<RaftBatchReplicationResult> ReplicateEntries(
     CancellationToken cancellationToken = default);
 ```
 
-Supporting types (all in `Kommander/Data/`):
-
-- **`RaftProposalEntry`** — one typed input entry: `Type`, `Data`, `AutoCommit`, `ExpectedGeneration`, `ExpectedTerm`.
-- **`RaftEntryResult`** — one per-entry outcome: `Status`, `LogIndex`, `Ticket`.
-- **`RaftBatchReplicationResult`** — the batch outcome: `Success`, `Status`, `TicketId`, `Entries`.
-
-Manual-group lifecycle (existing calls, reused unchanged):
+Finish a manual group with these calls. Pass `RaftBatchReplicationResult.TicketId`, or the `RaftEntryResult.Ticket` of
+any manual entry.
 
 ```csharp
 Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(
@@ -375,23 +320,18 @@ Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(
     int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default);
 ```
 
-Pass the `RaftBatchReplicationResult.TicketId` (or any manual entry's `RaftEntryResult.Ticket`) to
-`CommitLogs`/`RollbackLogs`.
-
 ---
 
 ## Configuration
 
-`ReplicateEntries` adds no configuration of its own. Its throughput and coalescing behaviour are governed by
-the same WAL-scheduler knobs as every other write:
+`ReplicateEntries` adds no configuration. The WAL-scheduler settings apply, and the
+[WAL Write Durability guide](wal-commit-durability-developer-guide.md) explains how they interact.
 
 | Setting | Default | Relevance to batches |
 |---|---|---|
 | `WalGroupCommitLingerMs` | `0` | `> 0` lets the scheduler linger to gather more ready writes into one `fsync`, raising coalescing density for a manual group riding a separate flush. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into one `walAdapter.Write`. |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write — bounds how large a single proposal's write can be. |
-
-See the [WAL Write Durability guide](wal-commit-durability-developer-guide.md) for how these interact.
 
 ---
 
@@ -400,19 +340,19 @@ See the [WAL Write Durability guide](wal-commit-durability-developer-guide.md) f
 ```
 Kommander/
 ├─ IRaft.cs                        ReplicateEntries declaration
-├─ RaftManager.cs                  ReplicateEntries — the orchestration:
+├─ ReplicationGateway.cs           ReplicateEntries — the orchestration:
 │     ├─ shape validation           auto-prefix + single trailing manual group; reserved-type guard
 │     ├─ per-entry fence            classify each entry vs partition.Generation; PartitionMoved slots
 │     ├─ auto group                 propose (autoCommit:true) + WaitForQuorum → commit
 │     ├─ manual group               propose (autoCommit:false) + WaitForQuorum → propose-quorum durable
 │     └─ RejectBatch / FailBatch    batch-level and in-flight failure results
-├─ RaftPartition.cs                ReplicateEntries(List<RaftLog>, expectedGeneration, autoCommit)
+├─ RaftPartition.cs                ProposeEntriesAsync(List<RaftLog>, expectedGeneration, autoCommit, expectedTerm)
 │                                   — posts one ReplicateLogs executor request per group
 ├─ Data/
-│     ├─ RaftProposalEntry.cs       input entry (Type, Data, AutoCommit, ExpectedGeneration)
+│     ├─ RaftProposalEntry.cs       input entry (Type, Data, AutoCommit, ExpectedGeneration, ExpectedTerm)
 │     ├─ RaftEntryResult.cs         per-entry outcome (Status, LogIndex, Ticket)
 │     └─ RaftBatchReplicationResult.cs   batch outcome (Success, Status, TicketId, Entries)
-└─ RaftPartitionStateMachine.cs    the proposal/commit/rollback path both groups reuse
+└─ Consensus/LogReplicator.cs      the proposal/commit/rollback path both groups reuse
 
 Kommander.Tests/
 └─ TestReplicateEntries.cs         heterogeneous commit + restore-by-type on a follower;
@@ -425,60 +365,35 @@ Kommander.Tests/
 
 ## Invariants you must not break
 
-- **One manual group, last.** If you change the shape validation, the manual group must remain a single
-  contiguous **suffix**. A manual group anywhere but the end is not truncation-safe.
-- **Auto commits before manual is proposed.** Never post the two groups concurrently. The sequential order is
-  what keeps a manual `CommitLogs`/`RollbackLogs` from reaching the auto entries.
-- **Results stay index-aligned to the input.** Every code path — admitted, fenced, or failed — must leave
-  `Entries[i]` describing input entry `i`. Fenced and failed slots carry `LogIndex == -1`.
-- **A batch-level rejection appends nothing.** Shape and reserved-type checks run before any append; they must
-  never leave partial state.
-- **Per-entry `LogIndex` comes from the assigned log id.** It is read back off the same `RaftLog` instances
-  after the propose reply resolves — do not derive it from a single commit index.
+- **One manual group, last.** The manual group must remain a single contiguous suffix. In any other position it is not
+  truncation-safe.
+- **Auto commits before manual is proposed.** Never post the two groups concurrently. The sequential order stops a
+  manual `CommitLogs`/`RollbackLogs` from reaching the auto entries.
+- **Results stay index-aligned to the input.** All code paths must leave `Entries[i]` describing input entry `i`. Fenced
+  and failed slots carry `LogIndex == -1`.
+- **A batch-level rejection appends nothing.** Shape and reserved-type checks run before any append.
+- **Per-entry `LogIndex` comes from the assigned log id.** It is read back off the same `RaftLog` instances after the
+  propose reply resolves. Do not derive it from a single commit index.
 
 ---
 
 ## Testing
 
-`Kommander.Tests/TestReplicateEntries.cs` runs on a real two-node in-memory cluster so the follower
-receives each batch:
+`Kommander.Tests/TestReplicateEntries.cs` uses a real two-node in-memory cluster.
 
-- **Heterogeneous auto-commit** — a mixed-type batch commits as one proposal; per-entry indices are
-  contiguous and index-aligned; the follower restores each entry under its own type.
-- **Trailing manual group** — the auto prefix commits; the manual entries are `Pending` under one shared
-  ticket; committing the ticket commits the suffix, and rolling it back marks the suffix rolled back while the
-  committed auto prefix survives.
+- **Heterogeneous auto-commit** — a mixed-type batch commits as one proposal, the indices are contiguous, and the
+  follower restores each entry under its type.
+- **Trailing manual group** — the manual entries are `Pending` under one ticket. A commit commits the suffix. A rollback
+  marks the suffix rolled back, and the committed auto prefix survives.
 - **Shape rejection** — an auto-commit entry after a manual entry is rejected before any append.
-- **Per-entry fence** — a mix of admitted and fenced entries appends the admitted ones and reports
-  `PartitionMoved` only in the fenced slots (overall `Success`); a fenced entry interleaved with the manual
-  split does not disturb either group; an all-fenced batch reports `PartitionMoved` and appends nothing.
+- **Per-entry fence** — a mixed batch appends the admitted entries. A fenced entry interleaved with the manual split does
+  not disturb either group. An all-fenced batch returns `PartitionMoved`.
 
-When you touch this path, run the full test project — it exercises shared scheduling, WAL, and cluster
-coordination, and the two-node flows are timing-sensitive.
-
----
-
-## Glossary
-
-- **Heterogeneous batch** — a set of entries in one call that may each have a different type, auto-commit
-  choice, and generation fence.
-- **Commit group** — a set of entries that commit or roll back together as one proposal. A batch has one
-  auto-commit group and at most one trailing manual group.
-- **Auto-commit entry** — an entry that commits with the batch; its result carries an index and no ticket.
-- **Manual entry / trailing manual group** — entries held for an explicit later `CommitLogs`/`RollbackLogs`;
-  they share one ticket and must sort after every auto-commit entry.
-- **Ticket** — the `HLCTimestamp` handle for a manual group, passed to `CommitLogs`/`RollbackLogs`.
-- **Generation fence** — a per-entry check against the partition's committed generation; a stale entry is
-  dropped with `PartitionMoved`.
-- **Generation** — the partition-map version, bumped on split/merge.
-- **`PartitionMoved`** — the status for an entry (or a whole all-fenced batch) whose generation fence missed;
-  refresh the partition map and retry.
-- **Index-aligned** — `Entries[i]` corresponds to input entry `i`, whatever internal grouping occurred.
-- **Suffix truncation** — how a manual rollback removes entries: everything after a point, which is why the
-  manual group must be last.
+When you change this path, run the full test project. The two-node flows are timing-sensitive, and the path is shared
+with scheduling, WAL, and cluster coordination.
 
 ---
 
-*For the broader system, see the [Architecture Overview](architecture-overview.md); for the sync mechanics a
-batch rides, see the [WAL Write Durability & Single-Fsync Commit Guide](wal-commit-durability-developer-guide.md);
-for how a partition's generation changes, see the [Elastic Partitions Developer Guide](elastic-partitions-developer-guide.md).*
+*Related: [Architecture Overview](architecture-overview.md),
+[WAL Write Durability & Single-Fsync Commit Guide](wal-commit-durability-developer-guide.md), and
+[Elastic Partitions Developer Guide](elastic-partitions-developer-guide.md) for how a partition's generation changes.*
