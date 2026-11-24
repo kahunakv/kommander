@@ -127,6 +127,9 @@ public sealed class TestPartitionNotHosted
             async () => await manager.ConfirmLeadershipAsync(ForeignPartition, TestContext.Current.CancellationToken));
 
         await Assert.ThrowsAsync<PartitionNotHostedException>(
+            async () => await manager.ConfirmLeadershipLeaseAsync(ForeignPartition, TestContext.Current.CancellationToken));
+
+        await Assert.ThrowsAsync<PartitionNotHostedException>(
             async () => await manager.WaitForLeader(ForeignPartition, TestContext.Current.CancellationToken));
 
         // ConfirmLocalApplicationAsync fails closed instead of throwing.

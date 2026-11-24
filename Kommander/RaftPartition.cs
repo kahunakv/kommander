@@ -975,6 +975,13 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
+    /// Whether this node is the published leader of the partition under a lease that is still fresh:
+    /// the first half of <see cref="ConfirmLeadershipAsync"/> on its own, with no look at the applied
+    /// frontier. Reads published state only, so it never touches the executor queue.
+    /// </summary>
+    internal bool HoldsFreshLease() => stateMachine.TryReadFreshLease(out _, out _);
+
+    /// <summary>
     /// Leader-side answer to a non-leader's read-index fetch: runs the same confirmation as
     /// <see cref="ConfirmLeadershipAsync"/> but surfaces the quorum-confirmed commit index the
     /// round captured (carried on the reply's <see cref="RaftResponse.LogIndex"/>) so a remote

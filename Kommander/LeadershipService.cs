@@ -165,6 +165,21 @@ internal sealed class LeadershipService
     }
 
     /// <summary>
+    /// Leadership confirmation without the applied-frontier wait — see
+    /// <see cref="IRaft.ConfirmLeadershipLeaseAsync"/> for the contract. A fresh lease answers on
+    /// the calling thread and allocates nothing; anything else is
+    /// <see cref="ConfirmLeadershipAsync"/>, error mapping included.
+    /// </summary>
+    internal async ValueTask<bool> ConfirmLeadershipLeaseAsync(int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!isInitialized())
+            return false;
+
+        return partitionProvider.GetPartition(partitionId).HoldsFreshLease()
+            || await ConfirmLeadershipAsync(partitionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Follower catch-up confirmation — see <see cref="IRaft.ConfirmLocalApplicationAsync"/> for
     /// the contract. On the (believed) leader the call degenerates to
     /// <see cref="ConfirmLeadershipAsync"/>: the leader's own applied-frontier wait is the same

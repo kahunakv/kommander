@@ -2096,6 +2096,13 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         leadershipService.ConfirmLeadershipAsync(partitionId, cancellationToken);
 
     /// <summary>
+    /// Leadership confirmation without the applied-frontier wait — see
+    /// <see cref="IRaft.ConfirmLeadershipLeaseAsync"/> for the contract.
+    /// </summary>
+    public ValueTask<bool> ConfirmLeadershipLeaseAsync(int partitionId, CancellationToken cancellationToken = default) =>
+        leadershipService.ConfirmLeadershipLeaseAsync(partitionId, cancellationToken);
+
+    /// <summary>
     /// Follower catch-up confirmation — see <see cref="IRaft.ConfirmLocalApplicationAsync"/> for
     /// the contract.
     /// </summary>

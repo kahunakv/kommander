@@ -646,6 +646,35 @@ public interface IRaft
     public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Confirms this node's leadership for the partition without the applied-frontier half of
+    /// <see cref="ConfirmLeadershipAsync"/>: a fresh leadership lease answers it, and the entries
+    /// this node committed but did not deliver to its consumer yet are not waited for.
+    /// <para><b>What a true answer proves.</b> No other node committed an entry of this partition
+    /// before the lease was confirmed, and every entry of an earlier leadership is delivered to the
+    /// consumer on this node, because leadership is published only after that. The entries that can
+    /// be committed and not delivered are the ones this node proposed while it leads now.</para>
+    /// <para><b>What the caller must add.</b> A proposal is answered when its entries are durable
+    /// on a quorum, and the delivery to the consumer on this node follows. A local read served after
+    /// a true answer is linearizable only when the caller knows that no undelivered entry of its own
+    /// can change what it reads, for example because it keeps the keys of its proposals until their
+    /// entries are delivered. A caller without that knowledge uses
+    /// <see cref="ConfirmLeadershipAsync"/>.</para>
+    /// <para>Without a fresh lease this is <see cref="ConfirmLeadershipAsync"/>, applied-frontier
+    /// wait included, and a <see langword="false"/> answer means the same thing there and here. The
+    /// default implementation does the same, so an implementation that has no lease stays
+    /// correct.</para>
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
+    public ValueTask<bool> ConfirmLeadershipLeaseAsync(int partitionId, CancellationToken cancellationToken = default) =>
+        ConfirmLeadershipAsync(partitionId, cancellationToken);
+
+    /// <summary>
     /// Follower catch-up confirmation: proves this node's <b>applied</b> state for the partition
     /// covers everything committed cluster-wide before the call began, whether or not this node
     /// is the leader. Returns <see langword="true"/> only when a leader-confirmed commit index —

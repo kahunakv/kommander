@@ -300,6 +300,57 @@ public class TestLeadershipLease
         Assert.True(sm.TryConfirmLeadershipFast());
     }
 
+    // ── the lease half on its own ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task LeaseHalf_IgnoresTheAppliedFrontier_AndMissesWithEveryLossOfLeadership()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        // No confirmation yet, so there is no lease to read.
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+
+        // Committed entries that are not applied do not matter to this half.
+        await ConfirmOnce(sm, host);
+        sm.SetLocalCommittedIndexForTesting(5);
+        Assert.False(sm.TryConfirmLeadershipFast());
+        Assert.True(sm.TryReadFreshLease(out _, out _));
+
+        // A leader whose promotion barrier is armed may not have applied the entries of earlier terms.
+        host.Leader = "";
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+        host.Leader = "node-a";
+        Assert.True(sm.TryReadFreshLease(out _, out _));
+
+        // The window of the lease bounds this half as it bounds the full confirmation.
+        host.AdvanceMonotonic(host.Configuration.HeartbeatInterval);
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+
+        await Ack(sm, host, "node-b");
+        Assert.True(sm.TryReadFreshLease(out _, out _));
+
+        await sm.StepDownAsync(replyCorrelationId: null);
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+
+        // A new leadership starts without the lease of the one before it.
+        sm.SetLeaderForTesting(term: 3);
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+    }
+
+    [Fact]
+    public async Task LeaseHalf_DiesWithAHigherTerm()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+
+        await ConfirmOnce(sm, host);
+        Assert.True(sm.TryReadFreshLease(out _, out _));
+
+        await Ack(sm, host, "node-b", responseTerm: 2);
+
+        Assert.False(sm.TryReadFreshLease(out _, out _));
+    }
+
     // ── re-arm after a new stint ───────────────────────────────────────────────
 
     [Fact]
