@@ -147,7 +147,8 @@ public class GrpcCommunication : ICommunication
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint,
-            PreVote = request.PreVote
+            PreVote = request.PreVote,
+            NoticeOnly = request.NoticeOnly
         };
 
         GrpcBatchRequestsRequestItem requestItem = new()
@@ -692,7 +693,8 @@ public class GrpcCommunication : ICommunication
                     TimePhysical = requestItem.RequestVotes.Time.L,
                     TimeCounter = requestItem.RequestVotes.Time.C,
                     Endpoint = requestItem.RequestVotes.Endpoint,
-                    PreVote = requestItem.RequestVotes.PreVote
+                    PreVote = requestItem.RequestVotes.PreVote,
+                    NoticeOnly = requestItem.RequestVotes.NoticeOnly
                 };
                 return item;
 

@@ -27,8 +27,10 @@ namespace Kommander.Consensus;
 /// a RequestVote carrying a higher term is adopted <em>unconditionally</em>, including by a
 /// follower, or a follower keeps ACKing a deposed leader at the old term and hands it a phantom
 /// quorum; the step-down bookkeeping alone stays gated on node state. Pre-vote is strictly
-/// side-effect-free with one deliberate exception — un-quiescing, which is scheduling state, not
-/// §3 vote state. A candidate whose log is behind is denied by
+/// side-effect-free with two deliberate exceptions, neither of them §3 vote state: un-quiescing,
+/// which is scheduling state, and the record that the sender does not lead
+/// (<see cref="NoteSenderDoesNotLead"/>), which only ends quiescence and refuses a delayed quiesce
+/// marker of a leadership that ended. A candidate whose log is behind is denied by
 /// <c>(lastLogTerm, lastLogIndex)</c> lexicographic comparison, never by index alone. And the vote
 /// record is persisted to hard state <em>before</em> the grant is sent, so a crash cannot produce a
 /// double vote in one term.</para>
@@ -542,6 +544,88 @@ internal sealed class ElectionCoordinator
         return true;
     }
 
+    /// <summary>
+    /// True when the leadership this follower remembers for its current term is known to be over,
+    /// whatever SWIM says about the node: <paramref name="expectedLeader"/> left the range
+    /// (<see cref="ExpectedLeaderLeftTheRange"/>), or it stated on the vote path that it does not
+    /// lead this term (<see cref="RaftPartitionCoreState.IsKnownNotLeading"/>).
+    /// <para>Both quiesced gates ask this before they defer to SWIM liveness. Liveness answers
+    /// "is the node up?". A leader that restarted, or stepped down on a storage fault, is up and
+    /// leads nothing. While such a node could campaign, its own pre-vote was the way out. A node
+    /// whose candidacy is held (storage quarantine, stalled disk, withheld by the application)
+    /// sends no pre-vote, so every quiesced follower stayed calm, every pre-vote of a healthy peer
+    /// was denied, and the partition had no leader until the hold ended — forever for a quarantine
+    /// that only a leader can lift (Jepsen lost-tail, run 45829910335: partition 2 leaderless for
+    /// the last 5.5 minutes of the run).</para>
+    /// </summary>
+    public bool ExpectedLeadershipVacated(string expectedLeader) =>
+        ExpectedLeaderLeftTheRange(expectedLeader)
+        || (!string.IsNullOrEmpty(expectedLeader) && coreState.IsKnownNotLeading(expectedLeader, coreState.CurrentTerm));
+
+    /// <summary>
+    /// Records what a vote-path message for <paramref name="voteTerm"/> proves about its sender: it
+    /// leads no term below <paramref name="voteTerm"/> (see
+    /// <see cref="RaftPartitionCoreState.NoteNotLeading"/> for why that holds for a pre-vote probe, a
+    /// leaderless notice and a real vote request alike, and why a late message cannot make it false).
+    /// When the sender is the leader this follower remembers for its current term, that leadership
+    /// is vacated: the follower leaves quiescence, so its election timer — long expired — runs again
+    /// and the next tick campaigns.
+    /// <para>Runs before every grant decision, so a voter that then denies the sender (storage
+    /// quarantine, outdated log) still learns the vacancy. Without that order a restarted leader
+    /// whose log is behind was denied on every round by followers that stayed quiesced, and nobody
+    /// else campaigned.</para>
+    /// <para>The stale host leader is deliberately left in place, as on every other pre-vote path:
+    /// the next leader's first append replaces it.</para>
+    /// </summary>
+    private void NoteSenderDoesNotLead(string endpoint, long voteTerm)
+    {
+        bool news = coreState.NoteNotLeading(endpoint, voteTerm - 1);
+
+        if (coreState.NodeState != RaftNodeState.Follower
+            || !coreState.IsKnownNotLeading(endpoint, coreState.CurrentTerm))
+            return;
+
+        if (expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "") != endpoint && host.Leader != endpoint)
+            return;
+
+        if (news)
+            logger.LogInfoLeadershipVacated(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, coreState.CurrentTerm, coreState.Quiesced);
+
+        if (coreState.Quiesced)
+            coreState.SetQuiesced(false);
+    }
+
+    /// <summary>Monotonic tick of the last leaderless notice this node sent; 0 = none.</summary>
+    private long lastLeaderlessNoticeTicks;
+
+    /// <summary>
+    /// Sends a leaderless notice (<see cref="RequestVotesRequest.NoticeOnly"/>) to the voters of the
+    /// range, at most once per election timeout. Called from an election-timer round that this node
+    /// yields for a reason with no bound: a storage quarantine, a stalled disk, or a candidacy the
+    /// application withheld.
+    /// <para><b>Why a held candidate still speaks.</b> A pre-vote does two things: it asks for a
+    /// grant, and it tells every peer that the sender is a follower with no leader. A held candidate
+    /// must not ask, but its peers still need the second part. A quiesced leader wakes on it and
+    /// sends the append that teaches this node its leader, which is also the only way a
+    /// lost-entries quarantine lifts. A follower that expects this node to lead treats the
+    /// leadership as vacated (<see cref="NoteSenderDoesNotLead"/>).</para>
+    /// <para>No round is opened, so a pre-grant from a peer that predates the flag is dropped by
+    /// <see cref="ReceivedVoteAsync"/>. Repeated on the timer because the message is best-effort
+    /// and a peer can be unreachable when the first one leaves.</para>
+    /// </summary>
+    private async Task SendLeaderlessNoticeAsync(HLCTimestamp currentTime, long nowTicks)
+    {
+        if (lastLeaderlessNoticeTicks != 0 && RaftMonotonic.Elapsed(lastLeaderlessNoticeTicks, nowTicks) < coreState.ElectionTimeout)
+            return;
+
+        if (CountVoterPeers() == 0)
+            return;
+
+        lastLeaderlessNoticeTicks = nowTicks;
+
+        await RequestVotesAsync(currentTime, coreState.CurrentTerm + 1, preVote: true, noticeOnly: true).ConfigureAwait(false);
+    }
+
     public async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
         // Two gates: the roster role (a cluster Learner/Leaving node never campaigns anywhere)
@@ -746,10 +830,13 @@ internal sealed class ElectionCoordinator
         bool leaderlessWarn = LeaderlessForLong(nowTicks, out long leaderlessMs);
 
         // Storage quarantine (see StartElectionAsync): a pre-vote probes for a term this node must
-        // not win, so it is not even asked for.
+        // not win, so it is not even asked for. The peers are still told that this node has no
+        // leader: a quarantine lifts only when a leader replicates to this node, and a peer that
+        // expects THIS node to lead would wait for it forever.
         if (coreState.StorageWithholdsCandidacy(wal, out string storageHold))
         {
             LogStorageQuarantineHold(storageHold, nowTicks);
+            await SendLeaderlessNoticeAsync(currentTime, nowTicks).ConfigureAwait(false);
             return;
         }
 
@@ -776,6 +863,9 @@ internal sealed class ElectionCoordinator
             return;
         }
 
+        // Read before ShouldDeferCandidacy: these two holds are the ones with no bound.
+        bool unboundedHold = IsLocalWalStalled() || coreState.CandidacyWithheld;
+
         // A gapped log with a fresher live voter known: yield the round (bounded) instead of
         // probing for a term this node would refuse at the promotion gates. Unlike the removed
         // global veto this is TTL- and liveness-gated and bounded, so it cannot suppress forever.
@@ -783,6 +873,13 @@ internal sealed class ElectionCoordinator
         {
             if (leaderlessWarn)
                 logger.LogWarnLeaderlessCandidacyHeld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderlessMs, LeaderlessWarnTimeoutMultiple, deferral);
+
+            // A stalled disk and a withheld candidacy have no bound, like the storage quarantine
+            // above: the peers are told that this node has no leader. The gap deferral is bounded
+            // and ends in an ordinary pre-vote, which carries the same statement.
+            if (unboundedHold)
+                await SendLeaderlessNoticeAsync(currentTime, nowTicks).ConfigureAwait(false);
+
             return;
         }
 
@@ -827,8 +924,9 @@ internal sealed class ElectionCoordinator
     /// <param name="timestamp"></param>
     /// <param name="term">Term to advertise: <see cref="RaftPartitionCoreState.CurrentTerm"/> for a real election, the hypothetical next term for a pre-vote.</param>
     /// <param name="preVote">When true the outbound request is marked as a pre-vote probe.</param>
+    /// <param name="noticeOnly">When true the probe is a leaderless notice that asks for no grant; see <see cref="SendLeaderlessNoticeAsync"/>.</param>
     /// <exception cref="RaftException"></exception>
-    public async Task RequestVotesAsync(HLCTimestamp timestamp, long term, bool preVote = false)
+    public async Task RequestVotesAsync(HLCTimestamp timestamp, long term, bool preVote = false, bool noticeOnly = false)
     {
         IReadOnlyList<RaftNode> nodes = host.Nodes;
 
@@ -840,7 +938,7 @@ internal sealed class ElectionCoordinator
 
         (long currentMaxLog, long currentLastLogTerm) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
-        RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, currentLastLogTerm, timestamp, host.LocalEndpoint, preVote);
+        RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, currentLastLogTerm, timestamp, host.LocalEndpoint, preVote, noticeOnly);
 
         foreach (RaftNode node in nodes)
         {
@@ -852,7 +950,10 @@ internal sealed class ElectionCoordinator
             if (!host.IsVoter(node.Endpoint))
                 continue;
 
-            logger.LogInfoAskedForVotes(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, term);
+            if (noticeOnly)
+                logger.LogDebugSendingLeaderlessNotice(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, term - 1);
+            else
+                logger.LogInfoAskedForVotes(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, term);
 
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
@@ -900,11 +1001,21 @@ internal sealed class ElectionCoordinator
     /// </param>
     /// <param name="timestamp"></param>
     /// <param name="preVote">When true, evaluate as a pure pre-vote probe and never persist state.</param>
-    /// <remarks><paramref name="remoteLastLogTerm"/> is placed last with a default of <c>0</c> so callers
+    /// <param name="noticeOnly">
+    /// When true the probe is a leaderless notice (<see cref="RequestVotesRequest.NoticeOnly"/>): the
+    /// sender states that it has no leader and asks for no grant. It is handled on the pre-vote
+    /// path and never answered.
+    /// </param>
+    /// <remarks><paramref name="remoteLastLogTerm"/> has a default of <c>0</c> so callers
     /// that predate the §5.4.1 freshness key (and older tests) compile unchanged and fall back to
     /// index-only comparison; the transport dispatch path always supplies the real value.</remarks>
-    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0)
+    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0, bool noticeOnly = false)
     {
+        // A notice is a statement, never a request for a real vote: it must not reach the path
+        // that adopts a term.
+        if (noticeOnly)
+            preVote = true;
+
         // Every vote-path message advertises the sender's §5.4.1 position — record it even when
         // the request is denied below, so the deference/escalation evidence stays current. (A
         // denial otherwise teaches this node nothing, and the majority-hole wedge is exactly the
@@ -927,6 +1038,25 @@ internal sealed class ElectionCoordinator
                 logger.LogDebugDenyingPreVoteNotVoter(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
                 if (denyWarn)
                     logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, denyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "pre-vote", node.Endpoint, voteTerm, "endpoint is not a committed voter");
+                return;
+            }
+
+            // The probe proves its sender leads no term below voteTerm. Recorded before every grant
+            // decision below, so a voter that goes on to deny still learns that a leadership it
+            // remembers is vacated.
+            NoteSenderDoesNotLead(node.Endpoint, voteTerm);
+
+            if (noticeOnly)
+            {
+                // A leaderless notice asks for nothing, so there is nothing to grant or deny. The
+                // vacancy is recorded above. What is left is the leader's half: a committed voter
+                // with no leader cannot see this leader, and a quiesced leader sends nothing that
+                // would teach it. Waking re-arms the appends (the same wake a real pre-vote causes
+                // below); for a quarantined sender they are also the only way its quarantine lifts.
+                if (coreState.NodeState == RaftNodeState.Leader && coreState.Quiesced)
+                    coreState.SetQuiesced(false);
+
+                logger.LogDebugReceivedLeaderlessNotice(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm - 1);
                 return;
             }
 
@@ -979,7 +1109,9 @@ internal sealed class ElectionCoordinator
             // their own election trigger stays calm for the same reason: a permanent leaderless
             // livelock with nobody heartbeating the restarted node. Fall through to the term/log
             // checks instead so the ex-leader can win a normal election (or lose it to a fresher
-            // peer, which equally re-establishes a leader).
+            // peer, which equally re-establishes a leader). NoteSenderDoesNotLead above has
+            // already taken this follower out of quiescence for a probe above its term, so the
+            // partition gets a leader even when the checks below deny the ex-leader.
             string preVoteExpectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
             if (!string.IsNullOrEmpty(preVoteExpectedLeader) && preVoteExpectedLeader != node.Endpoint)
             {
@@ -987,12 +1119,13 @@ internal sealed class ElectionCoordinator
                 {
                     // Quiesced: the leader suppresses heartbeats by design, so `coreState.LastHeartbeat` goes
                     // stale and is not a valid freshness signal. Defer to SWIM exactly as the quiesced
-                    // Follower election case does — while the expected leader is Alive AND still a peer
-                    // of this range, don't help a challenger unseat it. A leader the committed replica
-                    // set dropped is vacated whatever SWIM says (ExpectedLeaderLeftTheRange); denying
-                    // here on liveness alone is what kept a trimmed leader's range leaderless.
+                    // Follower election case does — while the expected leader is Alive AND its
+                    // leadership is not known to be over, don't help a challenger unseat it. A leader
+                    // the committed replica set dropped, or one that stated it leads nothing, is
+                    // vacated whatever SWIM says (ExpectedLeadershipVacated); denying here on liveness
+                    // alone is what kept a trimmed leader's range, and a quarantined leader's, leaderless.
                     if (host.GetNodeLiveness(preVoteExpectedLeader) == MemberLivenessState.Alive
-                        && !ExpectedLeaderLeftTheRange(preVoteExpectedLeader))
+                        && !ExpectedLeadershipVacated(preVoteExpectedLeader))
                     {
                         logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
                         if (denyWarn)
@@ -1057,6 +1190,10 @@ internal sealed class ElectionCoordinator
                 logger.LogWarnLeaderlessDenyingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteDenyLeaderlessMs, LeaderlessWarnTimeoutMultiple, "vote", node.Endpoint, voteTerm, "endpoint is not a committed voter");
             return;
         }
+
+        // A candidate at voteTerm leads no term below it. Same record as on the pre-vote path, and
+        // for the same reason placed ahead of every denial.
+        NoteSenderDoesNotLead(node.Endpoint, voteTerm);
 
         if (votes.ContainsKey(voteTerm))
         {

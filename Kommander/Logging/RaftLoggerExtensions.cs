@@ -549,6 +549,18 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Critical, Message = "[{Endpoint}/{Partition}/{State}] The storage engine fail-stopped: this partition steps down if it leads and will neither vote, campaign nor acknowledge until the node is repaired and restarted. {Reason}")]
     public static partial void LogCritPartitionStorageEngineFailed(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string reason);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Leadership of {Leader} for Term={Term} is vacated: that node stated on the vote path that it does not lead this term (it restarted or stepped down). WasQuiesced={WasQuiesced}; the election timer decides from the next tick")]
+    public static partial void LogInfoLeadershipVacated(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string leader, long term, bool wasQuiesced);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Sending leaderless notice to {Endpoint}: follower at Term={Term} with no leader and a held candidacy")]
+    public static partial void LogDebugSendingLeaderlessNotice(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received leaderless notice from {Endpoint}: follower at Term={Term} with no leader; no grant is sent")]
+    public static partial void LogDebugReceivedLeaderlessNotice(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Ignoring quiesce marker from {Endpoint} Term={Term}: that node already stated that it does not lead this term, so the marker is a delayed message of a leadership that ended; this follower keeps its election timer")]
+    public static partial void LogWarnIgnoringQuiesceMarkerFromVacatedLeader(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
+
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}/{State}] Storage quarantine holds this replica's candidacy: {Reason}")]
     public static partial void LogWarnStorageQuarantineHoldsCandidacy(this ILogger<IRaft> logger, string endpoint, int partition, RaftNodeState state, string reason);
 

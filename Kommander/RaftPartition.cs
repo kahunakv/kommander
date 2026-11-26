@@ -453,7 +453,8 @@ public sealed class RaftPartition : IDisposable
             request.Time,
             request.Endpoint,
             preVote: request.PreVote,
-            lastLogTerm: request.LastLogTerm
+            lastLogTerm: request.LastLogTerm,
+            noticeOnly: request.NoticeOnly
         ));
     }
 

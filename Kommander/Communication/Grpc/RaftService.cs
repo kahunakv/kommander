@@ -241,7 +241,8 @@ public sealed class RaftService : Rafter.RafterBase
             request.LastLogTerm,
             new(request.TimeNode, request.TimePhysical, request.TimeCounter),
             request.Endpoint,
-            request.PreVote
+            request.PreVote,
+            request.NoticeOnly
         ));
 
         return requestVoteResponse;
@@ -422,7 +423,8 @@ public sealed class RaftService : Rafter.RafterBase
                                     requestVotes.LastLogTerm,
                                     new(requestVotes.TimeNode, requestVotes.TimePhysical, requestVotes.TimeCounter),
                                     requestVotes.Endpoint,
-                                    requestVotes.PreVote
+                                    requestVotes.PreVote,
+                                    requestVotes.NoticeOnly
                                 ));
                                 break;
                             }

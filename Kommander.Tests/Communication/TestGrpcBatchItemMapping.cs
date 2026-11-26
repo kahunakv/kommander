@@ -82,6 +82,21 @@ public sealed class TestGrpcBatchItemMapping
     }
 
     [Fact]
+    public void RequestVote_LeaderlessNoticeFlagSurvivesMapping()
+    {
+        GrpcBatchRequestsRequestItem? item = GrpcCommunication.TryMapBatchItem(new BatchRequestsRequestItem
+        {
+            Type = BatchRequestsRequestType.RequestVote,
+            RequestVotes = new RequestVotesRequest(3, 9, 42, 8, Time, "node-a:9001", preVote: true, noticeOnly: true),
+        });
+
+        Assert.NotNull(item);
+        Assert.NotNull(item!.RequestVotes);
+        Assert.True(item.RequestVotes.PreVote);
+        Assert.True(item.RequestVotes.NoticeOnly);
+    }
+
+    [Fact]
     public void StepDownNotice_PayloadSurvivesMapping()
     {
         GrpcBatchRequestsRequestItem? item = GrpcCommunication.TryMapBatchItem(new BatchRequestsRequestItem

@@ -50,22 +50,30 @@ public class TestCandidacyDeferralGates
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
 
-        // Stalled past the bound: no RequestVotes leaves the node, on every round — the count is
-        // deliberately not bounded, because a healthy peer must be able to win any of these terms.
+        // Stalled past the bound: no request for a vote leaves the node, on every round — the count
+        // is deliberately not bounded, because a healthy peer must be able to win any of these terms.
+        // What does leave is the leaderless notice, which asks for nothing.
         wal.OldestPendingWriteAgeMs = 250;
         for (int round = 0; round < 12; round++)
         {
             host.Outbound.Clear();
             await sm.CheckPartitionLeadershipAsync();
-            Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+            Assert.DoesNotContain(host.Outbound, AsksForAVote);
         }
 
         // The write completes: the very next tick campaigns.
         wal.OldestPendingWriteAgeMs = 0;
         host.Outbound.Clear();
         await sm.CheckPartitionLeadershipAsync();
-        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.Contains(host.Outbound, AsksForAVote);
     }
+
+    /// <summary>
+    /// True for a RequestVotes that asks for a grant. A held candidate also sends RequestVotes
+    /// messages, but only as leaderless notices (<see cref="RequestVotesRequest.NoticeOnly"/>).
+    /// </summary>
+    private static bool AsksForAVote(RaftResponderRequest m) =>
+        m.Type == RaftResponderRequestType.RequestVotes && m.RequestVotesRequest is { NoticeOnly: false };
 
     /// <summary>
     /// A stalled write below the configured bound must NOT defer — the gate is a disk-failure
@@ -100,7 +108,7 @@ public class TestCandidacyDeferralGates
         {
             host.Outbound.Clear();
             await sm.CheckPartitionLeadershipAsync();
-            Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+            Assert.DoesNotContain(host.Outbound, AsksForAVote);
         }
 
         sm.SetCandidacyWithheld(false);
@@ -108,7 +116,7 @@ public class TestCandidacyDeferralGates
 
         host.Outbound.Clear();
         await sm.CheckPartitionLeadershipAsync();
-        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.Contains(host.Outbound, AsksForAVote);
     }
 
     // ── holey-log deference is evidence-gated ────────────────────────────────

@@ -443,6 +443,12 @@ The gates are `RaftPartitionCoreState.StorageWithholdsCandidacy` and `StorageDen
 `ElectionCoordinator` on each campaign entry and vote decision. A real vote is denied **after** the higher
 term is adopted, which means that a deposed leader's appends are fenced.
 
+A replica that withholds its candidacy still tells its peers that it has no leader. On each election timeout
+that it yields, it sends a *leaderless notice*: a pre-vote probe that asks for no grant. A quiesced leader wakes
+on the notice and sends the append that can release the quarantine. A quiesced follower that expects the
+quarantined replica to lead stops waiting for it. See
+[The leaderless notice](partition-quiescence-developer-guide.md#the-leaderless-notice).
+
 ### Fail-stop on `Corruption`
 
 `RocksDbWAL` classifies a failure by the status prefix the C API exposes (`"Corruption:"`, the one place

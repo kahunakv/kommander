@@ -646,9 +646,11 @@ public sealed class RaftPartitionStateMachine
     /// is ignored.  Instead, an election is triggered only when the SWIM failure detector marks
     /// the expected leader's node as <see cref="MemberLivenessState.Suspect"/> or
     /// <see cref="MemberLivenessState.Dead"/> — i.e. <c>GetNodeLiveness(leader) != Alive</c> —
-    /// or when the committed replica set no longer names the expected leader at all (its replica
-    /// was removed; see <see cref="ElectionCoordinator.ExpectedLeaderLeftTheRange"/>): that node
-    /// stays Alive, so liveness alone would keep every follower calm forever.
+    /// or when the remembered leadership is known to be over while its node stays Alive
+    /// (<see cref="ElectionCoordinator.ExpectedLeadershipVacated"/>): the committed replica set no
+    /// longer names the expected leader, or that node stated on the vote path that it leads nothing.
+    /// On liveness alone every follower would stay calm forever in both cases. A quiesced follower
+    /// with no leader recorded for its current term leaves quiescence on the tick.
     /// This relies on the invariant <c>PingInterval &lt; StartElectionTimeout</c>
     /// (validated at startup by <see cref="RaftConfiguration.Validate"/>): a SWIM Suspect fires
     /// after approximately one <c>PingInterval</c>, comfortably under <c>StartElectionTimeout</c>,
@@ -913,21 +915,33 @@ public sealed class RaftPartitionStateMachine
             case RaftNodeState.Follower when coreState.Quiesced && host.Configuration.EnableQuiescence:
             {
                 string expectedLeaderNode = election.GetExpectedLeader(coreState.CurrentTerm);
-                if (string.IsNullOrEmpty(expectedLeaderNode))
-                    return;
 
-                // SWIM answers "is the NODE up?", not "does it still host this range?". A leader
+                // Quiescence is a statement about one leadership: the leader that sent the marker,
+                // in the term it sent it. With no leader recorded for the current term there is
+                // nothing to defer to — the term moved on a vote request, or a step-down notice
+                // cleared the record and the election it asked for was held. Staying calm here was
+                // a state with no way out: SWIM has no node to judge, and a quiesced follower never
+                // reaches the election timer. Leave quiescence; the timer decides from the next tick.
+                if (string.IsNullOrEmpty(expectedLeaderNode))
+                {
+                    coreState.SetQuiesced(false);
+                    return;
+                }
+
+                // SWIM answers "is the NODE up?", not "does it still lead this range?". A leader
                 // whose replica was removed from the range (a placement trim of the leader) keeps
                 // answering pings, so on liveness alone every quiesced follower stayed calm, every
                 // pre-vote was denied, and the range had no leader until the next write — which
                 // never came, because every read was redirected to the departed leader (Kahuna
                 // 1.12.7 k8s-operator e2e: partition 3 unavailable for minutes). A leader that is
-                // no longer a peer of this range is vacated regardless of SWIM.
+                // no longer a peer of this range is vacated regardless of SWIM, and so is one that
+                // stated on the vote path that it leads nothing (a restart or a storage step-down
+                // whose candidacy is then held): see ElectionCoordinator.ExpectedLeadershipVacated.
                 if (host.GetNodeLiveness(expectedLeaderNode) == MemberLivenessState.Alive
-                    && !election.ExpectedLeaderLeftTheRange(expectedLeaderNode))
-                    return; // leader's node is Alive per SWIM and still a peer — stay calm
+                    && !election.ExpectedLeadershipVacated(expectedLeaderNode))
+                    return; // leader's node is Alive per SWIM and its leadership stands — stay calm
 
-                // Leader node is Suspect or Dead, or it left the range — un-quiesce and challenge.
+                // Leader node is Suspect or Dead, or its leadership is vacated — un-quiesce and challenge.
                 coreState.SetQuiesced(false);
                 await election.StartPreVoteAsync(currentTime).ConfigureAwait(false);
                 break;
@@ -3249,8 +3263,8 @@ public sealed class RaftPartitionStateMachine
     /// Grants or denies a vote (Raft §5.2/§5.4.1, pre-vote §9.6) — see
     /// <see cref="ElectionCoordinator.VoteAsync"/>.
     /// </summary>
-    public Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0) =>
-        election.VoteAsync(node, voteTerm, remoteMaxLogId, timestamp, preVote, remoteLastLogTerm);
+    public Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0, bool noticeOnly = false) =>
+        election.VoteAsync(node, voteTerm, remoteMaxLogId, timestamp, preVote, remoteLastLogTerm, noticeOnly);
 
     /// <summary>
     /// Tallies a received (pre-)vote grant — see <see cref="ElectionCoordinator.ReceivedVoteAsync"/>.

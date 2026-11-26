@@ -67,6 +67,13 @@ public sealed class RaftRequest
     public bool PreVote { get; }
 
     /// <summary>
+    /// Mirrors <see cref="RequestVotesRequest.NoticeOnly"/> on a
+    /// <see cref="RaftRequestType.RequestVote"/>: a leaderless notice. The state machine records
+    /// what the notice proves about the sender and sends no grant.
+    /// </summary>
+    public bool NoticeOnly { get; }
+
+    /// <summary>
     /// When non-zero, the executor rejects the proposal with
     /// <see cref="RaftOperationStatus.PartitionMoved"/> if the partition's
     /// committed <c>Generation</c> no longer matches this value.
@@ -154,7 +161,8 @@ public sealed class RaftRequest
         long presentTerm = -1,
         long retentionFloor = 0,
         long retentionBudget = 0,
-        long seedIndex = 0
+        long seedIndex = 0,
+        bool noticeOnly = false
     )
     {
         Type = type;
@@ -171,6 +179,7 @@ public sealed class RaftRequest
         Status = status;
         Logs = logs;
         PreVote = preVote;
+        NoticeOnly = noticeOnly;
         PrevLogIndex = prevLogIndex;
         PrevLogTerm = prevLogTerm;
         Quiesce = quiesce;

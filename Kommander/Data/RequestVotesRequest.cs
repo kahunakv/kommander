@@ -37,7 +37,20 @@ public sealed class RequestVotesRequest
     /// </summary>
     public bool PreVote { get; set; }
 
-    public RequestVotesRequest(int partition, long term, long maxLogId, long lastLogTerm, HLCTimestamp time, string endpoint, bool preVote = false)
+    /// <summary>
+    /// When true this is a leaderless notice: a pre-vote probe from a follower that has no leader and
+    /// cannot campaign (a storage quarantine, a stalled disk, or a candidacy the application withheld).
+    /// The sender asks for no grant and opens no round. The message only states that the sender is a
+    /// follower at <see cref="Term"/> - 1, so that a quiesced leader wakes and a follower that still
+    /// expects the sender to lead treats that leadership as vacated. Always sent with
+    /// <see cref="PreVote"/> set.
+    /// <para><b>Wire compatibility:</b> a peer that predates this field reads the message as an
+    /// ordinary pre-vote probe and can answer with a pre-grant. The sender has no open round and
+    /// drops that grant, so a mixed-version cluster stays correct.</para>
+    /// </summary>
+    public bool NoticeOnly { get; set; }
+
+    public RequestVotesRequest(int partition, long term, long maxLogId, long lastLogTerm, HLCTimestamp time, string endpoint, bool preVote = false, bool noticeOnly = false)
     {
         Partition = partition;
         Term = term;
@@ -46,5 +59,6 @@ public sealed class RequestVotesRequest
         LastLogTerm = lastLogTerm;
         Endpoint = endpoint;
         PreVote = preVote;
+        NoticeOnly = noticeOnly;
     }
 }

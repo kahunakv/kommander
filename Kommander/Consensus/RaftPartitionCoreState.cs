@@ -411,6 +411,60 @@ internal sealed class RaftPartitionCoreState
         OnQuiesceChanged?.Invoke(value);
     }
 
+    // ── Vacated leaderships ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// For each peer, the highest term through which that peer is known NOT to lead this partition.
+    /// Executor thread only.
+    ///
+    /// <para><b>Where the evidence comes from.</b> A vote-path message is the sender's own statement
+    /// about its role: a pre-vote probe or a leaderless notice for term V comes from a follower at
+    /// term V - 1, and a real vote request for term V from a candidate at term V. In each case the
+    /// sender leads no term below V when it sends.</para>
+    ///
+    /// <para><b>Why it stays true.</b> A node becomes the leader of a term only through a candidacy
+    /// that starts one term below it, so a node seen as a follower at V - 1, or as a candidate at V,
+    /// can only ever lead V or a later term. The statement therefore holds however late or out of
+    /// order the message arrives. That is what the two other signals lack: SWIM liveness says the
+    /// node is up, not that it leads, and a handshake carries no term, so a handshake delivered late
+    /// would vacate a leadership the sender won after it sent the handshake.</para>
+    ///
+    /// <para><b>What reads it.</b> The quiesced gates treat the expected leader as vacated
+    /// (<c>ElectionCoordinator.ExpectedLeadershipVacated</c>), and the follower append path refuses
+    /// a quiesce marker from the peer at a term it does not lead — a delayed message of a leadership
+    /// that ended, and the one late append whose effect has no bound (see
+    /// <c>FollowerAppendHandler</c>). The record never refuses entries or an ordinary heartbeat.</para>
+    /// </summary>
+    private readonly Dictionary<string, long> notLeadingThrough = [];
+
+    /// <summary>
+    /// Records that <paramref name="endpoint"/> leads no term up to and including
+    /// <paramref name="throughTerm"/>. Returns true when this is news for the current term. A
+    /// statement below <see cref="CurrentTerm"/> is dropped: the term fence already refuses that
+    /// leader, and the term only climbs.
+    /// </summary>
+    public bool NoteNotLeading(string endpoint, long throughTerm)
+    {
+        if (string.IsNullOrEmpty(endpoint) || throughTerm < CurrentTerm)
+            return false;
+
+        bool known = notLeadingThrough.TryGetValue(endpoint, out long through);
+
+        if (!known || through < throughTerm)
+            notLeadingThrough[endpoint] = throughTerm;
+
+        return !known || through < CurrentTerm;
+    }
+
+    /// <summary>
+    /// True when <paramref name="endpoint"/> is known not to lead <paramref name="term"/>; see
+    /// <see cref="notLeadingThrough"/>.
+    /// </summary>
+    public bool IsKnownNotLeading(string endpoint, long term) =>
+        notLeadingThrough.Count > 0
+        && notLeadingThrough.TryGetValue(endpoint, out long through)
+        && term <= through;
+
     /// <summary>
     /// HLC timestamp of the last real proposal enqueued on this leader.
     /// Zero until the first proposal arrives after winning election.

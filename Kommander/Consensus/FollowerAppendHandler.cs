@@ -152,6 +152,32 @@ internal sealed class FollowerAppendHandler
             return;
         }
 
+        // Vacated-leadership fence, for the quiesce marker only. The sender itself stated, on the
+        // vote path, that it leads no term up to this one (RaftPartitionCoreState.NoteNotLeading):
+        // it restarted, or it stepped down, after it sent this marker. One leader per term and no
+        // way back into a term a node left as a follower make that statement final, so this is a
+        // delayed message of a leadership that ended.
+        //
+        // Only the marker is refused. Every other effect of a late append is bounded, which is why
+        // Raft tolerates late appends at all: an entry is a real entry of that term, and a refreshed
+        // election timer costs one timeout. A marker is not bounded. It tells this follower to stop
+        // timing its leader and to trust SWIM, and SWIM reports the restarted node Alive. In Jepsen
+        // lost-tail run 45829910335 a marker stayed in the dead leader's TCP send buffer through a
+        // network isolation and arrived five seconds after that leader had restarted into a storage
+        // quarantine. Two followers accepted it, went quiet, and denied every pre-vote of the two
+        // voters that held the full log; the quarantined node could not campaign, and the partition
+        // had no leader for the rest of the run.
+        //
+        // A marker carries no entries, so dropping it loses nothing. No reply: the sender already
+        // knows it does not lead, and an ack would only say that this follower still listens to it.
+        if (quiesce && coreState.IsKnownNotLeading(endpoint, leaderTerm))
+        {
+            logger.LogWarnIgnoringQuiesceMarkerFromVacatedLeader(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, leaderTerm);
+
+            return;
+        }
+
         // Membership fence: a valid AppendEntries authoritatively identifies a term's leader, but only a
         // committed roster member can legitimately be one. Without this, any endpoint reachable through
         // the transport (e.g. registered in the transport map before joining membership) could be adopted

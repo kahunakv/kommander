@@ -760,6 +760,120 @@ public sealed class TestEvictionRejoin
         }
     }
 
+    /// <summary>
+    /// Regression: the quiesced leader restarts and CANNOT campaign. The sibling test above relies on
+    /// the restarted leader's own pre-vote to tell the quiesced followers that its leadership is
+    /// vacated. A replica whose candidacy is held sends no pre-vote — here the application withholds
+    /// it; in the incident a storage quarantine did (Jepsen lost-tail run 45829910335, partition 2
+    /// leaderless for 5.5 minutes). SWIM reports the restarted node Alive, so both survivors stayed
+    /// quiesced, neither campaigned, and the partition had no leader until the hold ended.
+    /// <para>With the leaderless notice the held replica still states that it has no leader. The
+    /// survivors leave quiescence and one of them wins the term.</para>
+    /// </summary>
+    [Fact]
+    public async Task QuiescedLeader_RestartsWithHeldCandidacy_ASurvivorTakesTheLeadership()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication comm = new();
+
+        const int basePort = 8970;
+        string ep1 = $"localhost:{basePort}", ep2 = $"localhost:{basePort + 1}", ep3 = $"localhost:{basePort + 2}";
+
+        InMemoryWAL innerWal3 = new(logger);
+        NonDisposingWAL wal3 = new(innerWal3);
+
+        RaftManager n1 = MakeSwimNode(comm, "localhost", basePort, 1, [ep2, ep3], logger, enableQuiescence: true);
+        RaftManager n2 = MakeSwimNode(comm, "localhost", basePort + 1, 2, [ep1, ep3], logger, enableQuiescence: true);
+        RaftManager n3 = MakeSwimNode(comm, "localhost", basePort + 2, 3, [ep1, ep2], logger, wal3, enableQuiescence: true);
+        RaftManager? restarted = null;
+
+        comm.SetNodes(new Dictionary<string, IRaft> { [ep1] = n1, [ep2] = n2, [ep3] = n3 });
+
+        try
+        {
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+            await n3.UpdateNodes();
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForCondition(
+                () => n1.GetMembership().MembershipVersion > 0
+                   && n2.GetMembership().MembershipVersion > 0
+                   && n3.GetMembership().MembershipVersion > 0,
+                ct);
+
+            // Partition 1 leadership goes ONTO the node that will restart (see the sibling test).
+            await WaitForPartitionLeader(1, ct, n1, n2, n3);
+            long forceDeadline = Environment.TickCount64 + 15_000;
+            while (!await n3.AmILeaderQuick(1))
+            {
+                if (Environment.TickCount64 > forceDeadline)
+                    throw new TimeoutException("Partition 1 leadership never settled on n3.");
+                await n3.ForceLeaderForTestingAsync(1, ct);
+                await Task.Delay(100, ct);
+            }
+
+            for (int i = 0; i < 5; i++)
+            {
+                RaftReplicationResult result = await n3.ReplicateLogs(1, "test", [1, 2, 3], cancellationToken: ct);
+                Assert.Equal(RaftOperationStatus.Success, result.Status);
+            }
+
+            long leaderCommitted = await n3.GetFollowerCommittedIndexAsync(1, n3.LocalEndpoint);
+            await WaitForFollowerIndex(n3, ep1, leaderCommitted, ct);
+            await WaitForFollowerIndex(n3, ep2, leaderCommitted, ct);
+
+            // Leader and both followers must be demonstrably quiesced: the followers are the ones
+            // that defer to SWIM.
+            await WaitForCondition(
+                () => n3.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult()?.Quiesced == true
+                   && n1.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult()?.Quiesced == true
+                   && n2.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult()?.Quiesced == true,
+                ct, timeoutMs: 45_000);
+
+            // Fast restart of the quiesced LEADER over the SAME WAL: no eviction, roster unchanged.
+            n3.Dispose();
+            restarted = MakeSwimNode(comm, "localhost", basePort + 2, 3, [ep1, ep2], logger, wal3, enableQuiescence: true);
+            comm.SetNodes(new Dictionary<string, IRaft> { [ep1] = n1, [ep2] = n2, [ep3] = restarted });
+
+            await restarted.UpdateNodes();
+            RaftManager toJoin = restarted;
+            Task joinTask = Task.Run(() => toJoin.JoinCluster(ct), ct);
+
+            // Hold the restarted replica's candidacy for partition 1 before its first election
+            // timeout (200 ms at least after the partition starts) can fire.
+            long holdDeadline = Environment.TickCount64 + 15_000;
+            while (toJoin.SetCandidacyWithheld(1, true) != RaftOperationStatus.Success)
+            {
+                if (Environment.TickCount64 > holdDeadline)
+                    throw new TimeoutException("Partition 1 never started on the restarted node.");
+                await Task.Delay(1, ct);
+            }
+
+            // A survivor must take the partition. Without the notice nobody ever campaigns.
+            await WaitForCondition(
+                () => n1.AmILeaderQuick(1).GetAwaiter().GetResult() || n2.AmILeaderQuick(1).GetAwaiter().GetResult(),
+                ct, timeoutMs: 30_000);
+
+            // The restarted replica follows the new leader and holds the old frontier.
+            await WaitForCondition(
+                () =>
+                {
+                    RaftPartitionView? v = toJoin.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult();
+                    return v is not null && v.CommitIndex >= leaderCommitted && (v.Leader == ep1 || v.Leader == ep2);
+                },
+                ct, timeoutMs: 30_000);
+
+            Assert.True(toJoin.IsCandidacyWithheld(1));
+            Assert.False(await toJoin.AmILeaderQuick(1));
+
+            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(30), ct); } catch (TimeoutException) { /* convergence verified above */ }
+        }
+        finally
+        {
+            n1.Dispose(); n2.Dispose(); n3.Dispose(); restarted?.Dispose();
+        }
+    }
+
     /// <summary>Polls until the leader's recorded committed index for <paramref name="endpoint"/> on partition 1 reaches <paramref name="target"/>.</summary>
     private static async Task WaitForFollowerIndex(RaftManager leader, string endpoint, long target, CancellationToken ct, int timeoutMs = 15_000)
     {

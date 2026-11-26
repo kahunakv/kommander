@@ -145,13 +145,15 @@ public class TestExpectedLeaderBackoff
 
         Assert.Contains(messages, m => m.Contains("No leader for") && m.Contains("denying pre-vote") && m.Contains("outdated log"));
 
-        // The application withholds candidacy: the held round names that too, every round.
+        // The application withholds candidacy: the held round names that too, every round. It asks
+        // for no vote; what it sends is the leaderless notice, which no peer answers.
         sm.SetCandidacyWithheld(true);
         host.AdvanceMonotonic(TimeSpan.FromMilliseconds(endTimeoutMs + 50));
         host.Outbound.Clear();
         await sm.CheckPartitionLeadershipAsync();
 
-        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes && m.RequestVotesRequest is { NoticeOnly: false });
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes && m.RequestVotesRequest is { NoticeOnly: true, PreVote: true });
         Assert.Contains(messages, m => m.Contains("No leader for") && m.Contains("not campaigning") && m.Contains("withheld"));
     }
 

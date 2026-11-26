@@ -816,7 +816,10 @@ public interface IRaft
     /// Withholds (or releases) this replica's candidacy for a partition. While withheld the replica
     /// never campaigns — every election-timer round and every step-down-notice election is yielded,
     /// unbounded, like a stalled disk — and it ignores a leadership transfer addressed to it. It
-    /// keeps voting, replicating and acknowledging as a follower. Meant for a replica the application
+    /// keeps voting, replicating and acknowledging as a follower. While it has no leader it tells
+    /// its peers so on each yielded round (a leaderless notice,
+    /// <see cref="Kommander.Data.RequestVotesRequest.NoticeOnly"/>), so a quiesced partition that it
+    /// led before a restart elects another replica instead of waiting. Meant for a replica the application
     /// has gated as incomplete until a re-seed replaces its projection; a replica that currently
     /// leads is not stepped down by this call (the application does that). In-memory, per node.
     /// Returns <see cref="RaftOperationStatus.Errored"/> when the partition is not hosted here.

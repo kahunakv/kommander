@@ -60,6 +60,9 @@ message GrpcRequestVotesRequest {
     bool PreVote = 8;
     // Term of the candidate's last log entry (§5.4.1 freshness key). 0 from peers predating this field.
     int64 LastLogTerm = 9;
+    // Leaderless notice: the sender has no leader, cannot campaign, and asks for no grant. A peer
+    // predating this field reads the message as an ordinary pre-vote probe.
+    bool NoticeOnly = 10;
 }
 
 message GrpcRequestVotesResponse {
