@@ -210,6 +210,34 @@ internal sealed class ParkedWorkerQueue<T> : IDisposable
 #endif
     }
 
+    /// <summary>
+    /// Wakes the worker that owns slot <paramref name="worker"/> if it waits in <see cref="TryTake"/>
+    /// or <see cref="TryTakeWhile"/>, and nobody otherwise. For a caller that changed a condition this one worker waits for; see the
+    /// <see cref="TryTakeWhile"/> for how the two cannot miss each other.
+    ///
+    /// <para>The untargeted <see cref="WakeTimedWaiter()"/> wakes the waiter that registered last,
+    /// which is right for an item (any waiter can take it) and wrong for a condition: with two
+    /// workers in a timed wait, the wake could go to the one that does not wait for it.</para>
+    /// </summary>
+    public void WakeTimedWaiter(int worker)
+    {
+#if !KOMMANDER_THREAD_FREE
+        if (Volatile.Read(ref _timedWaiterCount) == 0)
+            return;
+
+        WorkerSlot slot = _slots[worker];
+
+        lock (_timedLock)
+        {
+            if (!_timedWaiters.Remove(slot))
+                return;
+
+            Interlocked.Decrement(ref _timedWaiterCount);
+            slot.Event.Set();
+        }
+#endif
+    }
+
     /// <summary>Takes the oldest item without waiting. Any thread; wakes nobody.</summary>
     public bool TryDequeue([MaybeNullWhen(false)] out T item) => _queue.TryDequeue(out item);
 
@@ -436,7 +464,37 @@ internal sealed class ParkedWorkerQueue<T> : IDisposable
     /// When the call returns false: true if the time ran out or a stop was requested, false if the
     /// worker was woken and another worker took the item first (the caller may wait again).
     /// </param>
-    public bool TryTake(int worker, int millisecondsTimeout, [MaybeNullWhen(false)] out T item, out bool timedOut)
+    public bool TryTake(int worker, int millisecondsTimeout, [MaybeNullWhen(false)] out T item, out bool timedOut) =>
+        TryTakeWhile<object?>(worker, millisecondsTimeout, null, static _ => true, out item, out timedOut);
+
+    /// <summary>
+    /// <see cref="TryTake"/> for a worker that waits for a condition of its
+    /// owner as well as for an item: it sleeps only while <paramref name="keepWaiting"/> answers true.
+    ///
+    /// <para><b>No lost wake for the condition.</b> The worker registers (an interlocked increment, a
+    /// full fence) and then evaluates <paramref name="keepWaiting"/>. The thread that changes the
+    /// condition publishes the change with a full fence (an interlocked operation on what the
+    /// predicate reads) and then calls <see cref="WakeTimedWaiter(int)"/>, which reads the count. One
+    /// of the two sees the other: either the predicate already reads the change and the worker does
+    /// not sleep, or the waker finds the worker registered and sets its event.</para>
+    /// </summary>
+    /// <param name="worker">The caller's slot index.</param>
+    /// <param name="millisecondsTimeout">Longest wait.</param>
+    /// <param name="state">Passed to <paramref name="keepWaiting"/>, so the predicate can be a static lambda.</param>
+    /// <param name="keepWaiting">
+    /// Evaluated once, after the worker registered and before it sleeps. False means the condition
+    /// the caller waits for already changed; the call then returns without a sleep, and reports it as
+    /// a wake (<paramref name="timedOut"/> false) when no item is queued.
+    /// </param>
+    /// <param name="item">The item taken.</param>
+    /// <param name="timedOut">As in <see cref="TryTake"/>.</param>
+    public bool TryTakeWhile<TState>(
+        int worker,
+        int millisecondsTimeout,
+        TState state,
+        Func<TState, bool> keepWaiting,
+        [MaybeNullWhen(false)] out T item,
+        out bool timedOut)
     {
         timedOut = false;
 
@@ -454,7 +512,7 @@ internal sealed class ParkedWorkerQueue<T> : IDisposable
 
         bool signaled = true;
 
-        if (_queue.IsEmpty && Volatile.Read(ref _stopRequested) == 0)
+        if (_queue.IsEmpty && Volatile.Read(ref _stopRequested) == 0 && keepWaiting(state))
             signaled = slot.Event.Wait(millisecondsTimeout);
 
         // A producer sets the event inside the lock, in the section that removes the slot. So once this

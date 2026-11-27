@@ -67,6 +67,7 @@ TimeSpan pauseStart = default, pauseEnd = default;
 int[] gcStart = new int[3], gcEnd = new int[3];
 long acksStart = 0, acksEnd = 0;
 Dictionary<string, CountingCommunication.TrafficSnapshot> trafficStart = [], trafficEnd = [];
+WalCounters walStart = default, walEnd = default;
 
 (List<WorkloadRunner.WorkerResult> workers, TimeSpan window) = await runner.RunAsync(
     warmup,
@@ -79,6 +80,7 @@ Dictionary<string, CountingCommunication.TrafficSnapshot> trafficStart = [], tra
             stages.Measuring = true;
 
         (trafficStart, acksStart) = SnapshotTraffic(cluster);
+        walStart = SnapshotWal(cluster);
         process.Refresh();
         cpuStart = process.TotalProcessorTime;
         allocStart = GC.GetTotalAllocatedBytes(precise: false);
@@ -95,6 +97,7 @@ Dictionary<string, CountingCommunication.TrafficSnapshot> trafficStart = [], tra
         for (int g = 0; g < 3; g++)
             gcEnd[g] = GC.CollectionCount(g);
         (trafficEnd, acksEnd) = SnapshotTraffic(cluster);
+        walEnd = SnapshotWal(cluster);
 
         if (stages is not null)
             stages.Measuring = false;
@@ -153,6 +156,18 @@ CostStats cost = new(
     gcEnd[1] - gcStart[1],
     gcEnd[2] - gcStart[2]);
 
+WalCounters walDelta = walEnd - walStart;
+
+WalSchedulerStats? walStats = calls == 0 ? null : new(
+    (double)walDelta.Writes / calls,
+    (double)walDelta.SyncedWrites / calls,
+    walDelta.Writes > 0 ? (double)walDelta.Partitions / walDelta.Writes : 0,
+    (double)walDelta.MarkerBatchesHeld / calls,
+    (double)walDelta.ReturnGathers / calls,
+    walDelta.ReturnsAwaited,
+    walDelta.ReturnsMissed,
+    walDelta.GatherHandoffs);
+
 string version = typeof(RaftManager).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
     ?? typeof(RaftManager).Assembly.GetName().Version?.ToString()
     ?? "unknown";
@@ -184,7 +199,8 @@ BenchmarkResult result = new(
         options.FanOutBeforeLocalWrite ?? true,
         options.Set.ToList(),
         options.ApplyCostMicros,
-        options.ApplyOn),
+        options.ApplyOn,
+        options.SimSyncMs),
     entries / seconds,
     calls / seconds,
     entries,
@@ -196,7 +212,8 @@ BenchmarkResult result = new(
     cost,
     WalPhaseInstrumentation.Snapshot(),
     stages?.Snapshot(),
-    await cluster.LeaderDistribution(options.Partitions));
+    await cluster.LeaderDistribution(options.Partitions),
+    walStats);
 
 Console.WriteLine(BenchmarkReport.Summary(result));
 
@@ -236,5 +253,52 @@ static (Dictionary<string, CountingCommunication.TrafficSnapshot>, long) Snapsho
     return (appends, acks);
 }
 
+// The counters of every node's WAL write scheduler, summed. A scheduler of another type (none
+// today) contributes nothing.
+static WalCounters SnapshotWal(BenchmarkCluster cluster)
+{
+    WalCounters total = default;
+
+    foreach (RaftManager manager in cluster.Managers)
+    {
+        if (manager.WalScheduler is not Kommander.WAL.IO.FairWalScheduler scheduler)
+            continue;
+
+        total = new(
+            total.Writes + scheduler.TotalBatchesWritten,
+            total.SyncedWrites + scheduler.TotalSyncBatchesWritten,
+            total.Partitions + scheduler.TotalPartitionsBatched,
+            total.MarkerBatchesHeld + scheduler.TotalMarkerBatchesDeferred,
+            total.ReturnGathers + scheduler.TotalReturnGathers,
+            total.ReturnsAwaited + scheduler.TotalReturnsAwaited,
+            total.ReturnsMissed + scheduler.TotalReturnsMissed,
+            total.GatherHandoffs + scheduler.TotalGatherHandoffs);
+    }
+
+    return total;
+}
+
 static CountingCommunication.TrafficSnapshot Add(CountingCommunication.TrafficSnapshot a, CountingCommunication.TrafficSnapshot b) =>
     new(a.Frames + b.Frames, a.Heartbeats + b.Heartbeats, a.Entries + b.Entries, a.LogBytes + b.LogBytes);
+
+/// <summary>Counters of the WAL write schedulers at one edge of the window.</summary>
+readonly record struct WalCounters(
+    long Writes,
+    long SyncedWrites,
+    long Partitions,
+    long MarkerBatchesHeld,
+    long ReturnGathers,
+    long ReturnsAwaited,
+    long ReturnsMissed,
+    long GatherHandoffs)
+{
+    public static WalCounters operator -(WalCounters a, WalCounters b) => new(
+        a.Writes - b.Writes,
+        a.SyncedWrites - b.SyncedWrites,
+        a.Partitions - b.Partitions,
+        a.MarkerBatchesHeld - b.MarkerBatchesHeld,
+        a.ReturnGathers - b.ReturnGathers,
+        a.ReturnsAwaited - b.ReturnsAwaited,
+        a.ReturnsMissed - b.ReturnsMissed,
+        a.GatherHandoffs - b.GatherHandoffs);
+}

@@ -286,6 +286,15 @@ public class RocksDbWAL : IWAL, IDisposable
 
     internal bool SyncWritesEnabled => syncWrites;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Every column family shares the engine's one log, and the engine's write thread runs one write
+    /// group at a time: a synced write issued while another is in progress waits for that fsync and
+    /// then pays its own. With <c>syncWrites</c> off no write waits for an fsync, so there is nothing
+    /// to share and the answer is false.
+    /// </remarks>
+    public bool SerializesSyncedWrites => syncWrites;
+
     /// <summary>For tests: number of <c>db.Write</c> calls issued by the last compaction call.</summary>
     internal int LastCompactionWriteCount { get; private set; }
 

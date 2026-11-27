@@ -138,6 +138,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.SqliteWalShardCount)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxWalGroupBatchPartitions)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.WalGroupCommitLingerMs)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.WalGroupCommitReturnWindow)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.WalSingleFsyncCommit)] = RaftOptionKind.Safety,
         // Either value keeps "acknowledged ⇒ durable on a quorum including the leader": the quorum
         // waits for the leader's own write whichever way the fan-out is ordered.

@@ -170,6 +170,28 @@ public static class KommanderMetrics
             "raft.wal.batches_total",
             description: "Total WAL write batches dispatched to the storage adapter.");
 
+    /// <summary>
+    /// WAL write batches that paid a sync. Against <c>raft.wal.batches_total</c> it separates the
+    /// synced writes from the sync-off marker writes, and against the proposal rate it gives the
+    /// syncs for each round: with several partitions written back to back on one engine, well below
+    /// one for each proposal means the partitions share their syncs.
+    /// </summary>
+    internal static readonly Counter<long> WalSyncBatchesTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.sync_batches_total",
+            description: "WAL write batches dispatched to the storage adapter with a sync.");
+
+    /// <summary>
+    /// Times the WAL scheduler held a synced write for a partition it expected back and the partition
+    /// did not come inside the return window (<see cref="RaftConfiguration.WalGroupCommitReturnWindow"/>).
+    /// Each one cost a batch up to the window. Occasional misses are normal; a sustained rate means
+    /// the window does not fit the workload.
+    /// </summary>
+    internal static readonly Counter<long> WalReturnsMissedTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.returns_missed_total",
+            description: "Times a partition the WAL scheduler waited for did not return inside the return window.");
+
     /// <summary>Total individual WAL write operations completed.</summary>
     internal static readonly Counter<long> WalOperationsTotal =
         Meter.CreateCounter<long>(

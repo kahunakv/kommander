@@ -123,6 +123,87 @@ public sealed class FsyncCountTests
         }
     }
 
+    /// <summary>
+    /// Only a store that runs one synced write at a time says so: RocksDB with sync writes on. The
+    /// scheduler holds a synced write back for returning partitions only on such a store; on the
+    /// others the hold would be latency for nothing (no fsync to share, or one fsync per shard).
+    /// </summary>
+    [Fact]
+    public void OnlyRocksDbWithSyncWrites_SerializesItsSyncedWrites()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using (IWAL rocksSynced = CreateWal(WalBackend.RocksDb, Path.Combine(path, "rocks-sync"), syncWrites: true))
+                Assert.True(rocksSynced.SerializesSyncedWrites);
+
+            using (IWAL rocksUnsynced = CreateWal(WalBackend.RocksDb, Path.Combine(path, "rocks-nosync"), syncWrites: false))
+                Assert.False(rocksUnsynced.SerializesSyncedWrites);
+
+            using (IWAL sqlite = CreateWal(WalBackend.Sqlite, Path.Combine(path, "sqlite"), syncWrites: true))
+                Assert.False(sqlite.SerializesSyncedWrites);
+
+            using IWAL memory = new InMemoryWAL(NullLogger<IRaft>.Instance);
+            Assert.False(memory.SerializesSyncedWrites);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// The return window on a real engine, with the writer the fast path has: the next propose is
+    /// sent when the previous one is durable and the marker is not waited for. Every operation
+    /// completes, the fsync count stays one per committed write, the markers never add a write call
+    /// beyond the two per write of the pinned baseline, and the store ends with every row committed.
+    ///
+    /// <para>Whether a batch is ever held depends on how long this machine's fsync takes (the window
+    /// needs a synced write of 200 µs or more), so the test does not assert that one was. It pins
+    /// what must hold either way.</para>
+    /// </summary>
+    [Fact]
+    public async Task RocksDb_WithReturnWindow_BackToBackWriter_KeepsOneFsyncPerCommittedWrite()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using IWAL wal = CreateWal(WalBackend.RocksDb, path, syncWrites: true);
+            using FairWalScheduler scheduler = new(
+                wal,
+                NullLogger<IRaft>.Instance,
+                workerCount: 4,
+                lazyCommitMarkers: true,
+                markerDeferralMs: FairWalScheduler.DefaultMarkerDeferralMs,
+                returnWindow: FairWalScheduler.DefaultReturnWindow);
+            scheduler.Start();
+
+            Task lastMarker = Task.CompletedTask;
+
+            for (long id = 1; id <= Writes; id++)
+            {
+                await EnqueueAndAwaitAsync(scheduler, 1, id, WALWriteOperationType.LeaderPropose, RaftLogType.Proposed)
+                    .WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+                lastMarker = EnqueueAndAwaitAsync(scheduler, 1, id, WALWriteOperationType.LeaderCommit, RaftLogType.Committed);
+            }
+
+            await lastMarker.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            Assert.Equal(Writes, scheduler.TotalSyncBatchesWritten);
+            Assert.InRange(scheduler.TotalBatchesWritten, Writes, 2L * Writes);
+            Assert.Equal(0, scheduler.GetPartitionDepth(1));
+
+            List<RaftLog> stored = wal.ReadLogs(1);
+            Assert.Equal(Writes, stored.Count);
+            Assert.All(stored, log => Assert.Equal(RaftLogType.Committed, log.Type));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     public enum WalBackend

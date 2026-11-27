@@ -39,6 +39,9 @@ off, both are on the critical path of a write.
 
 - **Group commit** packs many concurrent writes into one `fsync`. It is always on and raises throughput.
   `WalGroupCommitLingerMs` tunes it.
+- **Return gathering** (`WalGroupCommitReturnWindow`, on by default for RocksDB with sync writes) keeps
+  partitions that are written back to back in the same `fsync`. Without it they take turns on the engine
+  and each round costs two syncs.
 - **The single-fsync fast path** (`WalSingleFsyncCommit`, on by default) acknowledges the client as soon
   as a quorum has the entry on disk, which is the Raft commit point. The commit marker is written lazily
   and rides a later sync. This lowers latency and roughly halves the syncs per write.
@@ -91,6 +94,73 @@ follower append path, then gets a near-solo sync for each arrival. `WalGroupComm
 worker wait a bounded, adaptive interval for more partitions. The wait ends as soon as a probe finds no
 newly ready partition. The linger raises batch density and tightens the latency tail. It cannot shorten
 a write that waits for two serial syncs.
+
+### Return gathering (back-to-back writers)
+
+A writer that sends its next proposal when the previous one is acknowledged is a closed loop. Its
+partition comes back a moment after the synced write that carried it ends. RocksDB runs one synced
+write at a time. A worker that writes the ready work at once starts the next synced write in that
+moment, with the partitions that became ready during the previous sync and without the partitions
+that are about to return. Those partitions wait for that write and then pay their own. The partitions
+of a node split into two groups that take turns, and the split does not heal by itself:
+
+```
+  no window: two groups take turns, a round = the other group's sync + its own
+
+    engine   │ sync {P1} │ sync {P2,P3,P4} │ sync {P1} │ sync {P2,P3,P4} │ …
+    P1        ───────────┘ back, waits ─────┘───────────┘ back, waits ─────┘
+
+  with the window: one group, a round = one sync
+
+    engine   │ sync {P1..P4} │·│ sync {P1..P4} │·│ sync {P1..P4} │ …
+                              └ waits for the partitions of the last sync
+```
+
+With `WalGroupCommitReturnWindow` the scheduler does two things on a store that serializes its synced
+writes (`IWAL.SerializesSyncedWrites`):
+
+1. It does not start a synced write while one that carries partitions it expects back is in progress.
+   The write would wait inside the engine with its content fixed. The worker holds the batch instead,
+   and the batch stays open for those partitions.
+2. After that write ends, it holds the next one until those partitions are back, or the window passed.
+
+Several writers on one partition split in the same way, into two groups of writers that take turns.
+A partition therefore counts as back when as many operations returned as its last synced write carried,
+not at the first one.
+
+A partition is waited for only when its last returns were inside the window. A partition that sends
+one write and stops is never waited for. A partition that was waited for and did not come is not
+expected again until it has returned at once several times in a row, and the number doubles after each
+miss. The window in use is half of the measured duration of a synced write, and at most the configured
+value. A store with a cheap sync (below 200 µs) gets no window.
+
+The lazy commit markers of a partition that is held ride its next propose in the same engine write.
+
+Measured with `Kommander.Benchmark` on one node (8-core Apple Silicon, RocksDB with sync writes, 50
+entries of 280 B for each proposal, every writer back to back). One sync of these batches takes 3 to
+4 ms on this disk. A range is the spread of two to five runs; a single value is one run.
+
+| Partitions × writers | Round p50, window off | Round p50, window on | Proposals/s off → on |
+|---|---|---|---|
+| 1 × 1 | 3.9 ms | 3.9 ms | 257 to 263 → 253 to 267 |
+| 2 × 1 | 6.0 ms | 4.0 ms | 335 → 512 |
+| 4 × 1 | 5.9 to 6.9 ms | 4.1 to 4.8 ms | 546 to 666 → 854 to 955 |
+| 8 × 1 | 7.0 ms | 5.2 ms | 1,135 → 1,482 |
+| 1 × 16 | 13.5 to 15.1 ms | 7.9 to 8.0 ms | 1,102 to 1,176 → 1,964 to 2,012 |
+| 4 × 4 | 14.1 ms | 7.0 ms | 1,124 → 2,164 |
+
+**Replicated partitions.** The scheduler learns the pattern from the node's own writes: a partition is
+expected back when its next write follows the end of its synced write on that node. That is so for a
+single-voter partition. With several voters the next proposal follows the quorum, which another node's
+write can complete earlier or later than the local one. The scheduler then finds no pattern and holds
+nothing. A three-node run (one simulated 3 ms device for each node, four partitions) gave the same round
+with the window off and on (7.7 ms, two syncs). The same alternation exists on the nodes of a cluster,
+and the window does not remove it there.
+
+Counters on `FairWalScheduler` show the effect: `TotalSyncBatchesWritten` and `TotalPartitionsBatched`
+(partitions for each sync), `TotalReturnGathers` (batches held), `TotalReturnsAwaited` and
+`TotalReturnsMissed` (wrong guesses). `Kommander.Benchmark` prints them for each run. Two of them are
+also metrics: `raft.wal.sync_batches_total` and `raft.wal.returns_missed_total`.
 
 ---
 
@@ -230,6 +300,7 @@ These settings are in `RaftConfiguration.cs`.
 | `FollowerApplyTurnTime` | `100 µs` | How long one follower apply turn delivers before it yields to queued appends and acks. At least one entry per turn. `Zero` ⇒ only the entry cap. |
 | `FollowerApplyTurnBudget` | `1024` | The entry cap of one follower apply turn. A backlog above eight caps is delivered anyway (backpressure). `0` ⇒ no cap. |
 | `WalGroupCommitLingerMs` | `0` | `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Evidence-gated: a worker waits only while another partition has queued work that must become ready soon. `0` ⇒ opportunistic batching. |
+| `WalGroupCommitReturnWindow` | `1 ms` | The longest time a synced write is held for partitions that are expected back, so they share its `fsync`. Applies to a store that serializes its synced writes (RocksDB with sync writes) once a sync takes 200 µs or more. The window in use is half of the measured sync, at most this value. `Zero` ⇒ off. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write`. |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |
 | `WriteIOThreads` | `4` | WAL scheduler worker threads, which is how many writes can sync concurrently across partitions. |
@@ -241,6 +312,11 @@ These settings are in `RaftConfiguration.cs`.
   Start around `2` ms and measure. The median does not drop. Idle, sequential and closed-loop load pays no
   wait.
 - The two settings are complementary and can be enabled together.
+- **`WalGroupCommitReturnWindow`** matters when a node writes two or more single-voter partitions back
+  to back, or one such partition from several writers, on RocksDB with sync writes. A sequential writer
+  on one partition, a writer that pauses between writes and a single write are not delayed. A wrong guess costs a batch one window, and a timed wait is rounded up
+  to about 1 ms. Leave `WalGroupCommitLingerMs` at `0` with it: the linger can wait for partitions that
+  the return window already holds.
 
 ---
 
@@ -513,10 +589,12 @@ Kommander/
 │     └─ CompleteLeaderCommit           the (still-running) commit marker + broadcast
 ├─ RaftWriteAhead.cs               EnqueuePropose / EnqueueCommit (the two phases);
 │     └─ CompleteRestoreAsync           frontier reconstruction on restart
-├─ WAL/IO/FairWalScheduler.cs      group commit, the deferred linger, sync vs sync-off decision,
+├─ WAL/IO/FairWalScheduler.cs      group commit, the deferred linger, return gathering
+│                                   (GatherForSharedSync), sync vs sync-off decision,
 │                                   TotalBatchesWritten / TotalSyncBatchesWritten / TotalPartitionsBatched
 └─ WAL/
-      ├─ IWAL.cs                    Write(logs)  and  Write(logs, sync)  (the sync-off primitive)
+      ├─ IWAL.cs                    Write(logs)  and  Write(logs, sync)  (the sync-off primitive);
+│                                   SerializesSyncedWrites (what return gathering asks the store)
       ├─ RocksDbWAL.cs              SetSync(true/false); engine recovery after a latched storage error
 │                                   (engineGuard, TryRecoverEngineAfterFailure, ReopenEngine);
 │                                   WriteAttested + BindSyncLedger (the lost-synced-writes verdict),
@@ -528,6 +606,8 @@ Kommander/
 
 Kommander.Tests/
 ├─ WAL/FsyncCountTests.cs                      syncs/write = 2× off, 1× on (RocksDB + SQLite)
+├─ Scheduler/TestFairWalSchedulerReturnGathering.cs  a synced write held for a write in progress and
+│                                              for returning partitions; markers ride; a wrong guess
 ├─ WAL/SingleFsyncCommitTests.cs              fast-path = baseline end-to-end; single-voter; concurrency
 ├─ WAL/RecoveryReconstructionCrashMatrixTests.cs  recovers exactly the contiguous prefix, keeps the tail
 ├─ WAL/RecoveryReSupplyClusterTests.cs        a regressed follower re-converges via leader re-supply

@@ -23,7 +23,8 @@ public sealed record RunConfig(
     bool? FanOutBeforeLocalWrite = null,
     IReadOnlyList<string>? Overrides = null,
     int ApplyCostMicros = 0,
-    string? ApplyOn = null);
+    string? ApplyOn = null,
+    double SimSyncMs = 0);
 
 /// <summary>The machine and build the run used.</summary>
 public sealed record HostInfo(int Cores, string Os, string Arch, string Framework, string KommanderVersion, bool ServerGc);
@@ -56,6 +57,30 @@ public sealed record CostStats(
     int Gen1,
     int Gen2);
 
+/// <summary>
+/// What the WAL write schedulers did over the window, summed over all nodes and divided by the
+/// proposals of the window. It tells how the syncs were shared: one synced write per proposal means
+/// every proposal paid a sync of its own, and with several partitions a low figure means the
+/// partitions rode the same syncs.
+/// </summary>
+/// <param name="WritesPerProposal">Engine write calls, synced or not.</param>
+/// <param name="SyncedWritesPerProposal">Engine write calls that paid a sync.</param>
+/// <param name="PartitionsPerWrite">Partitions carried by one engine write, on average.</param>
+/// <param name="MarkerBatchesHeldPerProposal">Lazy commit-marker batches held back behind another partition's sync.</param>
+/// <param name="ReturnGathersPerProposal">Times a worker held a batch for a write in progress or for partitions expected back.</param>
+/// <param name="ReturnsAwaited">Times a partition was expected back after a synced write.</param>
+/// <param name="ReturnsMissed">Times an expected partition did not come inside the window.</param>
+/// <param name="GatherHandoffs">Times a worker gave its partitions to the gathering worker.</param>
+public sealed record WalSchedulerStats(
+    double WritesPerProposal,
+    double SyncedWritesPerProposal,
+    double PartitionsPerWrite,
+    double MarkerBatchesHeldPerProposal,
+    double ReturnGathersPerProposal,
+    long ReturnsAwaited,
+    long ReturnsMissed,
+    long GatherHandoffs);
+
 /// <summary>One benchmark arm's result: one JSON line.</summary>
 public sealed record BenchmarkResult(
     string Kind,
@@ -74,7 +99,8 @@ public sealed record BenchmarkResult(
     CostStats Cost,
     InstrumentationSnapshot? WalPhases,
     Dictionary<string, StageStats>? Stages,
-    Dictionary<string, int> LeadersPerNode);
+    Dictionary<string, int> LeadersPerNode,
+    WalSchedulerStats? WalScheduler = null);
 
 /// <summary>A fitted per-proposal cost model: round = a + b·n over the batch-size arms of one group.</summary>
 public sealed record FitResult(
@@ -116,6 +142,12 @@ public static class BenchmarkReport
         sb.AppendLine(Inv($"  Committed  : {r.CommittedEntries:N0} entries in {r.Calls:N0} calls   Failed: {r.Failed}"));
         sb.AppendLine(Inv($"  Traffic    : {r.Traffic.FramesPerProposalPerFollower:0.00} frames/proposal/follower, {r.Traffic.EntriesPerFrame:0.0} entries/frame, {r.Traffic.LogBytesPerProposalPerFollower:N0} log B/proposal/follower, {r.Traffic.AcksPerProposal:0.00} acks/proposal"));
         sb.AppendLine(Inv($"  Cost       : {r.Cost.ProcessCores:0.00} cores, {r.Cost.CpuMicrosPerEntry:0.0} µs CPU/entry, {r.Cost.AllocBytesPerEntry:N0} B alloc/entry, GC pause {r.Cost.GcPauseFraction:P1} (gen0 {r.Cost.Gen0}, gen1 {r.Cost.Gen1}, gen2 {r.Cost.Gen2})"));
+
+        if (r.WalScheduler is { } wal)
+        {
+            sb.AppendLine(Inv($"  WAL        : {wal.WritesPerProposal:0.00} engine writes/proposal ({wal.SyncedWritesPerProposal:0.00} synced), {wal.PartitionsPerWrite:0.00} partitions/write, {wal.MarkerBatchesHeldPerProposal:0.00} marker batches held/proposal"));
+            sb.AppendLine(Inv($"  WAL gather : {wal.ReturnGathersPerProposal:0.00} holds/proposal, {wal.ReturnsAwaited:N0} returns awaited, {wal.ReturnsMissed:N0} missed, {wal.GatherHandoffs:N0} handed over"));
+        }
 
         if (r.Stages is { Count: > 0 } stages)
         {
@@ -230,6 +262,7 @@ public static class BenchmarkReport
     private static string FanOutSuffix(RunConfig c) =>
         (c.FanOutBeforeLocalWrite == false ? " fanout=after-local-write" : "")
         + (c.ApplyCostMicros > 0 ? Inv($" apply={c.ApplyCostMicros}us") + (c.ApplyOn == "followers" ? "@followers" : "") : "")
+        + (c.SimSyncMs > 0 ? Inv($" sim-sync={c.SimSyncMs:0.###}ms") : "")
         + (c.Overrides is { Count: > 0 } o ? " set=" + string.Join(',', o) : "");
 
     private static (double A, double B, double R2) LeastSquares(double[] x, double[] y)

@@ -68,6 +68,18 @@ public sealed class WALWriteOperation
     /// </summary>
     internal long EnqueueTicks;
 
+    /// <summary>
+    /// Set by <see cref="Kommander.WAL.IO.FairWalScheduler"/> when the operation is enqueued: true when
+    /// the operation, taken alone, makes its batch pay a sync (anything but a lazy commit marker and a
+    /// metadata write). The scheduler counts such operations per partition, when they are enqueued and
+    /// when the write that carried them ends, to tell when the partition is back with real work.
+    /// Stored here, and not derived again when the operation is written, because the type of a
+    /// shipped log can change in place between the two and both counts must see the same answer.
+    /// Never consulted for whether a batch is synced; that is decided from the rows when the batch is
+    /// written.
+    /// </summary>
+    internal bool CountsAsSyncWork;
+
     /// <summary>The vote recorded by a <see cref="WALWriteOperationType.HardState"/> operation (null = no vote); <see cref="Term"/> is the term.</summary>
     public string? VotedFor { get; }
 

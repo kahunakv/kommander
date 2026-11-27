@@ -88,6 +88,25 @@ public interface IWAL : IDisposable
     }
 
     /// <summary>
+    /// True when every synced <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/> of this
+    /// store goes through one log and waits for one fsync at a time, whatever partitions it carries:
+    /// two synced writes issued together do not run in parallel, the second waits for the first.
+    ///
+    /// <para><b>Why the scheduler asks.</b> On such a store a synced write started while another one
+    /// is in progress gains nothing, and it fixes its content too early: the partitions of the write
+    /// in progress come back a moment after it ends and then wait for a whole sync they could have
+    /// shared. <see cref="IO.FairWalScheduler"/> therefore holds the next synced write of such a store
+    /// until the one in progress ends and its partitions are back, when it has reason to expect them
+    /// (<see cref="RaftConfiguration.WalGroupCommitReturnWindow"/>).</para>
+    ///
+    /// <para>False, the default, for a store that has no fsync to share
+    /// (<see cref="InMemoryWAL"/>, test fakes) or that syncs partitions independently
+    /// (<see cref="SqliteWAL"/>, one fsync per shard): holding a write there would only add latency.
+    /// A timing hint and nothing else: it never changes what is written, synced or acknowledged.</para>
+    /// </summary>
+    public bool SerializesSyncedWrites => false;
+
+    /// <summary>
     /// Persists <paramref name="logs"/>. Atomic per partition. Overwrites any existing entry with the same
     /// (partitionId, id) key.
     /// </summary>

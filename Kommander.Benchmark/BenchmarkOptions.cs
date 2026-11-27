@@ -33,6 +33,9 @@ public sealed class BenchmarkOptions
     [Option("sync-writes", Default = true, HelpText = "fsync for rocksdb/sqlite (ignored for memory).")]
     public bool? SyncWrites { get; set; }
 
+    [Option("sim-sync-ms", Default = 0d, HelpText = "With --storage memory: give every node a simulated device on which a synced write takes this many milliseconds and one write runs at a time. Unlike rocksdb in one process, the nodes do not share a disk, so a multi-node arm behaves like nodes that each have one. 0 = plain in-memory store.")]
+    public double SimSyncMs { get; set; }
+
     [Option("fan-out-before-local-write", Default = true, HelpText = "RaftConfiguration.FanOutBeforeLocalWrite: send a proposal to the followers while the leader's own write is queued (false = after it is durable).")]
     public bool? FanOutBeforeLocalWrite { get; set; }
 
@@ -116,6 +119,12 @@ public sealed class BenchmarkOptions
 
         if (Storage is not ("memory" or "rocksdb" or "sqlite"))
             return "--storage must be memory, rocksdb or sqlite";
+
+        if (SimSyncMs < 0)
+            return "--sim-sync-ms must not be negative";
+
+        if (SimSyncMs > 0 && Storage != "memory")
+            return "--sim-sync-ms needs --storage memory";
 
         if (ParseDuration(Duration) is null)
             return $"--duration '{Duration}' is not a duration";

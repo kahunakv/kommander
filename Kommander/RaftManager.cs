@@ -753,7 +753,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             // durable, so nothing waits for a marker write any more and a marker batch can ride its
             // partition's next write instead of holding the partition behind another one's sync.
             markerDeferralMs: configuration.WalSingleFsyncCommit ? FairWalScheduler.DefaultMarkerDeferralMs : 0,
-            maxSpinBeforePark: configuration.IdleWorkerMaxSpinBeforePark);
+            maxSpinBeforePark: configuration.IdleWorkerMaxSpinBeforePark,
+            // Takes effect only on a store that serializes its synced writes; the scheduler asks
+            // the store itself.
+            returnWindow: configuration.WalGroupCommitReturnWindow);
         walScheduler.TraceSink = configuration.WalTraceSink;
 
         loadReportService = new LoadReportService(

@@ -528,6 +528,56 @@ public class RaftConfiguration
     public int WalGroupCommitLingerMs { get; set; }
 
     /// <summary>
+    /// Upper bound of the return window of the WAL write scheduler: the longest time a synced write
+    /// is held for partitions that are expected to come back, so that they share its sync.
+    ///
+    /// <para><b>What it is for.</b> A partition that is written in a closed loop (the next proposal
+    /// is sent when the previous one is acknowledged) comes back a moment after the synced write that
+    /// carried it ends. A scheduler that writes whatever is ready at once starts the next synced
+    /// write in that moment, without the partitions that are about to return. On a store that runs
+    /// one synced write at a time those partitions then wait for that write and pay their own after
+    /// it: the partitions of a node split into two groups that take turns, and a proposal round
+    /// costs two syncs where one is enough. With this window the scheduler does not start a synced
+    /// write while one that carries such partitions is in progress, and after it ends it waits for
+    /// them before it starts the next. Measured on one node with four partitions, RocksDB with
+    /// sync writes: a round fell from two syncs to one.</para>
+    ///
+    /// <para>The same holds inside one partition that several writers share: the writers split into
+    /// two groups that take turns. A partition therefore counts as back when as many operations
+    /// returned as its last synced write carried, not at the first of them.</para>
+    ///
+    /// <para><b>What it costs.</b> The window in use is half of the measured duration of a synced
+    /// write, and at most this value. A partition is waited for only when its last returns were
+    /// inside the window; one that was waited for and did not come is not expected again until it
+    /// has returned at once several times in a row. A sequential writer on one partition, a writer
+    /// with a pause between its writes, and a one-off write are not delayed. The arrival of the
+    /// last expected partition ends the wait at once; only a wrong guess waits for the whole window,
+    /// and a timed wait is rounded up to about 1 ms.</para>
+    ///
+    /// <para><b>Where it applies.</b> Only to a store that serializes its synced writes
+    /// (<see cref="WAL.IWAL.SerializesSyncedWrites"/>: <c>RocksDbWAL</c> with sync writes on), only
+    /// when the scheduler runs its own threads, and only once a synced write takes at least 200 µs.
+    /// It has no effect on the in-memory and SQLite stores or on a fast device.</para>
+    ///
+    /// <para><b>Replicated partitions.</b> The scheduler learns the pattern from this node's own
+    /// writes: a partition is expected back when its next write follows the end of its synced write
+    /// on this node. That is so for a single-voter partition. With several voters the next proposal
+    /// follows the quorum, which another node's write can complete earlier or later than this
+    /// node's; the scheduler then finds no pattern and holds nothing. A three-node benchmark showed
+    /// no change in either direction. The same alternation exists on the nodes of a cluster, and
+    /// this option does not remove it there.</para>
+    ///
+    /// <para>It is independent of <see cref="WalGroupCommitLingerMs"/>. With both on, the linger can
+    /// wait for partitions that the return window already holds, so leave the linger off unless a
+    /// measurement says otherwise.</para>
+    ///
+    /// <para>It changes when a batch is written and nothing else: not what is written, not whether
+    /// it is synced, not the order of completions. <see cref="TimeSpan.Zero"/> turns it off, and so
+    /// does any value below 100 µs. Default 1 ms.</para>
+    /// </summary>
+    public TimeSpan WalGroupCommitReturnWindow { get; set; } = WAL.IO.FairWalScheduler.DefaultReturnWindow;
+
+    /// <summary>
     /// Single-fsync commit fast path. When enabled, an <c>autoCommit</c> single-round
     /// proposal releases its client ticket as soon as the <b>propose quorum is durable</b>
     /// — i.e. a quorum already holds the entry on disk — instead of waiting for the

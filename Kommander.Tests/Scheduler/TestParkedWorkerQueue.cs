@@ -388,6 +388,84 @@ public sealed class TestParkedWorkerQueue
         Assert.True(timedOut, "A stop request must read as the end of the wait, so the caller does not wait again.");
     }
 
+    // ── Timed wait for a condition ──────────────────────────────────────────
+
+    /// <summary>
+    /// A worker whose condition changed before it could sleep does not sleep: the predicate is read
+    /// after the worker registered, which is what closes the race with the thread that changes the
+    /// condition and then looks for a registered waiter.
+    /// </summary>
+    [Fact]
+    public void TryTakeWhile_ConditionAlreadyChanged_DoesNotSleep()
+    {
+        using ParkedWorkerQueue<int> queue = new(1, TimeSpan.Zero);
+
+        Stopwatch watch = Stopwatch.StartNew();
+        bool taken = queue.TryTakeWhile(0, 20_000, false, static keepWaiting => keepWaiting, out _, out bool timedOut);
+
+        Assert.False(taken);
+        Assert.False(timedOut, "A changed condition must read as a wake, so the caller looks at the condition again.");
+        Assert.True(watch.ElapsedMilliseconds < 10_000, $"Slept {watch.ElapsedMilliseconds} ms although the condition had changed.");
+        Assert.Equal(0, queue.TimedWaiterCount);
+    }
+
+    [Fact]
+    public void TryTakeWhile_ConditionHolds_WaitsLikeTryTake()
+    {
+        using ParkedWorkerQueue<int> queue = new(1, TimeSpan.Zero);
+
+        Stopwatch watch = Stopwatch.StartNew();
+        bool taken = queue.TryTakeWhile(0, 50, true, static keepWaiting => keepWaiting, out _, out bool timedOut);
+
+        Assert.False(taken);
+        Assert.True(timedOut);
+        Assert.True(watch.ElapsedMilliseconds >= 40, $"Returned after {watch.ElapsedMilliseconds} ms.");
+    }
+
+    /// <summary>
+    /// The wake for one worker reaches that worker and no other. With two workers in a timed wait,
+    /// the untargeted wake takes whichever registered last; a condition belongs to one of them.
+    /// </summary>
+    [Fact]
+    public async Task WakeTimedWaiter_ForOneWorker_WakesThatWorkerOnly()
+    {
+        using ParkedWorkerQueue<int> queue = new(2, TimeSpan.Zero);
+
+        Task<(bool Taken, bool TimedOut)> Wait(int worker) => Task.Run(() =>
+        {
+            bool taken = queue.TryTakeWhile(worker, 20_000, true, static keepWaiting => keepWaiting, out _, out bool timedOut);
+            return (taken, timedOut);
+        }, TestContext.Current.CancellationToken);
+
+        Task<(bool Taken, bool TimedOut)> first = Wait(0);
+        await WaitUntil(() => queue.TimedWaiterCount == 1, "first waiter registered");
+
+        // Registered last: the one an untargeted wake would take.
+        Task<(bool Taken, bool TimedOut)> second = Wait(1);
+        await WaitUntil(() => queue.TimedWaiterCount == 2, "second waiter registered");
+
+        queue.WakeTimedWaiter(0);
+
+        (bool taken, bool timedOut) = await first.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+        Assert.False(taken);
+        Assert.False(timedOut);
+        Assert.Equal(1, queue.TimedWaiterCount);
+        Assert.False(second.IsCompleted);
+
+        // A worker that does not wait: nothing happens, and the other waiter stays asleep.
+        queue.WakeTimedWaiter(0);
+        Assert.Equal(1, queue.TimedWaiterCount);
+        Assert.False(second.IsCompleted);
+
+        queue.WakeTimedWaiter(1);
+        (taken, timedOut) = await second.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+        Assert.False(taken);
+        Assert.False(timedOut);
+        Assert.Equal(0, queue.TimedWaiterCount);
+    }
+
     // ── Adaptive spin ───────────────────────────────────────────────────────
 
     /// <summary>

@@ -190,7 +190,9 @@ public sealed class BenchmarkCluster : IAsyncDisposable
     private IWAL CreateWal(BenchmarkOptions options, int port, ILogger<IRaft> logger)
     {
         if (options.Storage == "memory")
-            return new InMemoryWAL(logger);
+            return options.SimSyncMs > 0
+                ? new SimulatedDiskWal(logger, TimeSpan.FromMilliseconds(options.SimSyncMs))
+                : new InMemoryWAL(logger);
 
         string parent = options.WalDir ?? Path.GetTempPath();
         string path = Path.Combine(parent, $"kommander-bench-{Environment.ProcessId}-{port}");

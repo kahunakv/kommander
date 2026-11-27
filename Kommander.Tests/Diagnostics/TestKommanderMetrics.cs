@@ -242,6 +242,8 @@ public sealed class TestKommanderMetrics : IDisposable
         // in TestBackpressureAndAdmissionControl. Here we only verify the metric
         // wiring (counter/histogram names and listener subscription).
         KommanderMetrics.WalBatchesTotal.Add(1);
+        KommanderMetrics.WalSyncBatchesTotal.Add(1);
+        KommanderMetrics.WalReturnsMissedTotal.Add(1);
         KommanderMetrics.WalBatchSize.Record(3);
         KommanderMetrics.WalOperationsTotal.Add(3);
 
@@ -249,6 +251,10 @@ public sealed class TestKommanderMetrics : IDisposable
 
         Assert.True(Sum("raft.wal.batches_total") >= 1,
             "Expected at least one WAL batch recorded");
+        Assert.True(Sum("raft.wal.sync_batches_total") >= 1,
+            "Expected at least one synced WAL batch recorded");
+        Assert.True(Sum("raft.wal.returns_missed_total") >= 1,
+            "Expected at least one missed return recorded");
         Assert.True(Count("raft.wal.batch_size") >= 1,
             "Expected at least one batch_size measurement");
         Assert.True(Sum("raft.wal.operations_total") >= 1,
